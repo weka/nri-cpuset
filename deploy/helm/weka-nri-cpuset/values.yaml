@@ -1,0 +1,70 @@
+# Default values for weka-nri-cpuset
+image:
+  repository: weka/nri-cpuset
+  pullPolicy: Always
+  tag: "latest"
+
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  # Specifies whether a service account should be created
+  create: true
+  # Annotations to add to the service account
+  annotations: {}
+  # The name of the service account to use.
+  name: ""
+
+podAnnotations: {}
+
+podSecurityContext:
+  # Since we need privileged access for cgroup operations
+  privileged: true
+
+securityContext:
+  privileged: true
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 128Mi
+  requests:
+    cpu: 100m
+    memory: 64Mi
+
+nodeSelector:
+  kubernetes.io/os: linux
+
+tolerations:
+  - operator: Exists
+    effect: NoSchedule
+  - operator: Exists
+    effect: NoExecute
+
+affinity: {}
+
+config:
+  plugin:
+    name: "weka-cpuset"
+    index: "200"
+    socket: "/run/containerd/nri/nri.sock"
+  
+  logging:
+    level: "info"
+    format: "json"
+  
+  cpu:
+    validate_topology: true
+    min_shared_cpus: 1
+  
+  numa:
+    enable_memory_placement: true
+    fallback_to_node0: true
+
+# Host paths for NRI and system information
+hostPaths:
+  nriSocket: "/run/containerd/nri"
+  sysfs: "/sys"
+  proc: "/proc"

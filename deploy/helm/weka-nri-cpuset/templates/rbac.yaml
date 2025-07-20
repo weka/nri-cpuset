@@ -1,0 +1,31 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "weka-nri-cpuset.fullname" . }}
+  labels:
+    {{- include "weka-nri-cpuset.labels" . | nindent 4 }}
+rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "weka-nri-cpuset.fullname" . }}
+  labels:
+    {{- include "weka-nri-cpuset.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "weka-nri-cpuset.fullname" . }}
+subjects:
+- kind: ServiceAccount
+  name: {{ include "weka-nri-cpuset.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}

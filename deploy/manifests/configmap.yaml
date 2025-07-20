@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: weka-nri-cpuset-config
+  namespace: kube-system
+  labels:
+    app: weka-nri-cpuset
+data:
+  config.yaml: |
+    # Weka NRI CPUSet Plugin Configuration
+    plugin:
+      name: "weka-cpuset"
+      index: "200"
+      socket: "/run/containerd/nri/nri.sock"
+    
+    logging:
+      level: "info"
+      format: "json"
+    
+    cpu:
+      # Whether to validate CPU topology on startup
+      validate_topology: true
+      
+      # Minimum number of CPUs to keep in shared pool
+      min_shared_cpus: 1
+    
+    numa:
+      # Whether to enable NUMA-aware memory placement
+      enable_memory_placement: true
+      
+      # Fallback to node 0 if NUMA detection fails
+      fallback_to_node0: true

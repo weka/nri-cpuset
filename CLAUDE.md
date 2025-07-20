@@ -37,8 +37,10 @@
 | Lint & static analysis | `make lint` (golangci-lint) |
 | Unit tests | `make test` |
 | Integration tests (no K8s) | `make test-integration` |
-| Kind e2e | `hack/kind-e2e.sh` |
-| Real-cluster e2e | `hack/e2e-live.sh $KUBECONFIG` |
+| **Kind e2e (RECOMMENDED)** | `make test-e2e-kind` |
+| **Live cluster e2e** | `make test-e2e-live` |
+| **Kind cluster setup** | `make kind-up` |
+| **Kind cluster cleanup** | `make kind-down` |
 | Image build | `make image` |
 | Helm chart package | `make chart` |
 
@@ -66,21 +68,55 @@
 ---
 
 ## End-to-End Testing Strategy
-### Local (Kind)
-1. Spin up kind cluster with matching containerd (`hack/kind-up.sh`).  
-2. Load plugin image into cluster node.  
-3. Apply CRDs & DaemonSet.  
-4. Run Ginkgo:  
-   - verifies admission decisions for annotated / integer / shared pods  
-   - asserts cpuset & mems via `kubectl exec cat /proc/self/status`  
-   - kills pods to ensure pool refresh logic.
 
-### Real Cluster
-`hack/e2e-live.sh` assumes:
+**⚠️ IMPORTANT: Always prefer Kind-based testing for development and CI.**
+
+### Kind-based Testing (RECOMMENDED)
+The kind-based approach automatically provisions a local Kubernetes cluster with:
+- containerd 2.0+ with NRI v0.9 support enabled
+- Static CPU manager policy configured 
+- Proper NRI plugin directories mounted
+- Plugin image pre-loaded
+
+**Quick start:**
 ```bash
-export KUBECONFIG=~/.kube/config   # points to any alive cluster
-export TEST_NS=wekaplugin-e2e
+# Full automated e2e test with kind cluster
+make test-e2e-kind
+
+# Or step by step:
+make kind-up        # Create kind cluster
+make image          # Build plugin image  
+make test-e2e-kind  # Run tests
+make kind-down      # Cleanup
 ```
+
+**Kind cluster features:**
+- Multi-node setup (1 control-plane + 1 worker)
+- NRI socket properly configured at `/run/containerd/nri/nri.sock`
+- Plugin directory at `/opt/nri/plugins` 
+- CPU manager with system/kube reserved resources
+- Automatic image loading and plugin deployment
+
+### Live Cluster Testing
+For testing against existing clusters (CI/staging/prod):
+```bash
+# Prerequisites: 
+# - Cluster must have containerd 2.0+ with NRI enabled
+# - kubectl configured with proper RBAC permissions
+
+export KUBECONFIG=~/.kube/config
+export TEST_NS=wekaplugin-e2e
+make test-e2e-live
+
+# Or with custom settings:
+KUBECONFIG=~/.kube/prod TEST_NS=weka-test make test-e2e-live
+```
+
+**Live cluster requirements:**
+- containerd 2.0+ with NRI plugin support enabled
+- Kubernetes ≥ 1.28 with static CPU manager policy
+- RBAC permissions for DaemonSet deployment
+- Nodes with sufficient CPU cores for testing
 
 ### Docs/PRD
 - PRDs located in docs/prd.md 

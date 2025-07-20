@@ -1,0 +1,94 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "weka-nri-cpuset.fullname" . }}
+  labels:
+    {{- include "weka-nri-cpuset.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "weka-nri-cpuset.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "weka-nri-cpuset.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "weka-nri-cpuset.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      hostNetwork: true
+      hostPID: true
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: nri-socket
+              mountPath: /run/containerd/nri
+            - name: sys-fs
+              mountPath: /sys
+              readOnly: true
+            - name: proc
+              mountPath: /proc
+              readOnly: true
+            - name: config
+              mountPath: /etc/weka-nri-cpuset
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          livenessProbe:
+            exec:
+              command:
+              - /usr/local/bin/weka-cpuset
+              - --version
+            initialDelaySeconds: 30
+            periodSeconds: 60
+          readinessProbe:
+            exec:
+              command:
+              - /usr/local/bin/weka-cpuset
+              - --version
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: nri-socket
+          hostPath:
+            path: {{ .Values.hostPaths.nriSocket }}
+            type: DirectoryOrCreate
+        - name: sys-fs
+          hostPath:
+            path: {{ .Values.hostPaths.sysfs }}
+            type: Directory
+        - name: proc
+          hostPath:
+            path: {{ .Values.hostPaths.proc }}
+            type: Directory
+        - name: config
+          configMap:
+            name: {{ include "weka-nri-cpuset.fullname" . }}-config
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
