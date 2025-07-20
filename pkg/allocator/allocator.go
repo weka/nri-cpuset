@@ -36,7 +36,7 @@ func (a *CPUAllocator) GetOnlineCPUs() []int {
 
 func (a *CPUAllocator) AllocateContainer(pod *api.PodSandbox, container *api.Container) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
 	mode := a.determineContainerMode(pod, container)
-	
+
 	var result *AllocationResult
 	var err error
 
@@ -66,12 +66,12 @@ func (a *CPUAllocator) AllocateContainer(pod *api.PodSandbox, container *api.Con
 		},
 	}
 
-	// Set memory nodes for annotated containers
-	if mode == "annotated" && len(result.MemNodes) > 0 {
-		adjustment.Linux.Resources.Memory = &api.LinuxMemory{}
-		// Note: NRI doesn't directly support cpuset.mems, but we can set it via annotations
-		// or through the cgroup interface if available
+	// Set memory nodes for exclusive containers (annotated and integer)
+	// Per PRD 3.3: restrict memory to NUMA nodes containing the assigned CPUs
+	if (mode == "annotated" || mode == "integer") && len(result.MemNodes) > 0 {
+		adjustment.Linux.Resources.Cpu.Mems = numa.FormatCPUList(result.MemNodes)
 	}
+	// Shared containers inherit system default memory placement (no restriction)
 
 	return adjustment, nil, nil
 }
@@ -99,7 +99,7 @@ func (a *CPUAllocator) AllocateExclusiveCPUs(count int, reserved []int) ([]int, 
 
 	// Sort available CPUs for deterministic allocation
 	sort.Ints(available)
-	
+
 	// Allocate first N available CPUs
 	return available[:count], nil
 }
@@ -127,7 +127,7 @@ func (a *CPUAllocator) hasIntegerSemantics(container *api.Container) bool {
 
 	cpu := container.Linux.Resources.Cpu
 	memory := container.Linux.Resources.Memory
-	
+
 	if cpu == nil || memory == nil {
 		return false
 	}
@@ -160,12 +160,12 @@ func (a *CPUAllocator) handleAnnotatedContainer(pod *api.PodSandbox) (*Allocatio
 	if pod.Annotations == nil {
 		return nil, fmt.Errorf("missing annotations for annotated container")
 	}
-	
+
 	cpuList, exists := pod.Annotations[WekaAnnotation]
 	if !exists {
 		return nil, fmt.Errorf("missing %s annotation", WekaAnnotation)
 	}
-	
+
 	cpus, err := numa.ParseCPUList(cpuList)
 	if err != nil {
 		return nil, fmt.Errorf("invalid CPU list in annotation '%s': %w", cpuList, err)
@@ -184,7 +184,14 @@ func (a *CPUAllocator) handleAnnotatedContainer(pod *api.PodSandbox) (*Allocatio
 	}
 
 	// Determine NUMA nodes for memory placement
+	// Per PRD 3.3: If all CPUs belong to one NUMA node, use only that node
+	// Otherwise, use the union of all involved nodes
 	memNodes := a.numa.GetCPUNodesUnion(cpus)
+	
+	// Always check if all CPUs belong to the same node for correctness
+	if singleNode, isSingleNode := a.getSingleNUMANode(cpus); isSingleNode {
+		memNodes = []int{singleNode}
+	}
 
 	return &AllocationResult{
 		CPUs:     cpus,
@@ -197,22 +204,32 @@ func (a *CPUAllocator) handleIntegerContainer(container *api.Container, reserved
 	if container.Linux == nil || container.Linux.Resources == nil || container.Linux.Resources.Cpu == nil {
 		return nil, fmt.Errorf("missing CPU resources for integer container")
 	}
-	
+
 	cpu := container.Linux.Resources.Cpu
 	if cpu.Quota == nil || cpu.Period == nil || cpu.Quota.GetValue() <= 0 || cpu.Period.GetValue() <= 0 {
 		return nil, fmt.Errorf("invalid CPU quota/period for integer container")
 	}
-	
+
 	cpuCores := int(cpu.Quota.GetValue() / int64(cpu.Period.GetValue()))
-	
+
 	cpus, err := a.AllocateExclusiveCPUs(cpuCores, reserved)
 	if err != nil {
 		return nil, fmt.Errorf("failed to allocate exclusive CPUs: %w", err)
 	}
 
+	// Determine NUMA nodes for memory placement
+	// Per PRD 3.3: restrict memory to NUMA nodes containing the assigned CPUs
+	memNodes := a.numa.GetCPUNodesUnion(cpus)
+	
+	// Always check if all CPUs belong to the same node for correctness
+	if singleNode, isSingleNode := a.getSingleNUMANode(cpus); isSingleNode {
+		memNodes = []int{singleNode}
+	}
+
 	return &AllocationResult{
-		CPUs: cpus,
-		Mode: "integer",
+		CPUs:     cpus,
+		MemNodes: memNodes,
+		Mode:     "integer",
 	}, nil
 }
 
@@ -265,7 +282,7 @@ func (a *CPUAllocator) ValidateAnnotatedCPUs(cpuList string, reserved []int) err
 
 	for _, cpu := range cpus {
 		if _, isReserved := reservedSet[cpu]; isReserved {
-			return fmt.Errorf("CPU %d is already reserved by an integer container", cpu)
+			return fmt.Errorf("CPU %d is already reserved by an integer-based container", cpu)
 		}
 	}
 
@@ -286,4 +303,24 @@ func (a *CPUAllocator) ComputeSharedPool(reserved []int) []int {
 	}
 
 	return sharedPool
+}
+
+func (a *CPUAllocator) getSingleNUMANode(cpus []int) (int, bool) {
+	if len(cpus) == 0 {
+		return 0, false
+	}
+
+	firstNode, exists := a.numa.GetCPUNode(cpus[0])
+	if !exists {
+		return 0, false
+	}
+
+	for _, cpu := range cpus[1:] {
+		node, exists := a.numa.GetCPUNode(cpu)
+		if !exists || node != firstNode {
+			return 0, false
+		}
+	}
+
+	return firstNode, true
 }

@@ -36,12 +36,22 @@ Whenever the reserved set changes (creation or termination of annotated/integer 
 - Recompute the shared pool and live-update every running shared container's `cpuset.cpus` so that it never overlaps any reserved core
 - Shared containers started before the component comes up (e.g., after node reboot) shall be corrected in the same way once the component registers
 
-### 3.3 Memory Placement for Annotated Pods
+### 3.3 Memory Placement
 
-1. Determine NUMA node(s) of every CPU in the annotation
-2. If all CPUs belong to one NUMA node — set `cpuset.mems` to that node
-3. Otherwise — set `cpuset.mems` to the union of the involved nodes
-4. Integer and shared pods: leave `cpuset.mems` unchanged
+#### Annotated and Integer Pods (Exclusive Allocation)
+
+1. Determine NUMA node(s) of all assigned CPUs
+2. Set `cpuset.mems` to the union of NUMA nodes containing the assigned CPUs
+   - If CPUs span 1 NUMA node → use that single node
+   - If CPUs span 2 NUMA nodes → use both nodes  
+   - If CPUs span 4 NUMA nodes → use all four nodes
+3. This ensures memory placement is restricted only to NUMA nodes that contain the allocated CPUs
+
+#### Shared Pods
+
+1. Leave `cpuset.mems` unchanged (inherit system default)
+2. Shared pods may access memory from all NUMA nodes regardless of their CPU constraints
+3. This provides maximum memory allocation flexibility for non-exclusive workloads
 
 ### 3.4 Book-keeping and Recovery
 

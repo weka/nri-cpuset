@@ -1,2 +1,5 @@
 coverage.out
 vendor
+.claude/
+.local/
+.idea

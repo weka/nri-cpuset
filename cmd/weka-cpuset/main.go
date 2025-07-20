@@ -17,7 +17,6 @@ import (
 
 const (
 	pluginName  = "weka-cpuset"
-	pluginIdx   = "20"
 	version     = "1.0.0"
 	description = "Weka NRI CPU/NUMA Placement Component"
 )
@@ -34,6 +33,7 @@ var (
 	pluginSocket string
 	logLevel     string
 	dryRun       bool
+	pluginIdx    string
 )
 
 func main() {
@@ -47,6 +47,7 @@ func main() {
 	rootCmd.Flags().StringVar(&pluginSocket, "socket", "", "NRI plugin socket path")
 	rootCmd.Flags().StringVar(&logLevel, "log-level", "info", "Log level (debug, info, warn, error)")
 	rootCmd.Flags().BoolVar(&dryRun, "dry-run", false, "Dry run mode (no actual cgroup changes)")
+	rootCmd.Flags().StringVar(&pluginIdx, "plugin-index", "99", "Plugin index for NRI registration (default: 99)")
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -90,10 +91,12 @@ func runPlugin(cmd *cobra.Command, args []string) error {
 	}
 
 	// Create NRI stub options
-	stubOptions := []stub.Option{
-		stub.WithPluginName(pluginName),
-		stub.WithPluginIdx(pluginIdx),
-	}
+	var stubOptions []stub.Option
+	
+	// Add plugin name and index
+	fullPluginName := pluginIdx + "-" + pluginName
+	stubOptions = append(stubOptions, stub.WithPluginName(fullPluginName))
+	stubOptions = append(stubOptions, stub.WithPluginIdx(pluginIdx))
 	
 	// Add socket path if specified
 	if pluginSocket != "" {
@@ -256,101 +259,13 @@ func (p *plugin) hasIntegerSemantics(container *api.Container) bool {
 }
 
 func (p *plugin) handleAnnotatedContainer(pod *api.PodSandbox, container *api.Container, reserved []int) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
-	if pod.Annotations == nil {
-		return nil, nil, fmt.Errorf("missing annotations for annotated container")
-	}
-	
-	cpuList, exists := pod.Annotations["weka.io/cores-ids"]
-	if !exists {
-		return nil, nil, fmt.Errorf("missing weka.io/cores-ids annotation")
-	}
-	
-	// Validate the CPU list
-	if err := p.allocator.ValidateAnnotatedCPUs(cpuList, reserved); err != nil {
-		return nil, nil, fmt.Errorf("invalid annotated CPUs: %w", err)
-	}
-	
-	cpus, err := numa.ParseCPUList(cpuList)
-	if err != nil {
-		return nil, nil, fmt.Errorf("invalid CPU list format: %w", err)
-	}
-
-	// Determine NUMA nodes for memory placement
-	memNodes := p.numa.GetCPUNodesUnion(cpus)
-
-	adjustment := &api.ContainerAdjustment{
-		Linux: &api.LinuxContainerAdjustment{
-			Resources: &api.LinuxResources{
-				Cpu: &api.LinuxCPU{
-					Cpus: cpuList,
-				},
-			},
-		},
-	}
-
-	// Set memory nodes if available
-	if len(memNodes) > 0 {
-		adjustment.Linux.Resources.Memory = &api.LinuxMemory{}
-		// Note: NRI v0.9 may not directly support cpuset.mems
-		// This would need to be handled through cgroup operations or annotations
-	}
-
-	return adjustment, nil, nil
+	return p.allocator.AllocateContainer(pod, container)
 }
 
 func (p *plugin) handleIntegerContainer(pod *api.PodSandbox, container *api.Container, reserved []int) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
-	if container.Linux == nil || container.Linux.Resources == nil || container.Linux.Resources.Cpu == nil {
-		return nil, nil, fmt.Errorf("missing CPU resources for integer container")
-	}
-	
-	cpu := container.Linux.Resources.Cpu
-	if cpu.Quota == nil || cpu.Period == nil || cpu.Quota.GetValue() <= 0 || cpu.Period.GetValue() <= 0 {
-		return nil, nil, fmt.Errorf("invalid CPU quota/period for integer container")
-	}
-	
-	cpuCores := int(cpu.Quota.GetValue() / int64(cpu.Period.GetValue()))
-	
-	cpus, err := p.allocator.AllocateExclusiveCPUs(cpuCores, reserved)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to allocate exclusive CPUs: %w", err)
-	}
-
-	adjustment := &api.ContainerAdjustment{
-		Linux: &api.LinuxContainerAdjustment{
-			Resources: &api.LinuxResources{
-				Cpu: &api.LinuxCPU{
-					Cpus: numa.FormatCPUList(cpus),
-				},
-			},
-		},
-	}
-
-	// Generate updates for shared containers that need to be moved
-	var updates []*api.ContainerUpdate
-	_ = p.allocator.ComputeSharedPool(append(reserved, cpus...))
-	
-	// This would update existing shared containers, but we need state management
-	// for now, just return the adjustment
-	
-	return adjustment, updates, nil
+	return p.allocator.AllocateContainer(pod, container)
 }
 
 func (p *plugin) handleSharedContainer(pod *api.PodSandbox, container *api.Container, reserved []int) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
-	sharedPool := p.allocator.ComputeSharedPool(reserved)
-	
-	if len(sharedPool) == 0 {
-		return nil, nil, fmt.Errorf("shared CPU pool is empty")
-	}
-
-	adjustment := &api.ContainerAdjustment{
-		Linux: &api.LinuxContainerAdjustment{
-			Resources: &api.LinuxResources{
-				Cpu: &api.LinuxCPU{
-					Cpus: numa.FormatCPUList(sharedPool),
-				},
-			},
-		},
-	}
-
-	return adjustment, nil, nil
+	return p.allocator.AllocateContainer(pod, container)
 }

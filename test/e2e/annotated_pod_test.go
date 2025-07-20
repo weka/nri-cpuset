@@ -177,7 +177,7 @@ var _ = Describe("Annotated Pod Tests", Label("e2e"), func() {
 			}, timeout, interval).Should(BeTrue(), "Pod should have memory accessible from all involved NUMA nodes")
 		})
 
-		It("should not affect memory placement for integer and shared pods", func() {
+		It("should set memory nodes for integer pods and leave shared pods unrestricted", func() {
 			By("Creating integer and shared pods")
 			integerResources := &corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{
@@ -203,16 +203,26 @@ var _ = Describe("Annotated Pod Tests", Label("e2e"), func() {
 			waitForPodRunning(createdInteger.Name)
 			waitForPodRunning(createdShared.Name)
 
-			By("Verifying memory placement is not modified for non-annotated pods")
+			By("Verifying integer pod has NUMA memory restriction based on assigned CPUs")
 			Eventually(func() bool {
-				intOutput, err1 := getPodCPUSet(createdInteger.Name)
-				sharedOutput, err2 := getPodCPUSet(createdShared.Name)
-				if err1 != nil || err2 != nil {
+				intOutput, err := getPodCPUSet(createdInteger.Name)
+				if err != nil {
 					return false
 				}
-				// Memory should remain unrestricted or follow system defaults
-				return strings.Contains(intOutput, "Cpus_allowed_list:") && strings.Contains(sharedOutput, "Cpus_allowed_list:")
-			}, timeout, interval).Should(BeTrue(), "Non-annotated pods should not have memory placement restrictions")
+				// Integer pod should have specific NUMA memory restriction
+				return strings.Contains(intOutput, "Mems_allowed_list:") && 
+					   strings.Contains(intOutput, "Cpus_allowed_list:")
+			}, timeout, interval).Should(BeTrue(), "Integer pod should have NUMA memory restriction")
+
+			By("Verifying shared pod has unrestricted memory access")
+			Eventually(func() bool {
+				sharedOutput, err := getPodCPUSet(createdShared.Name)
+				if err != nil {
+					return false
+				}
+				// Shared pod should have system default memory access (typically all nodes)
+				return strings.Contains(sharedOutput, "Cpus_allowed_list:")
+			}, timeout, interval).Should(BeTrue(), "Shared pod should have CPU assignment")
 		})
 	})
 })

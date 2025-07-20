@@ -31,6 +31,9 @@
 ---
 
 ## Commands
+
+> **IMPORTANT:** Always use `/usr/bin/make` instead of `make` to avoid zsh autoload function conflicts in automated environments.
+
 | Task | Command |
 |------|---------|
 | Local build | `make build` → `./bin/weka-cpuset` |
@@ -43,6 +46,7 @@
 | **Kind cluster cleanup** | `make kind-down` |
 | Image build | `make image` |
 | Helm chart package | `make chart` |
+| **Quick dev deploy** | `./hack/build-and-deploy.sh --kubeconfig PATH` |
 
 ---
 
@@ -121,3 +125,67 @@ KUBECONFIG=~/.kube/prod TEST_NS=weka-test make test-e2e-live
 ### Docs/PRD
 - PRDs located in docs/prd.md 
 - When implementing new functionality ensure it is covered in prd.md
+
+---
+
+## DaemonSet Deployment (Live Clusters)
+
+**⚠️ IMPORTANT: For development against live clusters, use the daemonset deployment approach.**
+
+### Quick Development Cycle
+
+For rapid iteration on live clusters:
+
+```bash
+# Build, push, and deploy in one command
+./hack/build-and-deploy.sh --kubeconfig /path/to/kubeconfig/example
+
+# With debug output
+./hack/build-and-deploy.sh --kubeconfig /path/to/kubeconfig/example --debug
+
+# Skip building (use existing image)
+./hack/build-and-deploy.sh --kubeconfig /path/to/kubeconfig/example --skip-build
+
+# Dry run (show what would be done)
+./hack/build-and-deploy.sh --kubeconfig /path/to/kubeconfig/example --dry-run
+```
+
+**Features:**
+- Builds Docker image with correct linux/amd64 platform
+- Pushes to `images.scalar.dev.weka.io:5002/weka-nri-cpuset:TIMESTAMP`
+- Updates daemonset manifest with new image tag automatically
+- Deploys RBAC, ConfigMap, and DaemonSet
+- Waits for rollout completion and shows status
+
+### Cluster Preparation
+
+**One-time setup:** Before first daemonset deployment, prepare cluster nodes:
+
+```bash
+# 1. Clean up any old plugin installations
+./hack/cleanup-plugin.sh --kubeconfig /path/to/kubeconfig/example
+
+# 2. Reconfigure nodes for daemonset deployment (disables static CPU manager)
+./hack/reconfigure-k3s-daemonset.sh --kubeconfig /path/to/kubeconfig/example
+
+# Or single node for testing:
+./hack/reconfigure-k3s-daemonset.sh --kubeconfig /path/to/kubeconfig/example --single-node 0
+```
+
+### Monitoring & Debugging
+
+```bash
+# Check pod status
+kubectl --kubeconfig /path/to/kubeconfig/example get pods -n kube-system -l app=weka-nri-cpuset
+
+# View logs from all pods
+kubectl --kubeconfig /path/to/kubeconfig/example logs -n kube-system -l app=weka-nri-cpuset -f
+
+# Describe pods for troubleshooting
+kubectl --kubeconfig /path/to/kubeconfig/example describe pods -n kube-system -l app=weka-nri-cpuset
+
+# Delete daemonset (for clean redeployment)
+kubectl --kubeconfig /path/to/kubeconfig/example delete daemonset weka-nri-cpuset -n kube-system
+```
+
+**Registry:** All images are pushed to `images.scalar.dev.weka.io:5002/weka-nri-cpuset:TIMESTAMP` for live cluster deployment.

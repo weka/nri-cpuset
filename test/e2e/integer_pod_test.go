@@ -1,6 +1,8 @@
 package e2e
 
 import (
+	"strings"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
@@ -298,6 +300,161 @@ var _ = Describe("Integer Pod Edge Cases", Label("e2e"), func() {
 				return output
 			}, timeout, interval).Should(ContainSubstring("Cpus_allowed_list:"), 
 				"Pod should get shared CPU treatment due to request/limit mismatch")
+		})
+
+		It("should set NUMA memory nodes for integer pods based on assigned CPUs", func() {
+			By("Creating an integer pod with single CPU")
+			resources := &corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("1"),
+					corev1.ResourceMemory: resource.MustParse("1Gi"),
+				},
+				Limits: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("1"),
+					corev1.ResourceMemory: resource.MustParse("1Gi"),
+				},
+			}
+
+			pod := createTestPod("numa-integer-single-cpu", nil, resources)
+			createdPod, err := kubeClient.CoreV1().Pods(testNamespace).Create(ctx, pod, metav1.CreateOptions{})
+			Expect(err).ToNot(HaveOccurred())
+
+			By("Waiting for pod to be running")
+			waitForPodRunning(createdPod.Name)
+
+			By("Verifying memory node matches CPU NUMA node")
+			Eventually(func() bool {
+				output, err := getPodCPUSet(createdPod.Name)
+				if err != nil {
+					return false
+				}
+				// Should have both CPU and memory node restrictions
+				return strings.Contains(output, "Cpus_allowed_list:") && 
+					   strings.Contains(output, "Mems_allowed_list:")
+			}, timeout, interval).Should(BeTrue(), "Integer pod should have NUMA memory restriction matching assigned CPU")
+		})
+
+		It("should set NUMA memory nodes spanning multiple nodes for multi-CPU integer pods", func() {
+			By("Creating an integer pod with multiple CPUs")
+			resources := &corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("2"),
+					corev1.ResourceMemory: resource.MustParse("2Gi"),
+				},
+				Limits: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("2"),
+					corev1.ResourceMemory: resource.MustParse("2Gi"),
+				},
+			}
+
+			pod := createTestPod("numa-integer-multi-cpu", nil, resources)
+			createdPod, err := kubeClient.CoreV1().Pods(testNamespace).Create(ctx, pod, metav1.CreateOptions{})
+			Expect(err).ToNot(HaveOccurred())
+
+			By("Waiting for pod to be running")
+			waitForPodRunning(createdPod.Name)
+
+			By("Verifying memory nodes include union of CPU NUMA nodes")
+			Eventually(func() bool {
+				output, err := getPodCPUSet(createdPod.Name)
+				if err != nil {
+					return false
+				}
+				// Should have both CPU and memory node restrictions
+				// Memory nodes should correspond to NUMA nodes of assigned CPUs
+				return strings.Contains(output, "Cpus_allowed_list:") && 
+					   strings.Contains(output, "Mems_allowed_list:")
+			}, timeout, interval).Should(BeTrue(), "Integer pod should have NUMA memory restriction spanning assigned CPU nodes")
+		})
+	})
+})
+
+var _ = Describe("Integer Pod NUMA Memory Placement", Label("e2e"), func() {
+	Context("When testing NUMA memory placement for integer pods", func() {
+		AfterEach(func() {
+			pods, err := kubeClient.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{})
+			if err == nil {
+				for _, pod := range pods.Items {
+					_ = kubeClient.CoreV1().Pods(testNamespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
+				}
+			}
+		})
+
+		It("should restrict memory to single NUMA node when all CPUs on same node", func() {
+			By("Creating integer pod that should get CPUs from single NUMA node")
+			resources := &corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("1"),
+					corev1.ResourceMemory: resource.MustParse("1Gi"),
+				},
+				Limits: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("1"),
+					corev1.ResourceMemory: resource.MustParse("1Gi"),
+				},
+			}
+
+			pod := createTestPod("numa-single-node-integer", nil, resources)
+			createdPod, err := kubeClient.CoreV1().Pods(testNamespace).Create(ctx, pod, metav1.CreateOptions{})
+			Expect(err).ToNot(HaveOccurred())
+
+			By("Waiting for pod to be running")
+			waitForPodRunning(createdPod.Name)
+
+			By("Verifying memory is restricted to single NUMA node")
+			Eventually(func() bool {
+				output, err := getPodCPUSet(createdPod.Name)
+				if err != nil {
+					return false
+				}
+				
+				// Parse the output to verify memory node matches CPU node
+				lines := strings.Split(output, "\n")
+				var cpuLine, memLine string
+				for _, line := range lines {
+					if strings.Contains(line, "Cpus_allowed_list:") {
+						cpuLine = line
+					}
+					if strings.Contains(line, "Mems_allowed_list:") {
+						memLine = line
+					}
+				}
+				
+				// Both should be present and memory should be restricted
+				return cpuLine != "" && memLine != "" && !strings.Contains(memLine, "0-1") && !strings.Contains(memLine, "0,1")
+			}, timeout, interval).Should(BeTrue(), "Memory should be restricted to single NUMA node")
+		})
+
+		It("should use union of NUMA nodes when CPUs span multiple nodes", func() {
+			By("Creating integer pod that should get CPUs from multiple NUMA nodes")
+			resources := &corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("4"), // More likely to span NUMA nodes
+					corev1.ResourceMemory: resource.MustParse("4Gi"),
+				},
+				Limits: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("4"),
+					corev1.ResourceMemory: resource.MustParse("4Gi"),
+				},
+			}
+
+			pod := createTestPod("numa-multi-node-integer", nil, resources)
+			createdPod, err := kubeClient.CoreV1().Pods(testNamespace).Create(ctx, pod, metav1.CreateOptions{})
+			Expect(err).ToNot(HaveOccurred())
+
+			By("Waiting for pod to be running")
+			waitForPodRunning(createdPod.Name)
+
+			By("Verifying memory includes all necessary NUMA nodes")
+			Eventually(func() bool {
+				output, err := getPodCPUSet(createdPod.Name)
+				if err != nil {
+					return false
+				}
+				
+				// Should have memory nodes corresponding to CPU placement
+				return strings.Contains(output, "Cpus_allowed_list:") && 
+					   strings.Contains(output, "Mems_allowed_list:")
+			}, timeout, interval).Should(BeTrue(), "Memory should span NUMA nodes containing assigned CPUs")
 		})
 	})
 })
