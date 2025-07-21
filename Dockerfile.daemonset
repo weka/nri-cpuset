@@ -1,0 +1,27 @@
+# Multi-stage build for weka-nri-cpuset daemonset
+FROM golang:1.24-alpine AS builder
+
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -installsuffix cgo -o weka-cpuset ./cmd/weka-cpuset/
+
+# Final stage
+FROM alpine:3.19
+
+RUN apk --no-cache add ca-certificates
+WORKDIR /root/
+
+# Copy the binary
+COPY --from=builder /app/weka-cpuset /usr/local/bin/weka-cpuset
+
+# Ensure the binary is executable
+RUN chmod +x /usr/local/bin/weka-cpuset
+
+# Create non-root user (although we'll run as root in daemonset due to privileges needed)
+RUN addgroup -g 1001 -S weka && \
+    adduser -S -u 1001 -G weka weka
+
+ENTRYPOINT ["/usr/local/bin/weka-cpuset"]

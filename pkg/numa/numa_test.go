@@ -64,6 +64,24 @@ var _ = Describe("ParseCPUList", func() {
 		_, err := ParseCPUList("0,abc,2")
 		Expect(err).To(HaveOccurred())
 	})
+
+	It("should return error for empty values in list", func() {
+		_, err := ParseCPUList("0,,2")
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("empty CPU value"))
+	})
+
+	It("should return error for trailing comma", func() {
+		_, err := ParseCPUList("0,2,")
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("empty CPU value"))
+	})
+
+	It("should return error for leading comma", func() {
+		_, err := ParseCPUList(",0,2")
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("empty CPU value"))
+	})
 })
 
 var _ = Describe("FormatCPUList", func() {
@@ -225,21 +243,26 @@ var _ = Describe("NUMA Manager", func() {
 	// Mock file system setup for testing
 	createMockManager := func(nodes []int, cpuNodeMapping map[int]int, onlineCPUs []int) *Manager {
 		m := &Manager{
-			nodes:      append([]int(nil), nodes...),
-			cpuToNode:  make(map[int]int),
-			nodeToCPUs: make(map[int][]int),
 			onlineCPUs: append([]int(nil), onlineCPUs...),
+			nodeMap:    make(map[int][]int),
+			cpuNodeMap: make(map[int]int),
+			siblingMap: make(map[int][]int),
+		}
+
+		// Initialize all provided nodes (even those without CPUs for discovery)
+		for _, nodeID := range nodes {
+			m.nodeMap[nodeID] = []int{}
 		}
 
 		// Set up CPU to node mapping
 		for cpu, node := range cpuNodeMapping {
-			m.cpuToNode[cpu] = node
-			m.nodeToCPUs[node] = append(m.nodeToCPUs[node], cpu)
+			m.cpuNodeMap[cpu] = node
+			m.nodeMap[node] = append(m.nodeMap[node], cpu)
 		}
 
 		// Sort CPU lists for each node
-		for nodeID := range m.nodeToCPUs {
-			sort.Ints(m.nodeToCPUs[nodeID])
+		for nodeID := range m.nodeMap {
+			sort.Ints(m.nodeMap[nodeID])
 		}
 
 		return m
@@ -250,7 +273,7 @@ var _ = Describe("NUMA Manager", func() {
 			manager = createMockManager([]int{0, 1}, map[int]int{0: 0, 1: 0, 2: 1, 3: 1}, []int{0, 1, 2, 3})
 			cpus := manager.GetOnlineCPUs()
 			Expect(cpus).To(Equal([]int{0, 1, 2, 3}))
-			
+
 			// Modify returned slice should not affect internal state
 			cpus[0] = 99
 			Expect(manager.GetOnlineCPUs()).To(Equal([]int{0, 1, 2, 3}))
@@ -274,7 +297,7 @@ var _ = Describe("NUMA Manager", func() {
 			manager = createMockManager([]int{0, 1, 2}, map[int]int{}, []int{})
 			nodes := manager.GetNodes()
 			Expect(nodes).To(Equal([]int{0, 1, 2}))
-			
+
 			// Modify returned slice should not affect internal state
 			nodes[0] = 99
 			Expect(manager.GetNodes()).To(Equal([]int{0, 1, 2}))
@@ -291,8 +314,8 @@ var _ = Describe("NUMA Manager", func() {
 		BeforeEach(func() {
 			// Node 0: CPUs 0,1,2,3  Node 1: CPUs 4,5,6,7
 			manager = createMockManager(
-				[]int{0, 1}, 
-				map[int]int{0: 0, 1: 0, 2: 0, 3: 0, 4: 1, 5: 1, 6: 1, 7: 1}, 
+				[]int{0, 1},
+				map[int]int{0: 0, 1: 0, 2: 0, 3: 0, 4: 1, 5: 1, 6: 1, 7: 1},
 				[]int{0, 1, 2, 3, 4, 5, 6, 7},
 			)
 		})
@@ -323,8 +346,8 @@ var _ = Describe("NUMA Manager", func() {
 	Describe("GetNodeCPUs", func() {
 		BeforeEach(func() {
 			manager = createMockManager(
-				[]int{0, 1}, 
-				map[int]int{0: 0, 1: 0, 2: 0, 4: 1, 5: 1}, 
+				[]int{0, 1},
+				map[int]int{0: 0, 1: 0, 2: 0, 4: 1, 5: 1},
 				[]int{0, 1, 2, 4, 5},
 			)
 		})
@@ -350,7 +373,7 @@ var _ = Describe("NUMA Manager", func() {
 		It("should return copy of CPU list", func() {
 			cpus, exists := manager.GetNodeCPUs(0)
 			Expect(exists).To(BeTrue())
-			
+
 			// Modify returned slice should not affect internal state
 			cpus[0] = 99
 			cpus2, _ := manager.GetNodeCPUs(0)
@@ -369,8 +392,8 @@ var _ = Describe("NUMA Manager", func() {
 		BeforeEach(func() {
 			// Node 0: CPUs 0,1,2  Node 1: CPUs 4,5  Node 2: CPUs 8,9
 			manager = createMockManager(
-				[]int{0, 1, 2}, 
-				map[int]int{0: 0, 1: 0, 2: 0, 4: 1, 5: 1, 8: 2, 9: 2}, 
+				[]int{0, 1, 2},
+				map[int]int{0: 0, 1: 0, 2: 0, 4: 1, 5: 1, 8: 2, 9: 2},
 				[]int{0, 1, 2, 4, 5, 8, 9},
 			)
 		})
@@ -420,8 +443,8 @@ var _ = Describe("NUMA Manager", func() {
 		It("should handle asymmetric NUMA topology", func() {
 			// Node 0: CPUs 0,1,2,3,4,5  Node 1: CPUs 6,7  Node 2: CPU 8
 			manager = createMockManager(
-				[]int{0, 1, 2}, 
-				map[int]int{0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 1, 7: 1, 8: 2}, 
+				[]int{0, 1, 2},
+				map[int]int{0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 1, 7: 1, 8: 2},
 				[]int{0, 1, 2, 3, 4, 5, 6, 7, 8},
 			)
 
@@ -448,8 +471,8 @@ var _ = Describe("NUMA Manager", func() {
 		It("should handle sparse node numbering", func() {
 			// Nodes 0, 3, 7 (non-consecutive)
 			manager = createMockManager(
-				[]int{0, 3, 7}, 
-				map[int]int{0: 0, 1: 0, 4: 3, 5: 3, 8: 7}, 
+				[]int{0, 3, 7},
+				map[int]int{0: 0, 1: 0, 4: 3, 5: 3, 8: 7},
 				[]int{0, 1, 4, 5, 8},
 			)
 
@@ -469,37 +492,37 @@ var _ = Describe("NUMA Manager", func() {
 	Describe("Edge cases", func() {
 		It("should handle manager with no nodes", func() {
 			manager = &Manager{
-				nodes:      []int{},
-				cpuToNode:  make(map[int]int),
-				nodeToCPUs: make(map[int][]int),
 				onlineCPUs: []int{},
+				nodeMap:    make(map[int][]int),
+				cpuNodeMap: make(map[int]int),
+				siblingMap: make(map[int][]int),
 			}
 
 			Expect(manager.GetNodes()).To(BeEmpty())
 			Expect(manager.GetOnlineCPUs()).To(BeEmpty())
-			
+
 			_, exists := manager.GetCPUNode(0)
 			Expect(exists).To(BeFalse())
-			
+
 			_, exists = manager.GetNodeCPUs(0)
 			Expect(exists).To(BeFalse())
-			
+
 			nodes := manager.GetCPUNodesUnion([]int{0, 1})
 			Expect(nodes).To(BeEmpty())
 		})
 
 		It("should handle manager with nil maps", func() {
 			manager = &Manager{
-				nodes:      []int{0},
-				cpuToNode:  nil,
-				nodeToCPUs: nil,
 				onlineCPUs: []int{0},
+				nodeMap:    nil,
+				cpuNodeMap: nil,
+				siblingMap: nil,
 			}
 
 			// Should not panic and return sensible defaults
 			_, exists := manager.GetCPUNode(0)
 			Expect(exists).To(BeFalse())
-			
+
 			_, exists = manager.GetNodeCPUs(0)
 			Expect(exists).To(BeFalse())
 		})

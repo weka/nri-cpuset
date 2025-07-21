@@ -8,6 +8,7 @@ A node-resident component shall control CPU and NUMA-memory placement for every 
 - Pods that qualify for static CPU-manager treatment obtain exclusive CPUs automatically
 - All remaining pods share only the currently unreserved cores
 - The placement rules remain valid across node reboots, crashes and live scale-up/down events
+- Integer pods can be live-reassigned to different cores when annotated pods create conflicts
 
 ## 2. Definitions
 
@@ -25,8 +26,8 @@ A node-resident component shall control CPU and NUMA-memory placement for every 
 
 | Pod type | Handling of cpuset.cpus | Admission errors |
 |----------|------------------------|------------------|
-| **Annotated** | Use the CPU list verbatim. Overlap with other annotated pods allowed (reference-count). | • CPU offline -or-<br>• CPU reserved by an integer pod. |
-| **Integer** | Allocate N exclusive CPUs (N = limits.cpu) from the free set `online − reserved`. | Not enough free CPUs. |
+| **Annotated** | Use the CPU list verbatim. Overlap with other annotated pods allowed (reference-count). If conflicts with integer pods exist and sufficient free CPUs are available, trigger live reallocation of conflicting integer pods to different exclusive CPU sets. | • CPU offline -or-<br>• CPU reserved by an integer pod with insufficient free CPUs for reallocation. |
+| **Integer** | Allocate N exclusive CPUs (N = limits.cpu) from the free set `online − reserved`. Prefer sibling cores (hyperthreads) when available: for 2 cores prefer siblings, for 3 cores prefer full core + one sibling, for additional cores prefer completing partial cores before fragmenting new ones. Must avoid CPUs already allocated to annotated pods. | Not enough free CPUs after excluding annotated pod allocations. |
 | **Shared** | Constrain to the current shared pool. | Shared pool would be empty after exclusion. |
 
 ### 3.2 Runtime Updates
@@ -34,7 +35,9 @@ A node-resident component shall control CPU and NUMA-memory placement for every 
 Whenever the reserved set changes (creation or termination of annotated/integer pods) the component shall:
 
 - Recompute the shared pool and live-update every running shared container's `cpuset.cpus` so that it never overlaps any reserved core
+- For annotated pod admission with conflicts: live-reassign conflicting integer containers to new exclusive CPU sets when sufficient free cores exist
 - Shared containers started before the component comes up (e.g., after node reboot) shall be corrected in the same way once the component registers
+- All live updates maintain transactional semantics: either all affected containers are updated successfully or the operation fails atomically
 
 ### 3.3 Memory Placement
 
@@ -46,6 +49,7 @@ Whenever the reserved set changes (creation or termination of annotated/integer 
    - If CPUs span 2 NUMA nodes → use both nodes  
    - If CPUs span 4 NUMA nodes → use all four nodes
 3. This ensures memory placement is restricted only to NUMA nodes that contain the allocated CPUs
+4. During live reassignment, memory placement is recalculated based on new CPU assignments
 
 #### Shared Pods
 
@@ -65,11 +69,40 @@ On every Synchronize event (initial connect, crash recovery) rebuild the above f
 
 On container exit release reservations and trigger shared-pool refresh.
 
+For live reassignment operations, maintain transactional integrity by tracking pending changes and rolling back on failure.
+
+### 3.5 CPU Allocation Strategy
+
+#### Sibling Core Preference for Integer Pods
+
+When allocating CPUs for integer containers, prefer sibling cores (hyperthreads) to optimize cache locality and minimize fragmentation:
+
+1. **Two cores requested**: Prefer two sibling cores from the same physical core
+2. **Three cores requested**: Prefer one complete physical core (2 siblings) plus one additional core
+3. **Additional cores**: Prefer completing partially allocated physical cores before fragmenting new cores
+4. **Fallback**: If optimal sibling allocation is not possible, fall back to any available cores while maintaining exclusivity
+
+This strategy optimizes for:
+- Better cache locality between related threads
+- Reduced memory bandwidth contention  
+- Minimized core fragmentation for future allocations
+- Improved overall system performance
+
+#### Live Reassignment Priority
+
+During annotated pod admission with integer pod conflicts:
+
+1. **Conflict Detection**: Identify integer containers using CPUs requested by annotated pod
+2. **Reallocation Feasibility**: Verify sufficient free CPUs exist for reassignment
+3. **Sibling-Aware Reassignment**: Apply sibling preference when reallocating integer containers
+4. **Atomic Updates**: Execute all container updates atomically or fail the entire operation
+5. **NUMA Consistency**: Maintain optimal NUMA placement during reassignment
+
 ## 4. Ordering and Conflicts
 
 Register the component with `index = 99` so it executes after the reference topology-aware
 
-If any later component writes a conflicting value to the same cgroup field, NRI shall abort container creation (transactional safety).
+If any later component writes a conflicting value to the same cgroup field, NRI shall abort container creation (transactional safety)t
 
 ## 5. Deployment & Cold-boot Guarantee
 
@@ -93,7 +126,9 @@ A privileged DaemonSet may still be used for upgrades and logging; the host bina
 |-----------|--------|
 | Invalid annotation syntax | Pod scheduled with FailedScheduling and explicit error. |
 | Insufficient CPUs for integer pod | Same. |
-| Shared pool exhausted | Same. |
+| Insufficient CPUs for integer pod after attempted live reallocation | Same. |
+| Live reassignment transaction failure | Pod creation fails, existing containers remain unchanged. |
+| Shared pool exhausted | Pod scheduled with FailedScheduling and explicit error. |
 | NUMA resolution failure for annotated pod | Same. |
 
 ## 7. Feasibility Statement
@@ -101,4 +136,6 @@ A privileged DaemonSet may still be used for upgrades and logging; the host bina
 - `cpuset.cpus` and `cpuset.mems` are writable through NRI ContainerAdjustment and UpdateContainers interfaces
 - Live cpuset changes are accepted by containerd and honoured by the kernel; only already-faulted memory pages may remain on their original NUMA nodes
 - NUMA node discovery is available via `/sys/devices/system/node/`
+- Sibling core topology is discoverable through `/sys/devices/system/cpu/cpu*/topology/`
+- Transactional container updates are achievable through NRI's batched UpdateContainers interface
 - All stated requirements are implementable with the current NRI and kernel capabilities

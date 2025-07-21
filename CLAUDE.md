@@ -1,188 +1,237 @@
-# Weka CPU/NUMA Placement Component – Project Brief
+# Weka NRI CPUSet Component
 
-*Node-Resource-Interface (NRI) plugin written in Go 1.22 that enforces CPU pinning and NUMA-aware memory placement in Kubernetes.*
+A Kubernetes NRI (Node Resource Interface) plugin that provides intelligent CPU and NUMA memory placement for containers with support for live reassignment and sibling core allocation.
 
----
+## Project Overview
 
-## Tech Stack
-- Go 1.24 - static builds (`CGO_ENABLED=0`)
-- containerd 2.0+ with NRI v0.9
-- Kubernetes ≥ 1.28
-- Ginkgo 2 + Gomega for Go unit/integration tests
-- Bats for bash-level smoke tests
-- Kind for local e2e CI; real cluster e2e uses `$KUBECONFIG`
+- **Purpose**: Pin exact CPUs via annotations, automatic exclusive allocation for integer pods, shared pool management
+- **Key Features**: Live CPU reassignment, sibling-aware allocation, NUMA memory placement, transactional updates
+- **Architecture**: Node-resident NRI plugin with state management and conflict resolution
 
----
+## Quick Navigation
 
-## Project Structure
-| Path | Purpose |
-|------|---------|
-| `cmd/weka-cpuset/` | `main.go`, CLI flags, stub init |
-| `pkg/allocator/` | core allocation logic (pure Go, unit-testable) |
-| `pkg/numa/` | NUMA helpers (reads `/sys/devices/system/node`) |
-| `pkg/state/` | in-memory maps + `Synchronize` rebuild |
-| `test/e2e/` | Ginkgo tests that deploy the plugin to a *live* cluster |
-| `hack/` | helper scripts (kind bootstrap, image build/push) |
-| `docs/` | design notes, architecture diagrams |
-| `deploy/` | K8s manifests (DS, RBAC), Helm chart |
-
-> **Do Not Touch** `vendor/` (managed by `go mod vendor`).
-
----
-
-## Commands
-| Task | Command |
-|------|---------|
-| Local build | `make build` → `./bin/weka-cpuset` |
-| Lint & static analysis | `make lint` (golangci-lint) |
-| Unit tests | `make test` |
-| Integration tests (no K8s) | `make test-integration` |
-| **Kind e2e (RECOMMENDED)** | `make test-e2e-kind` |
-| **Live cluster e2e** | `make test-e2e-live` |
-| **Kind cluster setup** | `make kind-up` |
-| **Kind cluster cleanup** | `make kind-down` |
-| Image build | `make image` |
-| Helm chart package | `make chart` |
-| **Quick dev deploy** | `./hack/build-and-deploy.sh --kubeconfig PATH` |
-
----
-
-## Coding Conventions
-- Follow **Effective Go** plus `go fumpt`.
-- Keep every file ≤300 LOC; highlight design issues if >600 LOC.
-- Prefer functional options pattern for shared helpers.
-- Public APIs need `godoc` comments.
-
----
-
-## Placement Rules (executable spec)
-1. **Annotated pod** (`weka.io/cores-ids` present)  
-   - Use the list verbatim.  
-   - If **integer semantics** (`requests=limits`, CPU whole number) ⇒ treat as *exclusive*; else *shared*.  
-   - Pin memory (`cpuset.mems`) to NUMA node(s) of annotated CPUs.
-2. **Pure-integer pod** (static CPU manager rules, no annotation)  
-   - Allocate *N* free logical CPUs from `online − exclusive`.  
-3. **Shared pod**  
-   - Restrict to *shared pool* (`online − exclusive`).  
-4. On every change to an exclusive set, recompute the shared pool and live-update running shared containers via `UpdateContainers`.
-
----
-
-## End-to-End Testing Strategy
-
-**⚠️ IMPORTANT: Always prefer Kind-based testing for development and CI.**
-
-### Kind-based Testing (RECOMMENDED)
-The kind-based approach automatically provisions a local Kubernetes cluster with:
-- containerd 2.0+ with NRI v0.9 support enabled
-- Static CPU manager policy configured 
-- Proper NRI plugin directories mounted
-- Plugin image pre-loaded
-
-**Quick start:**
+### Local Development
 ```bash
-# Full automated e2e test with kind cluster
+# Build binary
+make build
+
+# Run unit tests
+make test
+
+# Run all verification (unit + lint + format)
+make verify
+
+# Build Docker image
+make image IMAGE_TAG=dev
+
+# Clean build artifacts
+make clean
+```
+
+### Live Cluster Operations
+
+#### Prerequisites & KUBECONFIG Setup
+**Before running any cluster operations, ensure you have a valid KUBECONFIG:**
+
+1. **Check if KUBECONFIG is already set:**
+   ```bash
+   echo $KUBECONFIG
+   ```
+
+2. **If not set, you must specify one of:**
+   - Set environment variable: `export KUBECONFIG=/path/to/kubeconfig`
+   - Or use inline for single command: `KUBECONFIG=/path/to/kubeconfig <command>`
+
+3. **Test cluster connectivity:**
+   ```bash
+   kubectl cluster-info
+   ```
+
+#### Build & Deploy
+```bash
+# Automated build and deploy to live cluster
+./hack/build-and-deploy.sh --kubeconfig /path/to/kubeconfig
+
+# With custom registry
+./hack/build-and-deploy.sh --kubeconfig /path/to/kubeconfig --registry my-registry.com:5000
+
+# Dry run (see what would happen)
+./hack/build-and-deploy.sh --kubeconfig /path/to/kubeconfig --dry-run --debug
+
+# Skip Docker build (use existing image)
+./hack/build-and-deploy.sh --kubeconfig /path/to/kubeconfig --skip-build
+
+# If KUBECONFIG env var is set, you can omit --kubeconfig flag:
+export KUBECONFIG=/path/to/kubeconfig
+./hack/build-and-deploy.sh
+```
+
+#### E2E Testing
+
+**Test Strategy Guidelines:**
+- **Work on specific broken test** → Run only that test until it passes
+- **Once specific test passes** → Run full test suite to ensure no regressions
+- **Use focused tests for faster iteration during development**
+
+##### Running All E2E Tests
+```bash
+# Run all E2E tests against live cluster (use when all tests should pass)
+KUBECONFIG=/path/to/kubeconfig make test-e2e-live
+
+# Direct script execution
+KUBECONFIG=/path/to/kubeconfig ./hack/e2e-live.sh
+
+# With extended timeout for slow clusters  
+KUBECONFIG=/path/to/kubeconfig TEST_TIMEOUT=60m ./hack/e2e-live.sh
+```
+
+##### Running Specific E2E Tests (Recommended for Development)
+```bash
+# Run specific test suites using Ginkgo focus patterns:
+
+# Test CPU conflict resolution (the test we've been working on)
+KUBECONFIG=/path/to/kubeconfig ginkgo -v --focus="CPU Conflict Resolution" ./test/e2e/
+
+# Test just annotated pod functionality
+KUBECONFIG=/path/to/kubeconfig ginkgo -v --focus="Annotated Pod" ./test/e2e/
+
+# Test live reallocation features
+KUBECONFIG=/path/to/kubeconfig ginkgo -v --focus="Live Reallocation" ./test/e2e/
+
+# Test integer pod allocation
+KUBECONFIG=/path/to/kubeconfig ginkgo -v --focus="Integer Pod" ./test/e2e/
+
+# Test recovery and synchronization
+KUBECONFIG=/path/to/kubeconfig ginkgo -v --focus="Recovery" ./test/e2e/
+
+# Test shared pod functionality  
+KUBECONFIG=/path/to/kubeconfig ginkgo -v --focus="Shared Pod" ./test/e2e/
+
+# Run specific test by exact description
+KUBECONFIG=/path/to/kubeconfig ginkgo -v --focus="should reallocate integer containers when annotated pod creates conflicts" ./test/e2e/
+
+# Run tests that match any keyword
+KUBECONFIG=/path/to/kubeconfig ginkgo -v --focus="conflict" ./test/e2e/
+
+# Run with different verbosity levels
+KUBECONFIG=/path/to/kubeconfig ginkgo -vv --focus="CPU Conflict" ./test/e2e/  # Very verbose
+KUBECONFIG=/path/to/kubeconfig ginkgo --focus="CPU Conflict" ./test/e2e/      # Normal
+
+# Skip certain tests
+KUBECONFIG=/path/to/kubeconfig ginkgo -v --skip="NUMA|Memory" ./test/e2e/
+
+# Run with timeout control
+KUBECONFIG=/path/to/kubeconfig ginkgo -v --timeout=10m --focus="Annotated Pod" ./test/e2e/
+```
+
+##### Running Tests from Specific Files
+```bash
+# Run all tests in a specific file
+KUBECONFIG=/path/to/kubeconfig ginkgo -v ./test/e2e/annotated_pod_test.go
+KUBECONFIG=/path/to/kubeconfig ginkgo -v ./test/e2e/integer_pod_test.go
+KUBECONFIG=/path/to/kubeconfig ginkgo -v ./test/e2e/live_reallocation_test.go
+
+# Run specific test file with focus pattern
+KUBECONFIG=/path/to/kubeconfig ginkgo -v --focus="should pin CPUs according to annotation" ./test/e2e/annotated_pod_test.go
+```
+
+##### Testing Workflow for Bug Fixes
+```bash
+# 1. Work on specific failing test first (faster iteration)
+KUBECONFIG=/path/to/kubeconfig ginkgo -v --focus="should reallocate integer containers when annotated pod creates conflicts" ./test/e2e/
+
+# 2. Once that test passes, run related test group  
+KUBECONFIG=/path/to/kubeconfig ginkgo -v --focus="CPU Conflict Resolution" ./test/e2e/
+
+# 3. Finally, run all tests to check for regressions
+KUBECONFIG=/path/to/kubeconfig make test-e2e-live
+```
+
+### Kind Cluster (Isolated Testing)
+```bash
+# Create kind cluster, deploy, and test (self-contained)
 make test-e2e-kind
 
-# Or step by step:
-make kind-up        # Create kind cluster
-make image          # Build plugin image  
-make test-e2e-kind  # Run tests
-make kind-down      # Cleanup
+# Step by step
+make kind-up           # Create kind cluster
+make test-e2e-kind     # Deploy and test  
+make kind-down         # Cleanup
 ```
 
-**Kind cluster features:**
-- Multi-node setup (1 control-plane + 1 worker)
-- NRI socket properly configured at `/run/containerd/nri/nri.sock`
-- Plugin directory at `/opt/nri/plugins` 
-- CPU manager with system/kube reserved resources
-- Automatic image loading and plugin deployment
-
-### Live Cluster Testing
-For testing against existing clusters (CI/staging/prod):
+### Verification & Testing
 ```bash
-# Prerequisites: 
-# - Cluster must have containerd 2.0+ with NRI enabled
-# - kubectl configured with proper RBAC permissions
+# Unit tests only
+make test
 
-export KUBECONFIG=~/.kube/config
-export TEST_NS=wekaplugin-e2e
-make test-e2e-live
+# Integration tests (no K8s required)
+make test-integration
 
-# Or with custom settings:
-KUBECONFIG=~/.kube/prod TEST_NS=weka-test make test-e2e-live
+# All verification including E2E
+make verify-all
+
+# Specific package tests
+go test -v ./pkg/numa/...
+go test -v ./pkg/allocator/...
+go test -v ./pkg/state/...
 ```
 
-**Live cluster requirements:**
-- containerd 2.0+ with NRI plugin support enabled
-- Kubernetes ≥ 1.28 with static CPU manager policy
-- RBAC permissions for DaemonSet deployment
-- Nodes with sufficient CPU cores for testing
+## Key Files & Directories
 
-### Docs/PRD
-- PRDs located in docs/prd.md 
-- When implementing new functionality ensure it is covered in prd.md
+- **`cmd/weka-cpuset/main.go`** - Main plugin entry point and NRI interface implementation
+- **`pkg/allocator/`** - CPU allocation logic with sibling awareness and conflict resolution
+- **`pkg/state/`** - Container state management and live reallocation orchestration
+- **`pkg/numa/`** - NUMA topology discovery and CPU list parsing
+- **`hack/build-and-deploy.sh`** - Main automation script for build/deploy
+- **`hack/e2e-live.sh`** - E2E test runner for live clusters
+- **`test/e2e/`** - End-to-end test suites
+- **`deploy/manifests/`** - Kubernetes deployment manifests
+- **`docs/prd.md`** - Complete product requirements and technical specifications
 
----
+## Common Commands for AI Assistance
 
-## DaemonSet Deployment (Live Clusters)
-
-**⚠️ IMPORTANT: For development against live clusters, use the daemonset deployment approach.**
-
-### Quick Development Cycle
-
-For rapid iteration on live clusters:
-
+### Debugging Deployment
 ```bash
-# Build, push, and deploy in one command
-./hack/build-and-deploy.sh --kubeconfig /path/to/kubeconfig/example
+# Check DaemonSet status
+kubectl get daemonset -n kube-system weka-cpuset
 
-# With debug output
-./hack/build-and-deploy.sh --kubeconfig /path/to/kubeconfig/example --debug
+# View plugin logs
+kubectl logs -n kube-system -l app=weka-cpuset -f
 
-# Skip building (use existing image)
-./hack/build-and-deploy.sh --kubeconfig /path/to/kubeconfig/example --skip-build
+# Verify NRI registration
+kubectl exec -n kube-system <pod-name> -- ls -la /opt/nri/plugins/
 
-# Dry run (show what would be done)
-./hack/build-and-deploy.sh --kubeconfig /path/to/kubeconfig/example --dry-run
+# Test with sample annotated pod
+kubectl apply -f docs/samples/annotated-daemonset.yaml
 ```
 
-**Features:**
-- Builds Docker image with correct linux/amd64 platform
-- Pushes to `images.scalar.dev.weka.io:5002/weka-nri-cpuset:TIMESTAMP`
-- Updates daemonset manifest with new image tag automatically
-- Deploys RBAC, ConfigMap, and DaemonSet
-- Waits for rollout completion and shows status
-
-### Cluster Preparation
-
-**One-time setup:** Before first daemonset deployment, prepare cluster nodes:
-
+### Development Workflow
 ```bash
-# 1. Clean up any old plugin installations
-./hack/cleanup-plugin.sh --kubeconfig /path/to/kubeconfig/example
+# Make changes to code
+# Run unit tests
+make test
 
-# 2. Reconfigure nodes for daemonset deployment (disables static CPU manager)
-./hack/reconfigure-k3s-daemonset.sh --kubeconfig /path/to/kubeconfig/example
+# Build and deploy changes
+./hack/build-and-deploy.sh --kubeconfig /path/to/kubeconfig
 
-# Or single node for testing:
-./hack/reconfigure-k3s-daemonset.sh --kubeconfig /path/to/kubeconfig/example --single-node 0
+# Run specific E2E test to verify fix
+KUBECONFIG=/path/to/kubeconfig ginkgo -v --focus="specific test description" ./test/e2e/
+
+# Once specific test passes, run full E2E suite
+KUBECONFIG=/path/to/kubeconfig make test-e2e-live
 ```
 
-### Monitoring & Debugging
+## Prerequisites
+- Go 1.21+
+- Docker with registry access
+- kubectl configured for target cluster
+- KUBECONFIG pointing to cluster with NRI support
 
-```bash
-# Check pod status
-kubectl --kubeconfig /path/to/kubeconfig/example get pods -n kube-system -l app=weka-nri-cpuset
+## Troubleshooting Quick Reference
+1. **Build fails**: Check Go version and dependencies with `go mod tidy`
+2. **Deploy fails**: Verify Docker registry access and kubectl connectivity
+3. **Tests fail**: Check cluster has sufficient CPU resources and NRI support
+4. **Plugin not loading**: Verify containerd NRI configuration and binary placement
+5. **Malformed annotations**: Check CPU list syntax (fixed in recent updates)
+6. **KUBECONFIG issues**: Verify path exists and kubectl can connect to cluster
 
-# View logs from all pods
-kubectl --kubeconfig /path/to/kubeconfig/example logs -n kube-system -l app=weka-nri-cpuset -f
-
-# Describe pods for troubleshooting
-kubectl --kubeconfig /path/to/kubeconfig/example describe pods -n kube-system -l app=weka-nri-cpuset
-
-# Delete daemonset (for clean redeployment)
-kubectl --kubeconfig /path/to/kubeconfig/example delete daemonset weka-nri-cpuset -n kube-system
-```
-
-**Registry:** All images are pushed to `images.scalar.dev.weka.io:5002/weka-nri-cpuset:TIMESTAMP` for live cluster deployment.
+For detailed implementation explanations, architecture decisions, and comprehensive requirements, see `docs/prd.md` and other documentation in the `docs/` directory.

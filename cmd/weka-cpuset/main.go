@@ -29,19 +29,7 @@ const (
 	ModeAnnotated = state.ModeAnnotated
 )
 
-// Helper function to convert mode to string for logging
-func modeToString(mode state.ContainerMode) string {
-	switch mode {
-	case state.ModeAnnotated:
-		return "annotated"
-	case state.ModeInteger:
-		return "integer"
-	case state.ModeShared:
-		return "shared"
-	default:
-		return fmt.Sprintf("unknown(%d)", mode)
-	}
-}
+// Mode is now a string, so no conversion needed
 
 type plugin struct {
 	stub      stub.Stub
@@ -59,7 +47,7 @@ var (
 )
 
 func main() {
-	var rootCmd = &cobra.Command{
+	rootCmd := &cobra.Command{
 		Use:     pluginName,
 		Short:   description,
 		Version: version,
@@ -293,37 +281,40 @@ func abs(x float64) float64 {
 }
 
 func (p *plugin) handleAnnotatedContainer(pod *api.PodSandbox, container *api.Container) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
-	// For annotated containers, get only integer-reserved CPUs to check for conflicts
-	// Allow sharing between annotated containers
-	integerReserved := p.state.GetIntegerReservedCPUs()
-	result, err := p.allocator.HandleAnnotatedContainerWithIntegerConflictCheck(pod, integerReserved)
+	// For annotated containers, try allocation with potential live reallocation
+	adjustment, updates, err := p.state.AllocateAnnotatedWithReallocation(pod, p.allocator)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	// Create container adjustment
-	adjustment := &api.ContainerAdjustment{
-		Linux: &api.LinuxContainerAdjustment{
-			Resources: &api.LinuxResources{
-				Cpu: &api.LinuxCPU{
-					Cpus: numa.FormatCPUList(result.CPUs),
-				},
-			},
-		},
+	// Record the successful allocation with proper reference counting for annotated containers
+	if adjustment != nil {
+		err := p.state.RecordAnnotatedContainer(container, pod, adjustment)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to record annotated container: %w", err)
+		}
 	}
 
-	// Set memory nodes for exclusive containers
-	if len(result.MemNodes) > 0 {
-		adjustment.Linux.Resources.Cpu.Mems = numa.FormatCPUList(result.MemNodes)
-	}
-
-	return adjustment, nil, nil
+	return adjustment, updates, nil
 }
 
 func (p *plugin) handleIntegerContainer(pod *api.PodSandbox, container *api.Container) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
 	// For integer containers, get all reserved CPUs (both annotated and integer)
 	reserved := p.state.GetReservedCPUs()
-	return p.allocator.AllocateContainer(pod, container, reserved)
+	adjustment, updates, err := p.allocator.AllocateContainer(pod, container, reserved)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Record the successful allocation in state manager
+	if adjustment != nil {
+		err := p.state.RecordIntegerContainer(container, pod, adjustment)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to record integer container: %w", err)
+		}
+	}
+
+	return adjustment, updates, nil
 }
 
 func (p *plugin) handleSharedContainer(pod *api.PodSandbox, container *api.Container) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {

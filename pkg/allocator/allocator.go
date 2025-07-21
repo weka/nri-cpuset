@@ -23,6 +23,12 @@ type AllocationResult struct {
 	Mode     string
 }
 
+// SiblingAllocationStrategy represents different strategies for sibling allocation
+type SiblingAllocationStrategy struct {
+	PreferSiblings     bool
+	AllowFragmentation bool
+}
+
 func NewCPUAllocator(numaManager *numa.Manager) (*CPUAllocator, error) {
 	return &CPUAllocator{
 		numa:       numaManager,
@@ -32,6 +38,196 @@ func NewCPUAllocator(numaManager *numa.Manager) (*CPUAllocator, error) {
 
 func (a *CPUAllocator) GetOnlineCPUs() []int {
 	return append([]int(nil), a.onlineCPUs...)
+}
+
+// AllocateExclusiveCPUsWithSiblings allocates CPUs with sibling preference
+func (a *CPUAllocator) AllocateExclusiveCPUsWithSiblings(count int, reserved []int) ([]int, error) {
+	if count <= 0 {
+		return nil, fmt.Errorf("invalid CPU count: %d", count)
+	}
+
+	reservedSet := make(map[int]struct{})
+	for _, cpu := range reserved {
+		reservedSet[cpu] = struct{}{}
+	}
+
+	// Get available CPUs
+	var available []int
+	for _, cpu := range a.onlineCPUs {
+		if _, isReserved := reservedSet[cpu]; !isReserved {
+			available = append(available, cpu)
+		}
+	}
+
+	if len(available) < count {
+		return nil, fmt.Errorf("insufficient free CPUs: need %d, have %d", count, len(available))
+	}
+
+	// Try sibling-aware allocation first
+	allocated := a.allocateWithSiblingPreference(available, count, reservedSet)
+	if len(allocated) == count {
+		return allocated, nil
+	}
+
+	// Fallback to simple allocation if sibling strategy doesn't work
+	sort.Ints(available)
+	return available[:count], nil
+}
+
+// allocateWithSiblingPreference implements the sibling allocation strategy
+func (a *CPUAllocator) allocateWithSiblingPreference(available []int, count int, reservedSet map[int]struct{}) []int {
+	if !a.numa.IsHyperthreadingEnabled() {
+		// No hyperthreading, just return first available CPUs
+		sort.Ints(available)
+		if len(available) >= count {
+			return available[:count]
+		}
+		return nil
+	}
+
+	coreGroups := a.numa.GetPhysicalCoreGroups()
+	var allocated []int
+	remaining := count
+
+	// Build availability map for quick lookup
+	availableSet := make(map[int]struct{})
+	for _, cpu := range available {
+		availableSet[cpu] = struct{}{}
+	}
+
+	// Strategy: Complete partial cores first, then allocate full cores, then partial cores
+
+	// Phase 1: Complete partially allocated cores (if any exist in reserved set)
+	coreUtilization := a.numa.GetCoreUtilization(getKeysFromSet(reservedSet))
+	for groupIdx, group := range coreGroups {
+		if remaining <= 0 {
+			break
+		}
+
+		reservedInCore := coreUtilization[groupIdx]
+		if reservedInCore > 0 && reservedInCore < len(group) {
+			// This core is partially used, try to complete it
+			for _, cpu := range group {
+				if remaining <= 0 {
+					break
+				}
+				if _, isAvailable := availableSet[cpu]; isAvailable {
+					allocated = append(allocated, cpu)
+					delete(availableSet, cpu)
+					remaining--
+				}
+			}
+		}
+	}
+
+	// Phase 2: Allocate full cores for remaining pairs
+	for remaining >= 2 && len(coreGroups) > 0 {
+		bestGroup := -1
+
+		for groupIdx, group := range coreGroups {
+			if len(group) < 2 {
+				continue // Not a hyperthreaded core
+			}
+
+			availableInGroup := 0
+			for _, cpu := range group {
+				if _, isAvailable := availableSet[cpu]; isAvailable {
+					availableInGroup++
+				}
+			}
+
+			if availableInGroup == len(group) {
+				// Full core available, prefer smaller cores first
+				if bestGroup == -1 || len(group) < len(coreGroups[bestGroup]) {
+					bestGroup = groupIdx
+				}
+			}
+		}
+
+		if bestGroup >= 0 {
+			group := coreGroups[bestGroup]
+			coresNeeded := min(remaining, len(group))
+			for i := 0; i < coresNeeded; i++ {
+				cpu := group[i]
+				if _, isAvailable := availableSet[cpu]; isAvailable {
+					allocated = append(allocated, cpu)
+					delete(availableSet, cpu)
+					remaining--
+				}
+			}
+		} else {
+			break // No full cores available
+		}
+	}
+
+	// Phase 3: Allocate remaining CPUs from any available cores
+	if remaining > 0 {
+		for _, group := range coreGroups {
+			if remaining <= 0 {
+				break
+			}
+			for _, cpu := range group {
+				if remaining <= 0 {
+					break
+				}
+				if _, isAvailable := availableSet[cpu]; isAvailable {
+					allocated = append(allocated, cpu)
+					delete(availableSet, cpu)
+					remaining--
+				}
+			}
+		}
+	}
+
+	sort.Ints(allocated)
+	return allocated
+}
+
+// getKeysFromSet converts a set to a slice of keys
+func getKeysFromSet(set map[int]struct{}) []int {
+	var keys []int
+	for key := range set {
+		keys = append(keys, key)
+	}
+	return keys
+}
+
+// min returns the minimum of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func (a *CPUAllocator) AllocateExclusiveCPUs(count int, reserved []int) ([]int, error) {
+	// Use sibling-aware allocation by default
+	return a.AllocateExclusiveCPUsWithSiblings(count, reserved)
+}
+
+// CanReallocateInteger checks if an integer container can be reallocated to avoid conflicts
+func (a *CPUAllocator) CanReallocateInteger(currentCPUs []int, conflictCPUs []int, allReserved []int) ([]int, bool) {
+	// Remove current container's CPUs from reserved set
+	reservedSet := make(map[int]struct{})
+	for _, cpu := range allReserved {
+		reservedSet[cpu] = struct{}{}
+	}
+	for _, cpu := range currentCPUs {
+		delete(reservedSet, cpu)
+	}
+
+	// Add conflict CPUs to reserved set (they will be taken by annotated pod)
+	for _, cpu := range conflictCPUs {
+		reservedSet[cpu] = struct{}{}
+	}
+
+	reserved := getKeysFromSet(reservedSet)
+	newCPUs, err := a.AllocateExclusiveCPUsWithSiblings(len(currentCPUs), reserved)
+	if err != nil {
+		return nil, false
+	}
+
+	return newCPUs, true
 }
 
 func (a *CPUAllocator) AllocateContainer(pod *api.PodSandbox, container *api.Container, reserved []int) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
@@ -101,34 +297,6 @@ func (a *CPUAllocator) AllocateContainerCPUs(pod *api.PodSandbox, container *api
 	return result.CPUs, result.Mode, nil
 }
 
-func (a *CPUAllocator) AllocateExclusiveCPUs(count int, reserved []int) ([]int, error) {
-	if count <= 0 {
-		return nil, fmt.Errorf("invalid CPU count: %d", count)
-	}
-
-	reservedSet := make(map[int]struct{})
-	for _, cpu := range reserved {
-		reservedSet[cpu] = struct{}{}
-	}
-
-	var available []int
-	for _, cpu := range a.onlineCPUs {
-		if _, isReserved := reservedSet[cpu]; !isReserved {
-			available = append(available, cpu)
-		}
-	}
-
-	if len(available) < count {
-		return nil, fmt.Errorf("insufficient free CPUs: need %d, have %d", count, len(available))
-	}
-
-	// Sort available CPUs for deterministic allocation
-	sort.Ints(available)
-
-	// Allocate first N available CPUs
-	return available[:count], nil
-}
-
 func (a *CPUAllocator) determineContainerMode(pod *api.PodSandbox, container *api.Container) string {
 	// Check for annotation first
 	if pod.Annotations != nil {
@@ -157,27 +325,23 @@ func (a *CPUAllocator) hasIntegerSemantics(container *api.Container) bool {
 		return false
 	}
 
-	// Check CPU limits and requests are equal and integer
+	// Check CPU requirements
 	if cpu.Quota == nil || cpu.Period == nil || cpu.Quota.GetValue() <= 0 || cpu.Period.GetValue() <= 0 {
 		return false
 	}
 
-	quota := cpu.Quota.GetValue()
-	period := int64(cpu.Period.GetValue())
-	if quota%period != 0 {
+	// Check if CPU limit is an integer
+	if cpu.Quota.GetValue()%int64(cpu.Period.GetValue()) != 0 {
 		return false
 	}
 
-	cpuCores := quota / period
-	if cpuCores <= 0 {
-		return false
-	}
-
-	// Check memory limits are set
+	// Check memory requirements
 	if memory.Limit == nil || memory.Limit.GetValue() <= 0 {
 		return false
 	}
 
+	// In real scenarios, we would also check that requests == limits
+	// This is simplified for the implementation
 	return true
 }
 
@@ -271,14 +435,13 @@ func (a *CPUAllocator) HandleAnnotatedContainerWithIntegerConflictCheck(pod *api
 	}
 
 	for _, cpu := range cpus {
-		if _, isReserved := integerReservedSet[cpu]; isReserved {
-			return nil, fmt.Errorf("CPU %d is already reserved by an integer container", cpu)
+		if _, isIntegerReserved := integerReservedSet[cpu]; isIntegerReserved {
+			return nil, fmt.Errorf("CPU %d is reserved by an integer container", cpu)
 		}
 	}
 
 	// Determine NUMA nodes for memory placement
 	memNodes := a.numa.GetCPUNodesUnion(cpus)
-
 	if singleNode, isSingleNode := a.getSingleNUMANode(cpus); isSingleNode {
 		memNodes = []int{singleNode}
 	}
@@ -302,7 +465,8 @@ func (a *CPUAllocator) handleIntegerContainer(container *api.Container, reserved
 
 	cpuCores := int(cpu.Quota.GetValue() / int64(cpu.Period.GetValue()))
 
-	cpus, err := a.AllocateExclusiveCPUs(cpuCores, reserved)
+	// Use sibling-aware allocation for integer containers
+	cpus, err := a.AllocateExclusiveCPUsWithSiblings(cpuCores, reserved)
 	if err != nil {
 		return nil, fmt.Errorf("failed to allocate exclusive CPUs: %w", err)
 	}
@@ -406,8 +570,7 @@ func (a *CPUAllocator) getSingleNUMANode(cpus []int) (int, bool) {
 	}
 
 	for _, cpu := range cpus[1:] {
-		node, exists := a.numa.GetCPUNode(cpu)
-		if !exists || node != firstNode {
+		if node, exists := a.numa.GetCPUNode(cpu); !exists || node != firstNode {
 			return 0, false
 		}
 	}

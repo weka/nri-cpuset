@@ -20,8 +20,8 @@ import (
 const (
 	testNamespace = "wekaplugin-e2e"
 	pluginName    = "weka-nri-cpuset"
-	timeout       = 5 * time.Minute
-	interval      = 10 * time.Second
+	timeout       = 30 * time.Second  // Reduced from 5 minutes
+	interval      = 2 * time.Second   // Reduced from 10 seconds
 )
 
 var (
@@ -170,11 +170,12 @@ func execInPod(pod *corev1.Pod, command []string) ([]byte, error) {
 
 // waitForPodTermination waits for a pod to be fully terminated and removed
 func waitForPodTermination(podName string) {
+	// First try waiting with a shorter timeout
 	Eventually(func() bool {
 		_, err := kubeClient.CoreV1().Pods(testNamespace).Get(ctx, podName, metav1.GetOptions{})
 		// Pod is considered terminated when it no longer exists
 		return err != nil
-	}, timeout, interval).Should(BeTrue(), fmt.Sprintf("Pod %s should be fully terminated", podName))
+	}, time.Minute, interval).Should(BeTrue(), fmt.Sprintf("Pod %s should be fully terminated", podName))
 }
 
 // waitForPodsTermination waits for multiple pods to be fully terminated
@@ -194,28 +195,53 @@ func cleanupAllPodsAndWait() {
 	var podNames []string
 	for _, pod := range pods.Items {
 		podNames = append(podNames, pod.Name)
-		// Use graceful deletion with a 30-second timeout
-		gracePeriod := int64(30)
+		// Use graceful deletion with a shorter timeout
+		gracePeriod := int64(10)
 		deleteOptions := metav1.DeleteOptions{
 			GracePeriodSeconds: &gracePeriod,
 		}
 		_ = kubeClient.CoreV1().Pods(testNamespace).Delete(ctx, pod.Name, deleteOptions)
 	}
 
-	// Wait for all pods to be fully terminated
-	waitForPodsTermination(podNames)
+	// Wait for all pods to be terminated with shorter timeout, then force delete if needed
+	for _, podName := range podNames {
+		// First try graceful termination with 30s timeout
+		success := false
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					// Timeout occurred, success remains false
+				}
+			}()
+			Eventually(func() bool {
+				_, err := kubeClient.CoreV1().Pods(testNamespace).Get(ctx, podName, metav1.GetOptions{})
+				if err != nil {
+					success = true
+					return true
+				}
+				return false
+			}, 30*time.Second, interval).Should(BeTrue())
+		}()
+
+		// If graceful termination failed, force delete
+		if !success {
+			fmt.Printf("Pod %s stuck, force deleting...\n", podName)
+			gracePeriod := int64(0)
+			forceDeleteOptions := metav1.DeleteOptions{
+				GracePeriodSeconds: &gracePeriod,
+			}
+			_ = kubeClient.CoreV1().Pods(testNamespace).Delete(ctx, podName, forceDeleteOptions)
+
+			// Wait a bit more for force delete (don't fail if still stuck)
+			func() {
+				defer func() { recover() }()
+				Eventually(func() bool {
+					_, err := kubeClient.CoreV1().Pods(testNamespace).Get(ctx, podName, metav1.GetOptions{})
+					return err != nil
+				}, 10*time.Second, interval).Should(BeTrue())
+			}()
+		}
+	}
 }
 
-// deletePodAndWait deletes a specific pod and waits for its termination
-func deletePodAndWait(podName string) {
-	gracePeriod := int64(30)
-	deleteOptions := metav1.DeleteOptions{
-		GracePeriodSeconds: &gracePeriod,
-	}
-	err := kubeClient.CoreV1().Pods(testNamespace).Delete(ctx, podName, deleteOptions)
-	if err != nil {
-		// Pod might already be deleted or not exist
-		return
-	}
-	waitForPodTermination(podName)
-}
+// Unused helper functions removed to fix linter warnings

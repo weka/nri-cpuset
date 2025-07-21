@@ -46,6 +46,35 @@ func (t *TestAllocator) AllocateExclusiveCPUs(count int, reserved []int) ([]int,
 	return available[:count], nil
 }
 
+// CanReallocateInteger checks if an integer container can be reallocated to different CPUs
+func (t *TestAllocator) CanReallocateInteger(currentCPUs []int, conflictCPUs []int, allReserved []int) ([]int, bool) {
+	// Remove current container's CPUs from reserved set
+	reservedSet := make(map[int]struct{})
+	for _, cpu := range allReserved {
+		reservedSet[cpu] = struct{}{}
+	}
+	for _, cpu := range currentCPUs {
+		delete(reservedSet, cpu)
+	}
+
+	// Add conflict CPUs to reserved set (they will be taken by annotated pod)
+	for _, cpu := range conflictCPUs {
+		reservedSet[cpu] = struct{}{}
+	}
+
+	var reserved []int
+	for cpu := range reservedSet {
+		reserved = append(reserved, cpu)
+	}
+
+	newCPUs, err := t.AllocateExclusiveCPUs(len(currentCPUs), reserved)
+	if err != nil {
+		return nil, false
+	}
+
+	return newCPUs, true
+}
+
 func (t *TestAllocator) AllocateContainerCPUs(pod *api.PodSandbox, container *api.Container, reserved []int) ([]int, string, error) {
 	// Determine container mode
 	mode := "shared" // default
@@ -67,11 +96,14 @@ func (t *TestAllocator) AllocateContainerCPUs(pod *api.PodSandbox, container *ap
 
 		// Simple parser for test - just handle single CPUs and ranges
 		var cpus []int
-		if cpuList == "0,2" {
+		switch cpuList {
+		case "0,2":
 			cpus = []int{0, 2}
-		} else if cpuList == "0,1" {
+		case "0,1":
 			cpus = []int{0, 1}
-		} else {
+		case "2,3":
+			cpus = []int{2, 3}
+		default:
 			return nil, "", fmt.Errorf("unsupported CPU list format in test: %s", cpuList)
 		}
 
@@ -200,11 +232,14 @@ func (t *TestAllocator) HandleAnnotatedContainerWithIntegerConflictCheck(pod *ap
 
 	// Simple parser for test - just handle single CPUs and ranges
 	var cpus []int
-	if cpuList == "0,2" {
+	switch cpuList {
+	case "0,2":
 		cpus = []int{0, 2}
-	} else if cpuList == "0,1" {
+	case "0,1":
 		cpus = []int{0, 1}
-	} else {
+	case "2,3":
+		cpus = []int{2, 3}
+	default:
 		return nil, fmt.Errorf("unsupported CPU list format in test: %s", cpuList)
 	}
 
@@ -494,9 +529,9 @@ var _ = Describe("ContainerInfo", func() {
 
 var _ = Describe("Container Modes", func() {
 	It("should have correct mode values", func() {
-		Expect(ModeShared).To(Equal(ContainerMode(0)))
-		Expect(ModeInteger).To(Equal(ContainerMode(1)))
-		Expect(ModeAnnotated).To(Equal(ContainerMode(2)))
+		Expect(ModeShared).To(Equal("shared"))
+		Expect(ModeInteger).To(Equal("integer"))
+		Expect(ModeAnnotated).To(Equal("annotated"))
 	})
 })
 
@@ -1223,7 +1258,7 @@ var _ = Describe("Concurrency Safety", func() {
 
 						time.Sleep(time.Microsecond)
 
-						manager.RemoveContainer(containerID, alloc)
+						_, _ = manager.RemoveContainer(containerID, alloc)
 						time.Sleep(time.Microsecond)
 					}
 				}(i)
@@ -1400,7 +1435,7 @@ var _ = Describe("Concurrency Safety", func() {
 							return
 						default:
 							containerID := fmt.Sprintf("add-worker-%d-%d", id, counter)
-							manager.RemoveContainer(containerID, alloc)
+							_, _ = manager.RemoveContainer(containerID, alloc)
 							counter++
 							time.Sleep(time.Microsecond)
 						}
@@ -1419,7 +1454,7 @@ var _ = Describe("Concurrency Safety", func() {
 						case <-ctx:
 							return
 						default:
-							manager.Synchronize(pods, containers, alloc)
+							_, _ = manager.Synchronize(pods, containers, alloc)
 							time.Sleep(time.Millisecond)
 						}
 					}
@@ -1483,7 +1518,7 @@ var _ = Describe("Concurrency Safety", func() {
 					// Small delay to let adds happen first
 					time.Sleep(time.Microsecond)
 
-					manager.RemoveContainer(containerID, alloc)
+					_, _ = manager.RemoveContainer(containerID, alloc)
 				}(i)
 			}
 

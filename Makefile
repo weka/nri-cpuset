@@ -47,7 +47,7 @@ fmt: ## Format code
 
 .PHONY: test
 test: ## Run unit tests
-	go test -race -coverprofile=coverage.out $(PKG_DIR)
+	go test -race -coverprofile=coverage.out ./pkg/... ./cmd/...
 
 .PHONY: test-integration
 test-integration: ## Run integration tests (no K8s required)

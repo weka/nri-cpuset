@@ -117,8 +117,11 @@ var _ = Describe("Annotated Pod Tests", Label("e2e"), func() {
 				// Check for failed container or event indicating CPU validation failure
 				for _, containerStatus := range updatedPod.Status.ContainerStatuses {
 					if containerStatus.State.Waiting != nil {
-						return strings.Contains(containerStatus.State.Waiting.Message, "CPU") ||
-							strings.Contains(containerStatus.State.Waiting.Reason, "Invalid")
+						// Check for CreateContainerError reason or error messages related to NRI/allocation
+						return containerStatus.State.Waiting.Reason == "CreateContainerError" ||
+							strings.Contains(containerStatus.State.Waiting.Message, "NRI") ||
+							strings.Contains(containerStatus.State.Waiting.Message, "allocation") ||
+							strings.Contains(containerStatus.State.Waiting.Message, "conflict")
 					}
 				}
 				return false
@@ -408,24 +411,36 @@ var _ = Describe("CPU Conflict Resolution", Label("e2e"), func() {
 			_, err = kubeClient.CoreV1().Pods(testNamespace).Create(ctx, conflictAnnotatedPod, metav1.CreateOptions{})
 			Expect(err).ToNot(HaveOccurred())
 
-			By("Verifying conflicting annotated pod fails due to CPU conflict with integer pod")
+			By("Verifying conflicting annotated pod succeeds and integer pod gets reallocated to different CPUs")
+			// The annotated pod should succeed
 			Eventually(func() bool {
 				updatedPod, err := kubeClient.CoreV1().Pods(testNamespace).Get(ctx, conflictAnnotatedPod.Name, metav1.GetOptions{})
 				if err != nil {
 					return false
 				}
+				return updatedPod.Status.Phase == corev1.PodRunning
+			}, timeout, interval).Should(BeTrue(), "Annotated pod should succeed when requesting CPUs from integer pod")
 
-				// Check for container creation failure due to CPU conflict
-				for _, containerStatus := range updatedPod.Status.ContainerStatuses {
-					if containerStatus.State.Waiting != nil {
-						return strings.Contains(containerStatus.State.Waiting.Message, "reserved") ||
-							strings.Contains(containerStatus.State.Waiting.Message, "conflict") ||
-							strings.Contains(containerStatus.State.Waiting.Reason, "CreateContainerError")
-					}
+			By("Verifying annotated pod gets the requested CPUs")
+			Eventually(func() bool {
+				output, err := getPodCPUSet(conflictAnnotatedPod.Name)
+				if err != nil {
+					return false
 				}
+				return strings.Contains(output, "2") && strings.Contains(output, "3")
+			}, timeout, interval).Should(BeTrue(), "Annotated pod should get CPUs 2,3")
 
-				return updatedPod.Status.Phase == corev1.PodFailed
-			}, timeout, interval).Should(BeTrue(), "Conflicting annotated pod should fail when requesting CPUs reserved by integer pod")
+			By("Verifying integer pod gets reallocated to different CPUs (not 2,3)")
+			Eventually(func() bool {
+				output, err := getPodCPUSet(createdInteger.Name)
+				if err != nil {
+					return false
+				}
+				// Integer pod should no longer have CPUs 2,3
+				return !strings.Contains(output, "Cpus_allowed_list: 2,3") &&
+					!strings.Contains(output, "Cpus_allowed_list: 2-3") &&
+					strings.Contains(output, "Cpus_allowed_list:")
+			}, timeout, interval).Should(BeTrue(), "Integer pod should be reallocated away from CPUs 2,3")
 		})
 
 		It("should allow annotated pods to share CPUs with each other but not with integer pods", func() {

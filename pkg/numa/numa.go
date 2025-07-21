@@ -15,22 +15,27 @@ const (
 )
 
 type Manager struct {
-	nodes       []int
-	cpuToNode   map[int]int
-	nodeToCPUs  map[int][]int
-	onlineCPUs  []int
+	onlineCPUs []int
+	nodeMap    map[int][]int // nodeID -> CPUs
+	cpuNodeMap map[int]int   // cpuID -> nodeID
+	siblingMap map[int][]int // cpuID -> sibling CPUs (including self)
 }
 
 type CPUSet []int
 
 func NewManager() (*Manager, error) {
 	m := &Manager{
-		cpuToNode:  make(map[int]int),
-		nodeToCPUs: make(map[int][]int),
+		nodeMap:    make(map[int][]int),
+		cpuNodeMap: make(map[int]int),
+		siblingMap: make(map[int][]int),
 	}
 
 	if err := m.discoverTopology(); err != nil {
-		return nil, fmt.Errorf("failed to discover NUMA topology: %w", err)
+		return nil, err
+	}
+
+	if err := m.discoverSiblings(); err != nil {
+		return nil, err
 	}
 
 	return m, nil
@@ -60,27 +65,29 @@ func (m *Manager) discoverNodes() error {
 	if err != nil {
 		// If no NUMA nodes directory, assume single node system
 		if os.IsNotExist(err) {
-			m.nodes = []int{0}
+			// For single node systems, we'll populate this during mapCPUsToNodes
 			return nil
 		}
 		return err
 	}
 
+	var nodes []int
 	for _, entry := range entries {
 		name := entry.Name()
 		if strings.HasPrefix(name, "node") && entry.IsDir() {
 			nodeStr := strings.TrimPrefix(name, "node")
 			if nodeID, err := strconv.Atoi(nodeStr); err == nil {
-				m.nodes = append(m.nodes, nodeID)
+				nodes = append(nodes, nodeID)
 			}
 		}
 	}
 
-	if len(m.nodes) == 0 {
-		m.nodes = []int{0}
+	if len(nodes) == 0 {
+		// Will be handled in mapCPUsToNodes
+		return nil
 	}
 
-	sort.Ints(m.nodes)
+	sort.Ints(nodes)
 	return nil
 }
 
@@ -110,13 +117,13 @@ func (m *Manager) mapCPUsToNodes() error {
 			nodeID = 0
 		}
 
-		m.cpuToNode[cpu] = nodeID
-		m.nodeToCPUs[nodeID] = append(m.nodeToCPUs[nodeID], cpu)
+		m.cpuNodeMap[cpu] = nodeID
+		m.nodeMap[nodeID] = append(m.nodeMap[nodeID], cpu)
 	}
 
 	// Sort CPU lists for each node
-	for nodeID := range m.nodeToCPUs {
-		sort.Ints(m.nodeToCPUs[nodeID])
+	for nodeID := range m.nodeMap {
+		sort.Ints(m.nodeMap[nodeID])
 	}
 
 	return nil
@@ -124,7 +131,7 @@ func (m *Manager) mapCPUsToNodes() error {
 
 func (m *Manager) getCPUNode(cpu int) (int, error) {
 	// Look for the CPU in each NUMA node directory
-	for _, nodeID := range m.nodes {
+	for nodeID := range m.nodeMap {
 		cpuListFile := filepath.Join(sysDevicesSystemNode, fmt.Sprintf("node%d", nodeID), "cpulist")
 		data, err := os.ReadFile(cpuListFile)
 		if err != nil {
@@ -152,17 +159,22 @@ func (m *Manager) GetOnlineCPUs() []int {
 }
 
 func (m *Manager) GetNodes() []int {
-	return append([]int(nil), m.nodes...)
+	var nodes []int
+	for nodeID := range m.nodeMap {
+		nodes = append(nodes, nodeID)
+	}
+	sort.Ints(nodes)
+	return nodes
 }
 
 func (m *Manager) GetCPUNode(cpu int) (int, bool) {
-	node, exists := m.cpuToNode[cpu]
+	node, exists := m.cpuNodeMap[cpu]
 	return node, exists
 }
 
 func (m *Manager) GetNodeCPUs(nodeID int) ([]int, bool) {
-	cpus, exists := m.nodeToCPUs[nodeID]
-	if !exists {
+	cpus, exists := m.nodeMap[nodeID]
+	if !exists || len(cpus) == 0 {
 		return nil, false
 	}
 	return append([]int(nil), cpus...), true
@@ -170,9 +182,9 @@ func (m *Manager) GetNodeCPUs(nodeID int) ([]int, bool) {
 
 func (m *Manager) GetCPUNodesUnion(cpus []int) []int {
 	nodeSet := make(map[int]struct{})
-	
+
 	for _, cpu := range cpus {
-		if nodeID, exists := m.cpuToNode[cpu]; exists {
+		if nodeID, exists := m.cpuNodeMap[cpu]; exists {
 			nodeSet[nodeID] = struct{}{}
 		}
 	}
@@ -181,7 +193,7 @@ func (m *Manager) GetCPUNodesUnion(cpus []int) []int {
 	for nodeID := range nodeSet {
 		nodes = append(nodes, nodeID)
 	}
-	
+
 	sort.Ints(nodes)
 	return nodes
 }
@@ -197,7 +209,7 @@ func ParseCPUList(cpuList string) ([]int, error) {
 	for _, part := range parts {
 		part = strings.TrimSpace(part)
 		if part == "" {
-			continue
+			return nil, fmt.Errorf("empty CPU value in list: %s", cpuList)
 		}
 
 		if strings.Contains(part, "-") {
@@ -243,7 +255,7 @@ func FormatCPUList(cpus []int) string {
 	}
 
 	sort.Ints(cpus)
-	
+
 	var parts []string
 	start := cpus[0]
 	prev := cpus[0]
@@ -325,4 +337,128 @@ func (c CPUSet) Difference(other CPUSet) CPUSet {
 
 func (c CPUSet) String() string {
 	return FormatCPUList(c)
+}
+
+// discoverSiblings discovers CPU sibling relationships (hyperthreading)
+func (m *Manager) discoverSiblings() error {
+	for _, cpu := range m.onlineCPUs {
+		siblings, err := m.getCPUSiblings(cpu)
+		if err != nil {
+			// If we can't discover siblings, treat CPU as its own sibling
+			siblings = []int{cpu}
+		}
+		m.siblingMap[cpu] = siblings
+	}
+	return nil
+}
+
+// getCPUSiblings reads the sibling CPU list for a given CPU
+func (m *Manager) getCPUSiblings(cpu int) ([]int, error) {
+	threadSiblingsPath := fmt.Sprintf("/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", cpu)
+
+	data, err := os.ReadFile(threadSiblingsPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read thread siblings for CPU %d: %w", cpu, err)
+	}
+
+	siblingsStr := strings.TrimSpace(string(data))
+	if siblingsStr == "" {
+		return []int{cpu}, nil
+	}
+
+	siblings, err := ParseCPUList(siblingsStr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse sibling list '%s' for CPU %d: %w", siblingsStr, cpu, err)
+	}
+
+	// Filter siblings to only include online CPUs
+	var onlineSiblings []int
+	onlineSet := make(map[int]struct{})
+	for _, onlineCPU := range m.onlineCPUs {
+		onlineSet[onlineCPU] = struct{}{}
+	}
+
+	for _, sibling := range siblings {
+		if _, isOnline := onlineSet[sibling]; isOnline {
+			onlineSiblings = append(onlineSiblings, sibling)
+		}
+	}
+
+	if len(onlineSiblings) == 0 {
+		return []int{cpu}, nil
+	}
+
+	sort.Ints(onlineSiblings)
+	return onlineSiblings, nil
+}
+
+// GetCPUSiblings returns the sibling CPUs for a given CPU
+func (m *Manager) GetCPUSiblings(cpu int) []int {
+	if siblings, exists := m.siblingMap[cpu]; exists {
+		result := make([]int, len(siblings))
+		copy(result, siblings)
+		return result
+	}
+	return []int{cpu}
+}
+
+// GetPhysicalCoreGroups returns groups of sibling CPUs (representing physical cores)
+func (m *Manager) GetPhysicalCoreGroups() [][]int {
+	seen := make(map[int]struct{})
+	var coreGroups [][]int
+
+	for _, cpu := range m.onlineCPUs {
+		if _, alreadySeen := seen[cpu]; alreadySeen {
+			continue
+		}
+
+		siblings := m.GetCPUSiblings(cpu)
+		coreGroups = append(coreGroups, siblings)
+
+		// Mark all siblings as seen
+		for _, sibling := range siblings {
+			seen[sibling] = struct{}{}
+		}
+	}
+
+	// Sort core groups by their first CPU for deterministic behavior
+	sort.Slice(coreGroups, func(i, j int) bool {
+		return coreGroups[i][0] < coreGroups[j][0]
+	})
+
+	return coreGroups
+}
+
+// IsHyperthreadingEnabled returns true if hyperthreading is detected
+func (m *Manager) IsHyperthreadingEnabled() bool {
+	coreGroups := m.GetPhysicalCoreGroups()
+	for _, group := range coreGroups {
+		if len(group) > 1 {
+			return true
+		}
+	}
+	return false
+}
+
+// GetCoreUtilization returns information about how many CPUs from each physical core are reserved
+func (m *Manager) GetCoreUtilization(reservedCPUs []int) map[int]int {
+	reservedSet := make(map[int]struct{})
+	for _, cpu := range reservedCPUs {
+		reservedSet[cpu] = struct{}{}
+	}
+
+	coreUtilization := make(map[int]int) // core group index -> reserved count
+	coreGroups := m.GetPhysicalCoreGroups()
+
+	for groupIdx, group := range coreGroups {
+		reservedCount := 0
+		for _, cpu := range group {
+			if _, isReserved := reservedSet[cpu]; isReserved {
+				reservedCount++
+			}
+		}
+		coreUtilization[groupIdx] = reservedCount
+	}
+
+	return coreUtilization
 }
