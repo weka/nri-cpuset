@@ -324,21 +324,23 @@ var _ = Describe("Live Container Updates", Label("e2e"), func() {
 		})
 
 		It("should maintain annotated pod assignments during shared pool updates", func() {
-			By("Creating annotated pod with fixed CPU assignment")
+			By("Creating annotated pod with fixed CPU assignment first")
 			annotatedPod := createTestPod("live-annotated", map[string]string{
-				"weka.io/cores-ids": "0,1",
+				"weka.io/cores-ids": "0,1", // Create annotated pod first to secure these CPUs
 			}, nil)
 
 			createdAnnotated, err := kubeClient.CoreV1().Pods(testNamespace).Create(ctx, annotatedPod, metav1.CreateOptions{})
 			Expect(err).ToNot(HaveOccurred())
+
+			By("Waiting for annotated pod to be running")
+			waitForPodRunning(createdAnnotated.Name)
 
 			By("Creating shared pod")
 			sharedPod := createTestPod("live-shared-with-annotated", nil, nil)
 			createdShared, err := kubeClient.CoreV1().Pods(testNamespace).Create(ctx, sharedPod, metav1.CreateOptions{})
 			Expect(err).ToNot(HaveOccurred())
 
-			By("Waiting for both pods to be running")
-			waitForPodRunning(createdAnnotated.Name)
+			By("Waiting for shared pod to be running")
 			waitForPodRunning(createdShared.Name)
 
 			By("Recording initial assignments")

@@ -156,8 +156,12 @@ verify_plugin() {
 run_tests() {
     log_info "Running e2e tests against live cluster"
     
-    # Create test namespace
-    kubectl create namespace "$TEST_NS" --dry-run=client -o yaml | kubectl apply -f -
+    # Reset environment to clean state first
+    reset_test_environment
+    
+    # Create fresh test namespace
+    log_info "Creating fresh test namespace..."
+    kubectl create namespace "$TEST_NS"
     
     # Export required environment variables
     export KUBECONFIG="$KUBECONFIG"
@@ -182,6 +186,8 @@ run_tests() {
     
     # Run tests with verbose and progress output
     local test_result=0
+    cd "$(dirname "$0")/.."  # Ensure we're in the project root
+    
     if command -v ginkgo &> /dev/null; then
         # Use ginkgo binary with verbose output and progress
         ginkgo -r \
@@ -193,15 +199,15 @@ run_tests() {
             --junit-report=test-results.xml \
             ./test/e2e/ || test_result=$?
     else
-        # Use go run with verbose flags
-        go run github.com/onsi/ginkgo/v2/ginkgo -r \
-            --timeout="$TEST_TIMEOUT" \
-            --label-filter="e2e" \
-            -vv \
-            --show-node-events \
-            --json-report=test-results.json \
-            --junit-report=test-results.xml \
-            ./test/e2e/ || test_result=$?
+        # Use go test with ginkgo
+        go test ./test/e2e \
+            -timeout="$TEST_TIMEOUT" \
+            -v \
+            -ginkgo.label-filter="e2e" \
+            -ginkgo.vv \
+            -ginkgo.show-node-events \
+            -ginkgo.json-report=test-results.json \
+            -ginkgo.junit-report=test-results.xml || test_result=$?
     fi
     
     # Stop monitoring
@@ -245,6 +251,43 @@ cleanup() {
         [[ -f test-results.json ]] && log_info "JSON report: test-results.json"
         [[ -f test-results.xml ]] && log_info "JUnit report: test-results.xml"
     fi
+}
+
+# Reset test environment to clean state
+reset_test_environment() {
+    log_info "Resetting test environment to clean state..."
+    
+    # Clean up any existing test namespace and all its resources
+    log_info "Cleaning up existing test namespace..."
+    kubectl delete namespace "$TEST_NS" --ignore-not-found=true --timeout=60s
+    
+    # Wait for namespace to be fully deleted
+    log_info "Waiting for namespace deletion to complete..."
+    while kubectl get namespace "$TEST_NS" &> /dev/null; do
+        sleep 2
+    done
+    
+    # Force restart plugin pods to clear their internal state
+    log_info "Restarting plugin to clear internal state..."
+    kubectl rollout restart daemonset/weka-nri-cpuset -n kube-system
+    kubectl rollout status daemonset/weka-nri-cpuset -n kube-system --timeout=120s
+    
+    # Give the plugin a moment to resynchronize with clean state
+    log_info "Allowing plugin to resynchronize..."
+    sleep 10
+    
+    # Verify plugin is healthy after restart
+    local ready_pods=$(kubectl get daemonset weka-nri-cpuset -n kube-system -o jsonpath='{.status.numberReady}')
+    local desired_pods=$(kubectl get daemonset weka-nri-cpuset -n kube-system -o jsonpath='{.status.desiredNumberScheduled}')
+    
+    if [[ "$ready_pods" -eq "$desired_pods" ]] && [[ "$ready_pods" -gt 0 ]]; then
+        log_info "Plugin successfully restarted: $ready_pods/$desired_pods pods ready"
+    else
+        log_error "Plugin restart failed: $ready_pods/$desired_pods pods ready"
+        return 1
+    fi
+    
+    log_info "Test environment reset complete"
 }
 
 # Main execution

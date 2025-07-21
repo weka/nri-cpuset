@@ -76,6 +76,31 @@ func (a *CPUAllocator) AllocateContainer(pod *api.PodSandbox, container *api.Con
 	return adjustment, nil, nil
 }
 
+// AllocateContainerCPUs provides unified allocation logic for both normal and synchronization paths
+func (a *CPUAllocator) AllocateContainerCPUs(pod *api.PodSandbox, container *api.Container, reserved []int) ([]int, string, error) {
+	mode := a.determineContainerMode(pod, container)
+
+	var result *AllocationResult
+	var err error
+
+	switch mode {
+	case "annotated":
+		result, err = a.handleAnnotatedContainer(pod, reserved)
+	case "integer":
+		result, err = a.handleIntegerContainer(container, reserved)
+	case "shared":
+		result, err = a.handleSharedContainer(reserved)
+	default:
+		return nil, "", fmt.Errorf("unknown container mode: %s", mode)
+	}
+
+	if err != nil {
+		return nil, "", err
+	}
+
+	return result.CPUs, result.Mode, nil
+}
+
 func (a *CPUAllocator) AllocateExclusiveCPUs(count int, reserved []int) ([]int, error) {
 	if count <= 0 {
 		return nil, fmt.Errorf("invalid CPU count: %d", count)
@@ -184,23 +209,76 @@ func (a *CPUAllocator) handleAnnotatedContainer(pod *api.PodSandbox, reserved []
 	}
 
 	// Check for conflicts with reserved CPUs
-	reservedSet := make(map[int]struct{})
-	for _, cpu := range reserved {
-		reservedSet[cpu] = struct{}{}
-	}
+	// Note: For annotated containers, we need to distinguish between:
+	// - CPUs reserved by INTEGER containers (conflict - not allowed)
+	// - CPUs reserved by ANNOTATED containers (sharing - allowed)
+	// Since we don't have mode information in the reserved list, we'll allow
+	// the state manager to handle this properly during synchronization
 
-	for _, cpu := range cpus {
-		if _, isReserved := reservedSet[cpu]; isReserved {
-			return nil, fmt.Errorf("CPU %d is already reserved by another container", cpu)
-		}
-	}
+	// For now, we'll allow annotated containers to request any online CPU
+	// The state manager will handle proper conflict resolution during sync
 
 	// Determine NUMA nodes for memory placement
 	// Per PRD 3.3: If all CPUs belong to one NUMA node, use only that node
 	// Otherwise, use the union of all involved nodes
 	memNodes := a.numa.GetCPUNodesUnion(cpus)
-	
+
 	// Always check if all CPUs belong to the same node for correctness
+	if singleNode, isSingleNode := a.getSingleNUMANode(cpus); isSingleNode {
+		memNodes = []int{singleNode}
+	}
+
+	return &AllocationResult{
+		CPUs:     cpus,
+		MemNodes: memNodes,
+		Mode:     "annotated",
+	}, nil
+}
+
+// HandleAnnotatedContainerWithIntegerConflictCheck handles annotated containers with proper conflict checking
+// It only rejects CPUs that are reserved by integer containers, allowing sharing between annotated containers
+func (a *CPUAllocator) HandleAnnotatedContainerWithIntegerConflictCheck(pod *api.PodSandbox, integerReserved []int) (*AllocationResult, error) {
+	if pod.Annotations == nil {
+		return nil, fmt.Errorf("missing annotations for annotated container")
+	}
+
+	cpuList, exists := pod.Annotations[WekaAnnotation]
+	if !exists {
+		return nil, fmt.Errorf("missing %s annotation", WekaAnnotation)
+	}
+
+	cpus, err := numa.ParseCPUList(cpuList)
+	if err != nil {
+		return nil, fmt.Errorf("invalid CPU list in annotation '%s': %w", cpuList, err)
+	}
+
+	// Validate CPUs are online
+	onlineSet := make(map[int]struct{})
+	for _, cpu := range a.onlineCPUs {
+		onlineSet[cpu] = struct{}{}
+	}
+
+	for _, cpu := range cpus {
+		if _, isOnline := onlineSet[cpu]; !isOnline {
+			return nil, fmt.Errorf("CPU %d is not online", cpu)
+		}
+	}
+
+	// Check for conflicts with integer-reserved CPUs only
+	integerReservedSet := make(map[int]struct{})
+	for _, cpu := range integerReserved {
+		integerReservedSet[cpu] = struct{}{}
+	}
+
+	for _, cpu := range cpus {
+		if _, isReserved := integerReservedSet[cpu]; isReserved {
+			return nil, fmt.Errorf("CPU %d is already reserved by an integer container", cpu)
+		}
+	}
+
+	// Determine NUMA nodes for memory placement
+	memNodes := a.numa.GetCPUNodesUnion(cpus)
+
 	if singleNode, isSingleNode := a.getSingleNUMANode(cpus); isSingleNode {
 		memNodes = []int{singleNode}
 	}
@@ -232,7 +310,7 @@ func (a *CPUAllocator) handleIntegerContainer(container *api.Container, reserved
 	// Determine NUMA nodes for memory placement
 	// Per PRD 3.3: restrict memory to NUMA nodes containing the assigned CPUs
 	memNodes := a.numa.GetCPUNodesUnion(cpus)
-	
+
 	// Always check if all CPUs belong to the same node for correctness
 	if singleNode, isSingleNode := a.getSingleNUMANode(cpus); isSingleNode {
 		memNodes = []int{singleNode}

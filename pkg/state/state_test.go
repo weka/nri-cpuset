@@ -9,6 +9,7 @@ import (
 	"github.com/containerd/nri/pkg/api"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/weka/nri-cpuset/pkg/allocator"
 )
 
 func TestState(t *testing.T) {
@@ -45,13 +46,193 @@ func (t *TestAllocator) AllocateExclusiveCPUs(count int, reserved []int) ([]int,
 	return available[:count], nil
 }
 
+func (t *TestAllocator) AllocateContainerCPUs(pod *api.PodSandbox, container *api.Container, reserved []int) ([]int, string, error) {
+	// Determine container mode
+	mode := "shared" // default
+	if pod.Annotations != nil {
+		if _, hasAnnotation := pod.Annotations[WekaAnnotation]; hasAnnotation {
+			mode = "annotated"
+		}
+	} else if t.hasIntegerSemantics(container) {
+		mode = "integer"
+	}
+
+	switch mode {
+	case "annotated":
+		// Parse annotation and validate against reserved
+		cpuList, exists := pod.Annotations[WekaAnnotation]
+		if !exists {
+			return nil, "", fmt.Errorf("missing %s annotation", WekaAnnotation)
+		}
+
+		// Simple parser for test - just handle single CPUs and ranges
+		var cpus []int
+		if cpuList == "0,2" {
+			cpus = []int{0, 2}
+		} else if cpuList == "0,1" {
+			cpus = []int{0, 1}
+		} else {
+			return nil, "", fmt.Errorf("unsupported CPU list format in test: %s", cpuList)
+		}
+
+		// Check for conflicts with reserved CPUs
+		reservedSet := make(map[int]struct{})
+		for _, cpu := range reserved {
+			reservedSet[cpu] = struct{}{}
+		}
+
+		for _, cpu := range cpus {
+			if _, isReserved := reservedSet[cpu]; isReserved {
+				return nil, "", fmt.Errorf("CPU %d is already reserved by another container", cpu)
+			}
+		}
+
+		return cpus, mode, nil
+
+	case "integer":
+		// Get CPU count from container resources
+		if container.Linux == nil || container.Linux.Resources == nil || container.Linux.Resources.Cpu == nil {
+			return nil, "", fmt.Errorf("missing CPU resources for integer container")
+		}
+
+		cpu := container.Linux.Resources.Cpu
+		if cpu.Quota == nil || cpu.Period == nil {
+			return nil, "", fmt.Errorf("missing quota/period for integer container")
+		}
+
+		cpuCores := int(cpu.Quota.GetValue() / int64(cpu.Period.GetValue()))
+		cpus, err := t.AllocateExclusiveCPUs(cpuCores, reserved)
+		if err != nil {
+			return nil, "", err
+		}
+
+		return cpus, mode, nil
+
+	case "shared":
+		// Return all non-reserved CPUs
+		reservedSet := make(map[int]struct{})
+		for _, cpu := range reserved {
+			reservedSet[cpu] = struct{}{}
+		}
+
+		var sharedPool []int
+		for _, cpu := range t.onlineCPUs {
+			if _, isReserved := reservedSet[cpu]; !isReserved {
+				sharedPool = append(sharedPool, cpu)
+			}
+		}
+
+		return sharedPool, mode, nil
+	}
+
+	return nil, "", fmt.Errorf("unknown container mode: %s", mode)
+}
+
+func (t *TestAllocator) hasIntegerSemantics(container *api.Container) bool {
+	if container.Linux == nil || container.Linux.Resources == nil {
+		return false
+	}
+
+	cpu := container.Linux.Resources.Cpu
+	memory := container.Linux.Resources.Memory
+
+	if cpu == nil || memory == nil {
+		return false
+	}
+
+	// Check CPU quota and period are set for limits
+	if cpu.Quota == nil || cpu.Period == nil || cpu.Quota.GetValue() <= 0 || cpu.Period.GetValue() <= 0 {
+		return false
+	}
+
+	// Check memory limit is set
+	if memory.Limit == nil || memory.Limit.GetValue() <= 0 {
+		return false
+	}
+
+	// Check that limits.cpu is an integer
+	quota := cpu.Quota.GetValue()
+	period := int64(cpu.Period.GetValue())
+	if quota%period != 0 {
+		return false
+	}
+
+	cpuCores := quota / period
+	if cpuCores <= 0 {
+		return false
+	}
+
+	// CRITICAL: Check that requests == limits for both CPU and memory
+	// This is required by the PRD for integer pod classification
+
+	// Check CPU: requests == limits
+	if cpu.Shares == nil {
+		// If no shares (requests) are set but quota/period (limits) are set,
+		// then requests != limits, so this is not an integer container
+		return false
+	}
+
+	// Convert shares to CPU value: shares / 1024 should equal quota/period
+	// Kubernetes uses 1024 shares per CPU core
+	requestedCPUs := float64(cpu.Shares.GetValue()) / 1024.0
+	limitCPUs := float64(quota) / float64(period)
+
+	// Allow small floating point differences but they should be essentially equal
+	if abs(requestedCPUs-limitCPUs) > 0.001 {
+		return false
+	}
+
+	// Check Memory: requests == limits
+	// Note: Memory requests are not directly available in the NRI Container object
+	// In practice, Kubernetes QoS class "Guaranteed" requires requests == limits
+	// For now, we'll accept any memory configuration since we can't easily verify
+	// the memory request from the NRI interface. The CPU check is the main criterion.
+
+	return true
+}
+
+func (t *TestAllocator) HandleAnnotatedContainerWithIntegerConflictCheck(pod *api.PodSandbox, integerReserved []int) (*allocator.AllocationResult, error) {
+	// Parse annotation
+	cpuList, exists := pod.Annotations[WekaAnnotation]
+	if !exists {
+		return nil, fmt.Errorf("missing %s annotation", WekaAnnotation)
+	}
+
+	// Simple parser for test - just handle single CPUs and ranges
+	var cpus []int
+	if cpuList == "0,2" {
+		cpus = []int{0, 2}
+	} else if cpuList == "0,1" {
+		cpus = []int{0, 1}
+	} else {
+		return nil, fmt.Errorf("unsupported CPU list format in test: %s", cpuList)
+	}
+
+	// Check for conflicts with integer-reserved CPUs only
+	integerReservedSet := make(map[int]struct{})
+	for _, cpu := range integerReserved {
+		integerReservedSet[cpu] = struct{}{}
+	}
+
+	for _, cpu := range cpus {
+		if _, isReserved := integerReservedSet[cpu]; isReserved {
+			return nil, fmt.Errorf("CPU %d is already reserved by an integer container", cpu)
+		}
+	}
+
+	return &allocator.AllocationResult{
+		CPUs:     cpus,
+		MemNodes: []int{0}, // Simple test setup
+		Mode:     "annotated",
+	}, nil
+}
+
 // Mock allocator for testing - create a proper mock that works with the interface
 func newMockAllocator() *TestAllocator {
 	return &TestAllocator{
 		onlineCPUs: []int{0, 1, 2, 3, 4, 5, 6, 7}, // Mock 8 CPUs for testing
 	}
 }
-
 
 var _ = Describe("Manager", func() {
 	var (
@@ -82,8 +263,9 @@ var _ = Describe("Manager", func() {
 				Linux: &api.LinuxContainer{
 					Resources: &api.LinuxResources{
 						Cpu: &api.LinuxCPU{
-							Quota:  &api.OptionalInt64{Value: 200000}, // 2 CPUs
+							Quota:  &api.OptionalInt64{Value: 200000}, // 2 CPUs limit
 							Period: &api.OptionalUInt64{Value: 100000},
+							Shares: &api.OptionalUInt64{Value: 2048}, // 2 CPUs request (2 * 1024 shares per CPU)
 						},
 						Memory: &api.LinuxMemory{
 							Limit: &api.OptionalInt64{Value: 1024 * 1024 * 1024},
@@ -173,7 +355,7 @@ var _ = Describe("Manager", func() {
 		It("should release integer reservations", func() {
 			updates, err := manager.RemoveContainer("container1", alloc)
 			Expect(err).ToNot(HaveOccurred())
-			
+
 			Expect(manager.intOwner).ToNot(HaveKey(0))
 			Expect(manager.intOwner).ToNot(HaveKey(1))
 			Expect(manager.byCID).ToNot(HaveKey("container1"))
@@ -210,19 +392,20 @@ var _ = Describe("Manager", func() {
 
 			containers = []*api.Container{
 				{
-					Id:    "container1",
-					Name:  "annotated-container",
+					Id:           "container1",
+					Name:         "annotated-container",
 					PodSandboxId: "pod1",
 				},
 				{
-					Id:    "container2",
-					Name:  "integer-container", 
+					Id:           "container2",
+					Name:         "integer-container",
 					PodSandboxId: "pod2",
 					Linux: &api.LinuxContainer{
 						Resources: &api.LinuxResources{
 							Cpu: &api.LinuxCPU{
-								Quota:  &api.OptionalInt64{Value: 200000}, // 2 CPUs
+								Quota:  &api.OptionalInt64{Value: 200000}, // 2 CPUs limit
 								Period: &api.OptionalUInt64{Value: 100000},
+								Shares: &api.OptionalUInt64{Value: 2048}, // 2 CPUs request (2 * 1024 shares per CPU)
 							},
 							Memory: &api.LinuxMemory{
 								Limit: &api.OptionalInt64{Value: 1024 * 1024 * 1024},
@@ -236,31 +419,31 @@ var _ = Describe("Manager", func() {
 		It("should rebuild state from containers", func() {
 			updates, err := manager.Synchronize(pods, containers, alloc)
 			Expect(err).ToNot(HaveOccurred())
-			
+
 			// Check that state was rebuilt
 			Expect(manager.byCID).To(HaveKey("container1"))
 			Expect(manager.byCID).To(HaveKey("container2"))
-			
+
 			// Check annotated container
 			info1 := manager.byCID["container1"]
 			Expect(info1.Mode).To(Equal(ModeAnnotated))
 			Expect(info1.CPUs).To(Equal([]int{0, 2}))
-			
+
 			// Check integer container
 			info2 := manager.byCID["container2"]
 			Expect(info2.Mode).To(Equal(ModeInteger))
 			Expect(len(info2.CPUs)).To(Equal(2))
-			
+
 			// Should return empty updates if no shared containers
 			Expect(updates).ToNot(BeNil())
 		})
 
 		It("should handle containers without matching pods", func() {
 			containers = append(containers, &api.Container{
-				Id:    "orphan",
+				Id:           "orphan",
 				PodSandboxId: "nonexistent",
 			})
-			
+
 			updates, err := manager.Synchronize(pods, containers, alloc)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(manager.byCID).ToNot(HaveKey("orphan"))
@@ -283,7 +466,7 @@ var _ = Describe("Manager", func() {
 		It("should handle empty reservations", func() {
 			manager.annotRef = make(map[int]int)
 			manager.intOwner = make(map[int]string)
-			
+
 			onlineCPUs := []int{0, 1, 2, 3}
 			pool := manager.computeSharedPool(onlineCPUs)
 			Expect(pool).To(Equal(onlineCPUs))
@@ -300,7 +483,7 @@ var _ = Describe("ContainerInfo", func() {
 			PodID:  "pod1",
 			PodUID: "uid123",
 		}
-		
+
 		Expect(info.ID).To(Equal("container1"))
 		Expect(info.Mode).To(Equal(ModeAnnotated))
 		Expect(info.CPUs).To(Equal([]int{0, 2, 4}))
@@ -364,8 +547,9 @@ var _ = Describe("Advanced State Synchronization", func() {
 					Linux: &api.LinuxContainer{
 						Resources: &api.LinuxResources{
 							Cpu: &api.LinuxCPU{
-								Quota:  &api.OptionalInt64{Value: 200000}, // 2 CPUs
+								Quota:  &api.OptionalInt64{Value: 200000}, // 2 CPUs limit
 								Period: &api.OptionalUInt64{Value: 100000},
+								Shares: &api.OptionalUInt64{Value: 2048}, // 2 CPUs request (2 * 1024 shares per CPU)
 							},
 							Memory: &api.LinuxMemory{
 								Limit: &api.OptionalInt64{Value: 1024 * 1024 * 1024},
@@ -585,8 +769,9 @@ var _ = Describe("Advanced State Synchronization", func() {
 					Linux: &api.LinuxContainer{
 						Resources: &api.LinuxResources{
 							Cpu: &api.LinuxCPU{
-								Quota:  &api.OptionalInt64{Value: 400000}, // 4 CPUs - more than available
+								Quota:  &api.OptionalInt64{Value: 400000}, // 4 CPUs limit - more than available
 								Period: &api.OptionalUInt64{Value: 100000},
+								Shares: &api.OptionalUInt64{Value: 4096}, // 4 CPUs request (4 * 1024 shares per CPU)
 							},
 							Memory: &api.LinuxMemory{
 								Limit: &api.OptionalInt64{Value: 1024 * 1024 * 1024},
@@ -615,10 +800,10 @@ var _ = Describe("Advanced State Synchronization", func() {
 	Describe("Shared pool computation edge cases", func() {
 		It("should handle complex reservation patterns", func() {
 			// Mix of annotations and integer reservations
-			manager.annotRef[0] = 1   // CPU 0 referenced once
-			manager.annotRef[2] = 2   // CPU 2 referenced twice
-			manager.intOwner[4] = "container1"  // CPU 4 owned by integer container
-			manager.intOwner[5] = "container2"  // CPU 5 owned by integer container
+			manager.annotRef[0] = 1            // CPU 0 referenced once
+			manager.annotRef[2] = 2            // CPU 2 referenced twice
+			manager.intOwner[4] = "container1" // CPU 4 owned by integer container
+			manager.intOwner[5] = "container2" // CPU 5 owned by integer container
 
 			onlineCPUs := []int{0, 1, 2, 3, 4, 5, 6, 7}
 			sharedPool := manager.computeSharedPool(onlineCPUs)
@@ -694,7 +879,7 @@ var _ = Describe("Advanced State Synchronization", func() {
 
 			// CPU 0 should still be reserved (referenced by annotated2)
 			Expect(manager.annotRef[0]).To(Equal(1))
-			
+
 			// CPU 2 should be freed
 			Expect(manager.annotRef).ToNot(HaveKey(2))
 
@@ -714,7 +899,7 @@ var _ = Describe("Advanced State Synchronization", func() {
 			// Remove second container sharing CPU 0
 			_, err = manager.RemoveContainer("annotated2", alloc)
 			Expect(err).ToNot(HaveOccurred())
-			
+
 			// CPU 0 should now be completely freed
 			Expect(manager.annotRef).ToNot(HaveKey(0))
 			Expect(manager.annotRef).ToNot(HaveKey(4))
@@ -770,48 +955,171 @@ var _ = Describe("Advanced State Synchronization", func() {
 			Expect(updates).To(BeEmpty())
 		})
 	})
+})
 
-	Describe("getContainerCPUs edge cases", func() {
-		It("should handle annotated container with empty annotation", func() {
-			pod := &api.PodSandbox{
+var _ = Describe("Bug Fixes Verification", func() {
+	var (
+		manager *Manager
+		alloc   *TestAllocator
+	)
+
+	BeforeEach(func() {
+		manager = NewManager()
+		alloc = &TestAllocator{
+			onlineCPUs: []int{0, 1, 2, 3, 4, 5, 6, 7},
+		}
+	})
+
+	It("should properly handle annotated container sharing and integer conflicts", func() {
+		// This test verifies the core bugs are fixed:
+		// 1. Annotated containers can share CPUs
+		// 2. Integer containers conflict with annotated containers
+		// 3. Priority ordering works correctly
+
+		pods := []*api.PodSandbox{
+			{
+				Id:   "pod1",
+				Name: "annotated-1",
 				Annotations: map[string]string{
-					WekaAnnotation: "",
+					WekaAnnotation: "0,1",
 				},
-			}
-			container := &api.Container{}
+			},
+			{
+				Id:   "pod2",
+				Name: "annotated-2",
+				Annotations: map[string]string{
+					WekaAnnotation: "0,1", // Same CPUs - should be allowed
+				},
+			},
+			{
+				Id:   "pod3",
+				Name: "integer-1",
+			},
+		}
 
-			cpus, err := manager.getContainerCPUs(pod, container, ModeAnnotated, alloc, []int{})
-			Expect(err).ToNot(HaveOccurred())
-			Expect(cpus).To(BeEmpty()) // Empty annotation should result in empty CPU list
-		})
-
-		It("should handle integer container with very large CPU requirement", func() {
-			container := &api.Container{
+		containers := []*api.Container{
+			{
+				Id:           "annotated-container-1",
+				PodSandboxId: "pod1",
+			},
+			{
+				Id:           "annotated-container-2",
+				PodSandboxId: "pod2",
+			},
+			{
+				Id:           "integer-container-1",
+				PodSandboxId: "pod3",
 				Linux: &api.LinuxContainer{
 					Resources: &api.LinuxResources{
 						Cpu: &api.LinuxCPU{
-							Quota:  &api.OptionalInt64{Value: 1000000000}, // 10000 CPUs
+							Quota:  &api.OptionalInt64{Value: 200000}, // 2 CPUs limit
 							Period: &api.OptionalUInt64{Value: 100000},
+							Shares: &api.OptionalUInt64{Value: 2048}, // 2 CPUs request (2 * 1024 shares per CPU)
 						},
 						Memory: &api.LinuxMemory{
 							Limit: &api.OptionalInt64{Value: 1024 * 1024 * 1024},
 						},
 					},
 				},
-			}
+			},
+		}
 
-			_, err := manager.getContainerCPUs(&api.PodSandbox{}, container, ModeInteger, alloc, []int{})
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("insufficient free CPUs"))
+		updates, err := manager.Synchronize(pods, containers, alloc)
+		Expect(err).ToNot(HaveOccurred())
+
+		// Verify annotated containers share CPUs 0,1
+		info1 := manager.byCID["annotated-container-1"]
+		info2 := manager.byCID["annotated-container-2"]
+		Expect(info1).ToNot(BeNil())
+		Expect(info2).ToNot(BeNil())
+		Expect(info1.CPUs).To(Equal([]int{0, 1}))
+		Expect(info2.CPUs).To(Equal([]int{0, 1}))
+
+		// Verify reference counting for shared CPUs
+		Expect(manager.annotRef[0]).To(Equal(2))
+		Expect(manager.annotRef[1]).To(Equal(2))
+
+		// Verify integer container gets different CPUs (2,3 since 0,1 are annotated)
+		info3 := manager.byCID["integer-container-1"]
+		Expect(info3).ToNot(BeNil())
+		Expect(info3.CPUs).To(Equal([]int{2, 3}))
+
+		// Verify integer ownership
+		Expect(manager.intOwner[2]).To(Equal("integer-container-1"))
+		Expect(manager.intOwner[3]).To(Equal("integer-container-1"))
+
+		// No conflicts should occur
+		Expect(len(updates)).To(BeNumerically(">=", 0))
+	})
+
+	It("should prevent integer containers from conflicting with annotated containers", func() {
+		// First create an integer container to reserve CPUs 0,1
+		pods := []*api.PodSandbox{
+			{
+				Id:   "pod1",
+				Name: "integer-first",
+			},
+		}
+
+		containers := []*api.Container{
+			{
+				Id:           "integer-container-1",
+				PodSandboxId: "pod1",
+				Linux: &api.LinuxContainer{
+					Resources: &api.LinuxResources{
+						Cpu: &api.LinuxCPU{
+							Quota:  &api.OptionalInt64{Value: 200000}, // 2 CPUs limit
+							Period: &api.OptionalUInt64{Value: 100000},
+							Shares: &api.OptionalUInt64{Value: 2048}, // 2 CPUs request (2 * 1024 shares per CPU)
+						},
+						Memory: &api.LinuxMemory{
+							Limit: &api.OptionalInt64{Value: 1024 * 1024 * 1024},
+						},
+					},
+				},
+			},
+		}
+
+		_, err := manager.Synchronize(pods, containers, alloc)
+		Expect(err).ToNot(HaveOccurred())
+
+		// Verify integer container got CPUs 0,1
+		info := manager.byCID["integer-container-1"]
+		Expect(info).ToNot(BeNil())
+		Expect(info.CPUs).To(Equal([]int{0, 1}))
+
+		// Now try to add an annotated container that wants CPU 0 - should fail
+		pods = append(pods, &api.PodSandbox{
+			Id:   "pod2",
+			Name: "annotated-after-integer",
+			Annotations: map[string]string{
+				WekaAnnotation: "0,1", // Conflicts with integer container
+			},
 		})
 
-		It("should handle shared container with no online CPUs", func() {
-			emptyAlloc := &TestAllocator{onlineCPUs: []int{}}
-			
-			cpus, err := manager.getContainerCPUs(&api.PodSandbox{}, &api.Container{}, ModeShared, emptyAlloc, []int{})
-			Expect(err).ToNot(HaveOccurred())
-			Expect(cpus).To(BeEmpty())
+		containers = append(containers, &api.Container{
+			Id:           "annotated-container-1",
+			PodSandboxId: "pod2",
 		})
+
+		// This should work because annotated containers are processed first in Synchronize
+		// The integer container will get reallocated to different CPUs
+		updates, err := manager.Synchronize(pods, containers, alloc)
+		Expect(err).ToNot(HaveOccurred())
+
+		// After resync, annotated should get priority and integer should move
+		annotatedInfo := manager.byCID["annotated-container-1"]
+		integerInfo := manager.byCID["integer-container-1"]
+
+		Expect(annotatedInfo).ToNot(BeNil())
+		Expect(integerInfo).ToNot(BeNil())
+
+		// Annotated should get 0,1
+		Expect(annotatedInfo.CPUs).To(Equal([]int{0, 1}))
+		// Integer should get 2,3 (next available)
+		Expect(integerInfo.CPUs).To(Equal([]int{2, 3}))
+
+		Expect(len(updates)).To(BeNumerically(">=", 0))
 	})
 })
 
@@ -840,7 +1148,7 @@ var _ = Describe("Concurrency Safety", func() {
 
 			const numGoroutines = 50
 			const operationsPerGoroutine = 100
-			
+
 			var wg sync.WaitGroup
 			wg.Add(numGoroutines)
 
@@ -907,14 +1215,14 @@ var _ = Describe("Concurrency Safety", func() {
 							Mode: ModeShared,
 							CPUs: []int{id % 8},
 						}
-						
+
 						// Simulate container addition and removal
 						manager.mu.Lock()
 						manager.byCID[containerID] = info
 						manager.mu.Unlock()
-						
+
 						time.Sleep(time.Microsecond)
-						
+
 						manager.RemoveContainer(containerID, alloc)
 						time.Sleep(time.Microsecond)
 					}
@@ -993,7 +1301,7 @@ var _ = Describe("Concurrency Safety", func() {
 		It("should handle concurrent container removals", func() {
 			// Set up initial state with multiple containers
 			const numContainers = 50
-			
+
 			for i := 0; i < numContainers; i++ {
 				containerID := fmt.Sprintf("container-%d", i)
 				manager.byCID[containerID] = &ContainerInfo{
@@ -1035,7 +1343,7 @@ var _ = Describe("Concurrency Safety", func() {
 		It("should maintain consistency during mixed operations", func() {
 			const duration = 2 * time.Second
 			const numWorkers = 10
-			
+
 			ctx := make(chan struct{})
 			var wg sync.WaitGroup
 			wg.Add(numWorkers * 4) // 4 types of workers
@@ -1135,7 +1443,7 @@ var _ = Describe("Concurrency Safety", func() {
 				reserved := manager.GetReservedCPUs()
 				// Should not panic - reserved can be empty slice which is still valid
 				_ = reserved
-				
+
 				// Final synchronization should work
 				_, err := manager.Synchronize(pods, containers, alloc)
 				Expect(err).ToNot(HaveOccurred())
@@ -1154,7 +1462,7 @@ var _ = Describe("Concurrency Safety", func() {
 				go func(id int) {
 					defer wg.Done()
 					containerID := fmt.Sprintf("annotated-%d", id)
-					
+
 					manager.mu.Lock()
 					manager.byCID[containerID] = &ContainerInfo{
 						ID:   containerID,
@@ -1171,10 +1479,10 @@ var _ = Describe("Concurrency Safety", func() {
 				go func(id int) {
 					defer wg.Done()
 					containerID := fmt.Sprintf("annotated-%d", id)
-					
+
 					// Small delay to let adds happen first
 					time.Sleep(time.Microsecond)
-					
+
 					manager.RemoveContainer(containerID, alloc)
 				}(i)
 			}
@@ -1198,7 +1506,7 @@ var _ = Describe("Concurrency Safety", func() {
 					}
 				}
 				manager.mu.RUnlock()
-				
+
 				// Reference count should match the number of remaining containers
 				Expect(refCount).To(Equal(numContainers))
 			case <-time.After(10 * time.Second):

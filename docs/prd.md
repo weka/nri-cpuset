@@ -67,7 +67,7 @@ On container exit release reservations and trigger shared-pool refresh.
 
 ## 4. Ordering and Conflicts
 
-Register the component with `index = 200` so it executes after the reference topology-aware (`index 90`) and balloons (`index 100`) resource policies; its adjustments prevail.
+Register the component with `index = 99` so it executes after the reference topology-aware
 
 If any later component writes a conflicting value to the same cgroup field, NRI shall abort container creation (transactional safety).
 

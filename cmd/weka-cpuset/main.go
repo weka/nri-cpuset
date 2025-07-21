@@ -10,6 +10,7 @@ import (
 	"github.com/containerd/nri/pkg/api"
 	"github.com/containerd/nri/pkg/stub"
 	"github.com/spf13/cobra"
+
 	"github.com/weka/nri-cpuset/pkg/allocator"
 	"github.com/weka/nri-cpuset/pkg/numa"
 	"github.com/weka/nri-cpuset/pkg/state"
@@ -20,6 +21,27 @@ const (
 	version     = "1.0.0"
 	description = "Weka NRI CPU/NUMA Placement Component"
 )
+
+// Bring in the constants from state package
+const (
+	ModeShared    = state.ModeShared
+	ModeInteger   = state.ModeInteger
+	ModeAnnotated = state.ModeAnnotated
+)
+
+// Helper function to convert mode to string for logging
+func modeToString(mode state.ContainerMode) string {
+	switch mode {
+	case state.ModeAnnotated:
+		return "annotated"
+	case state.ModeInteger:
+		return "integer"
+	case state.ModeShared:
+		return "shared"
+	default:
+		return fmt.Sprintf("unknown(%d)", mode)
+	}
+}
 
 type plugin struct {
 	stub      stub.Stub
@@ -92,17 +114,17 @@ func runPlugin(cmd *cobra.Command, args []string) error {
 
 	// Create NRI stub options
 	var stubOptions []stub.Option
-	
+
 	// Add plugin name and index
 	fullPluginName := pluginIdx + "-" + pluginName
 	stubOptions = append(stubOptions, stub.WithPluginName(fullPluginName))
 	stubOptions = append(stubOptions, stub.WithPluginIdx(pluginIdx))
-	
+
 	// Add socket path if specified
 	if pluginSocket != "" {
 		stubOptions = append(stubOptions, stub.WithSocketPath(pluginSocket))
 	}
-	
+
 	// Create NRI stub
 	stub, err := stub.New(p, stubOptions...)
 	if err != nil {
@@ -128,12 +150,12 @@ func (p *plugin) Configure(ctx context.Context, config, runtime, version string)
 
 func (p *plugin) Synchronize(ctx context.Context, pods []*api.PodSandbox, containers []*api.Container) ([]*api.ContainerUpdate, error) {
 	fmt.Printf("Synchronizing state with %d pods and %d containers\n", len(pods), len(containers))
-	
+
 	updates, err := p.state.Synchronize(pods, containers, p.allocator)
 	if err != nil {
 		return nil, fmt.Errorf("synchronization failed: %w", err)
 	}
-	
+
 	return updates, nil
 }
 
@@ -143,40 +165,18 @@ func (p *plugin) RunPodSandbox(ctx context.Context, pod *api.PodSandbox) error {
 }
 
 func (p *plugin) CreateContainer(ctx context.Context, pod *api.PodSandbox, container *api.Container) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
-	fmt.Printf("Creating container %s in pod %s/%s\n", container.Name, pod.Namespace, pod.Name)
-	
-	// Get current reserved CPUs from state
-	reserved := p.state.GetReservedCPUs()
-	
-	// Determine container mode
-	mode := p.determineContainerMode(pod, container)
-	fmt.Printf("Container %s mode: %s\n", container.Name, mode)
-	
-	var adjustment *api.ContainerAdjustment
-	var updates []*api.ContainerUpdate
-	var err error
-	
-	switch mode {
+	modeStr := p.determineContainerMode(pod, container)
+
+	switch modeStr {
 	case "annotated":
-		adjustment, updates, err = p.handleAnnotatedContainer(pod, container, reserved)
+		return p.handleAnnotatedContainer(pod, container)
 	case "integer":
-		adjustment, updates, err = p.handleIntegerContainer(pod, container, reserved)
+		return p.handleIntegerContainer(pod, container)
 	case "shared":
-		adjustment, updates, err = p.handleSharedContainer(pod, container, reserved)
+		return p.handleSharedContainer(pod, container)
 	default:
-		return nil, nil, fmt.Errorf("unknown container mode: %s", mode)
+		return nil, nil, fmt.Errorf("unknown container mode: %s", modeStr)
 	}
-	
-	if err != nil {
-		return nil, nil, fmt.Errorf("container allocation failed: %w", err)
-	}
-	
-	// Update state
-	if adjustment != nil {
-		p.state.RecordContainer(container, adjustment)
-	}
-	
-	return adjustment, updates, nil
 }
 
 func (p *plugin) UpdateContainer(ctx context.Context, pod *api.PodSandbox, container *api.Container, r *api.LinuxResources) ([]*api.ContainerUpdate, error) {
@@ -186,23 +186,22 @@ func (p *plugin) UpdateContainer(ctx context.Context, pod *api.PodSandbox, conta
 
 func (p *plugin) RemoveContainer(ctx context.Context, pod *api.PodSandbox, container *api.Container) error {
 	fmt.Printf("Removing container %s from pod %s/%s\n", container.Name, pod.Namespace, pod.Name)
-	
+
 	// Release resources and trigger shared pool update
 	updates, err := p.state.RemoveContainer(container.Id, p.allocator)
 	if err != nil {
 		return fmt.Errorf("container removal failed: %w", err)
 	}
-	
+
 	// Apply updates to shared containers
 	if len(updates) > 0 {
 		// In a real implementation, we would need to apply these updates
 		// For now, just log them
 		fmt.Printf("Would apply %d updates to shared containers\n", len(updates))
 	}
-	
+
 	return nil
 }
-
 
 // Helper methods for container mode determination and handling
 
@@ -229,16 +228,22 @@ func (p *plugin) hasIntegerSemantics(container *api.Container) bool {
 
 	cpu := container.Linux.Resources.Cpu
 	memory := container.Linux.Resources.Memory
-	
+
 	if cpu == nil || memory == nil {
 		return false
 	}
 
-	// Check CPU limits and requests are equal and integer
+	// Check CPU quota and period are set for limits
 	if cpu.Quota == nil || cpu.Period == nil || cpu.Quota.GetValue() <= 0 || cpu.Period.GetValue() <= 0 {
 		return false
 	}
 
+	// Check memory limit is set
+	if memory.Limit == nil || memory.Limit.GetValue() <= 0 {
+		return false
+	}
+
+	// Check that limits.cpu is an integer
 	quota := cpu.Quota.GetValue()
 	period := int64(cpu.Period.GetValue())
 	if quota%period != 0 {
@@ -250,22 +255,79 @@ func (p *plugin) hasIntegerSemantics(container *api.Container) bool {
 		return false
 	}
 
-	// Check memory limits are set
-	if memory.Limit == nil || memory.Limit.GetValue() <= 0 {
+	// CRITICAL: Check that requests == limits for both CPU and memory
+	// This is required by the PRD for integer pod classification
+
+	// Check CPU: requests == limits
+	if cpu.Shares == nil {
+		// If no shares (requests) are set but quota/period (limits) are set,
+		// then requests != limits, so this is not an integer container
 		return false
 	}
+
+	// Convert shares to CPU value: shares / 1024 should equal quota/period
+	// Kubernetes uses 1024 shares per CPU core
+	requestedCPUs := float64(cpu.Shares.GetValue()) / 1024.0
+	limitCPUs := float64(quota) / float64(period)
+
+	// Allow small floating point differences but they should be essentially equal
+	if abs(requestedCPUs-limitCPUs) > 0.001 {
+		return false
+	}
+
+	// Check Memory: requests == limits
+	// Note: Memory requests are not directly available in the NRI Container object
+	// In practice, Kubernetes QoS class "Guaranteed" requires requests == limits
+	// For now, we'll accept any memory configuration since we can't easily verify
+	// the memory request from the NRI interface. The CPU check is the main criterion.
 
 	return true
 }
 
-func (p *plugin) handleAnnotatedContainer(pod *api.PodSandbox, container *api.Container, reserved []int) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
+// Helper function for floating point comparison
+func abs(x float64) float64 {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
+func (p *plugin) handleAnnotatedContainer(pod *api.PodSandbox, container *api.Container) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
+	// For annotated containers, get only integer-reserved CPUs to check for conflicts
+	// Allow sharing between annotated containers
+	integerReserved := p.state.GetIntegerReservedCPUs()
+	result, err := p.allocator.HandleAnnotatedContainerWithIntegerConflictCheck(pod, integerReserved)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Create container adjustment
+	adjustment := &api.ContainerAdjustment{
+		Linux: &api.LinuxContainerAdjustment{
+			Resources: &api.LinuxResources{
+				Cpu: &api.LinuxCPU{
+					Cpus: numa.FormatCPUList(result.CPUs),
+				},
+			},
+		},
+	}
+
+	// Set memory nodes for exclusive containers
+	if len(result.MemNodes) > 0 {
+		adjustment.Linux.Resources.Cpu.Mems = numa.FormatCPUList(result.MemNodes)
+	}
+
+	return adjustment, nil, nil
+}
+
+func (p *plugin) handleIntegerContainer(pod *api.PodSandbox, container *api.Container) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
+	// For integer containers, get all reserved CPUs (both annotated and integer)
+	reserved := p.state.GetReservedCPUs()
 	return p.allocator.AllocateContainer(pod, container, reserved)
 }
 
-func (p *plugin) handleIntegerContainer(pod *api.PodSandbox, container *api.Container, reserved []int) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
-	return p.allocator.AllocateContainer(pod, container, reserved)
-}
-
-func (p *plugin) handleSharedContainer(pod *api.PodSandbox, container *api.Container, reserved []int) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
+func (p *plugin) handleSharedContainer(pod *api.PodSandbox, container *api.Container) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
+	// For shared containers, get all reserved CPUs (both annotated and integer)
+	reserved := p.state.GetReservedCPUs()
 	return p.allocator.AllocateContainer(pod, container, reserved)
 }

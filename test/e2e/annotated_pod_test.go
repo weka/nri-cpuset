@@ -349,7 +349,27 @@ var _ = Describe("CPU Conflict Resolution", Label("e2e"), func() {
 		})
 
 		It("should reject annotated pods when CPUs are reserved by integer pods", func() {
-			By("Creating an integer pod that reserves CPUs exclusively")
+			By("Creating an annotated pod that will reserve specific CPUs")
+			annotatedPod := createTestPod("conflict-annotated-first", map[string]string{
+				"weka.io/cores-ids": "0,1", // Request specific CPUs first
+			}, nil)
+
+			createdAnnotated, err := kubeClient.CoreV1().Pods(testNamespace).Create(ctx, annotatedPod, metav1.CreateOptions{})
+			Expect(err).ToNot(HaveOccurred())
+
+			By("Waiting for annotated pod to be running")
+			waitForPodRunning(createdAnnotated.Name)
+
+			By("Verifying annotated pod got the requested CPUs")
+			Eventually(func() string {
+				output, err := getPodCPUSet(createdAnnotated.Name)
+				if err != nil {
+					return ""
+				}
+				return output
+			}, timeout, interval).Should(And(ContainSubstring("0"), ContainSubstring("1")), "Annotated pod should get CPUs 0,1")
+
+			By("Creating an integer pod that will try to use different CPUs")
 			integerResources := &corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{
 					corev1.ResourceCPU:    resource.MustParse("2"),
@@ -361,33 +381,36 @@ var _ = Describe("CPU Conflict Resolution", Label("e2e"), func() {
 				},
 			}
 
-			integerPod := createTestPod("conflict-integer-first", nil, integerResources)
+			integerPod := createTestPod("conflict-integer-second", nil, integerResources)
 			createdInteger, err := kubeClient.CoreV1().Pods(testNamespace).Create(ctx, integerPod, metav1.CreateOptions{})
 			Expect(err).ToNot(HaveOccurred())
 
 			By("Waiting for integer pod to be running")
 			waitForPodRunning(createdInteger.Name)
 
-			By("Getting the CPUs allocated to integer pod")
-			Eventually(func() string {
+			By("Verifying integer pod gets different CPUs (not 0,1)")
+			Eventually(func() bool {
 				output, err := getPodCPUSet(createdInteger.Name)
 				if err != nil {
-					return ""
+					return false
 				}
-				return output
-			}, timeout, interval).Should(MatchRegexp(`Cpus_allowed_list:\s*\d+[,-]\d+`))
+				// Integer pod should get CPUs other than 0,1 (e.g., 2,3)
+				return !strings.Contains(output, "Cpus_allowed_list: 0,1") &&
+					!strings.Contains(output, "Cpus_allowed_list: 0-1") &&
+					strings.Contains(output, "Cpus_allowed_list:")
+			}, timeout, interval).Should(BeTrue(), "Integer pod should get different CPUs than annotated pod")
 
-			By("Creating an annotated pod requesting the same CPUs (assuming integer got 0,1)")
-			annotatedPod := createTestPod("conflict-annotated-second", map[string]string{
-				"weka.io/cores-ids": "0,1", // Try to request CPUs likely allocated to integer pod
+			By("Now creating a conflicting annotated pod that requests CPUs already taken by integer pod")
+			conflictAnnotatedPod := createTestPod("conflict-annotated-second", map[string]string{
+				"weka.io/cores-ids": "2,3", // Request CPUs likely allocated to integer pod
 			}, nil)
 
-			_, err = kubeClient.CoreV1().Pods(testNamespace).Create(ctx, annotatedPod, metav1.CreateOptions{})
+			_, err = kubeClient.CoreV1().Pods(testNamespace).Create(ctx, conflictAnnotatedPod, metav1.CreateOptions{})
 			Expect(err).ToNot(HaveOccurred())
 
-			By("Verifying annotated pod fails due to CPU conflict with integer pod")
+			By("Verifying conflicting annotated pod fails due to CPU conflict with integer pod")
 			Eventually(func() bool {
-				updatedPod, err := kubeClient.CoreV1().Pods(testNamespace).Get(ctx, annotatedPod.Name, metav1.GetOptions{})
+				updatedPod, err := kubeClient.CoreV1().Pods(testNamespace).Get(ctx, conflictAnnotatedPod.Name, metav1.GetOptions{})
 				if err != nil {
 					return false
 				}
@@ -402,7 +425,7 @@ var _ = Describe("CPU Conflict Resolution", Label("e2e"), func() {
 				}
 
 				return updatedPod.Status.Phase == corev1.PodFailed
-			}, timeout, interval).Should(BeTrue(), "Annotated pod should fail when requesting CPUs reserved by integer pod")
+			}, timeout, interval).Should(BeTrue(), "Conflicting annotated pod should fail when requesting CPUs reserved by integer pod")
 		})
 
 		It("should allow annotated pods to share CPUs with each other but not with integer pods", func() {

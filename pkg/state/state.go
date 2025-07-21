@@ -5,6 +5,7 @@ import (
 	"sync"
 
 	"github.com/containerd/nri/pkg/api"
+	"github.com/weka/nri-cpuset/pkg/allocator"
 	"github.com/weka/nri-cpuset/pkg/numa"
 )
 
@@ -30,13 +31,13 @@ type ContainerInfo struct {
 
 type Manager struct {
 	mu sync.RWMutex
-	
+
 	// annotRef[cpu] -> refcount (annotated sharing)
 	annotRef map[int]int
-	
-	// intOwner[cpu] -> containerID (integer exclusivity) 
+
+	// intOwner[cpu] -> containerID (integer exclusivity)
 	intOwner map[int]string
-	
+
 	// byCID -> ContainerInfo (reverse lookup)
 	byCID map[string]*ContainerInfo
 }
@@ -52,6 +53,10 @@ func NewManager() *Manager {
 type Allocator interface {
 	GetOnlineCPUs() []int
 	AllocateExclusiveCPUs(count int, reserved []int) ([]int, error)
+	// Add the new unified allocation method
+	AllocateContainerCPUs(pod *api.PodSandbox, container *api.Container, reserved []int) ([]int, string, error)
+	// Add the specific method for annotated containers with integer conflict checking
+	HandleAnnotatedContainerWithIntegerConflictCheck(pod *api.PodSandbox, integerReserved []int) (*allocator.AllocationResult, error)
 }
 
 func (m *Manager) Synchronize(pods []*api.PodSandbox, containers []*api.Container, alloc Allocator) ([]*api.ContainerUpdate, error) {
@@ -65,7 +70,9 @@ func (m *Manager) Synchronize(pods []*api.PodSandbox, containers []*api.Containe
 
 	updates := make([]*api.ContainerUpdate, 0)
 
-	// First pass: process annotated and integer containers to build reserved set
+	// Group containers by mode for proper priority processing
+	var annotatedContainers, integerContainers, sharedContainers []*api.Container
+
 	for _, container := range containers {
 		pod := m.findPod(pods, container.PodSandboxId)
 		if pod == nil {
@@ -73,18 +80,79 @@ func (m *Manager) Synchronize(pods []*api.PodSandbox, containers []*api.Containe
 		}
 
 		mode := m.determineContainerMode(pod, container)
-		// Get reserved CPUs before processing each container to avoid lock contention
-		reserved := m.getReservedCPUsUnsafe()
-		cpus, err := m.getContainerCPUs(pod, container, mode, alloc, reserved)
-		if err != nil {
-			// Log error but continue with other containers
-			fmt.Printf("Error getting CPUs for container %s: %v\n", container.Id, err)
+		switch mode {
+		case ModeAnnotated:
+			annotatedContainers = append(annotatedContainers, container)
+		case ModeInteger:
+			integerContainers = append(integerContainers, container)
+		case ModeShared:
+			sharedContainers = append(sharedContainers, container)
+		}
+	}
+
+	fmt.Printf("=== Starting Synchronize: %d pods, %d containers ===\n", len(pods), len(containers))
+	fmt.Printf("Container types: %d annotated, %d integer, %d shared\n", len(annotatedContainers), len(integerContainers), len(sharedContainers))
+
+	// Process containers in priority order: annotated, then integer, then shared
+
+	// Phase 1: Process annotated containers first (highest priority)
+	for _, container := range annotatedContainers {
+		pod := m.findPod(pods, container.PodSandboxId)
+		if pod == nil {
 			continue
 		}
 
+		// For annotated containers, we need to check only for conflicts with INTEGER containers
+		// Sharing between annotated containers is allowed
+		integerReserved := make([]int, 0)
+		for cpu, _ := range m.intOwner {
+			integerReserved = append(integerReserved, cpu)
+		}
+
+		result, err := alloc.HandleAnnotatedContainerWithIntegerConflictCheck(pod, integerReserved)
+		if err != nil {
+			fmt.Printf("Error allocating CPUs for annotated container %s: %v\n", container.Id, err)
+			continue
+		}
+
+		fmt.Printf("Annotated container %s: allocated CPUs %v\n", container.Id, result.CPUs)
+
 		info := &ContainerInfo{
 			ID:     container.Id,
-			Mode:   mode,
+			Mode:   ModeAnnotated,
+			CPUs:   result.CPUs,
+			PodID:  container.PodSandboxId,
+			PodUID: pod.Uid,
+		}
+
+		m.byCID[container.Id] = info
+
+		// Update annotation reference counts
+		for _, cpu := range result.CPUs {
+			m.annotRef[cpu]++
+		}
+	}
+
+	// Phase 2: Process integer containers (medium priority)
+	for _, container := range integerContainers {
+		pod := m.findPod(pods, container.PodSandboxId)
+		if pod == nil {
+			continue
+		}
+
+		reserved := m.getReservedCPUsUnsafe()
+
+		cpus, _, err := alloc.AllocateContainerCPUs(pod, container, reserved)
+		if err != nil {
+			fmt.Printf("Error allocating CPUs for integer container %s: %v\n", container.Id, err)
+			continue
+		}
+
+		fmt.Printf("Integer container %s: allocated CPUs %v\n", container.Id, cpus)
+
+		info := &ContainerInfo{
+			ID:     container.Id,
+			Mode:   ModeInteger,
 			CPUs:   cpus,
 			PodID:  container.PodSandboxId,
 			PodUID: pod.Uid,
@@ -92,29 +160,35 @@ func (m *Manager) Synchronize(pods []*api.PodSandbox, containers []*api.Containe
 
 		m.byCID[container.Id] = info
 
-		// Update reservation maps
-		switch mode {
-		case ModeAnnotated:
-			for _, cpu := range cpus {
-				m.annotRef[cpu]++
-			}
-		case ModeInteger:
-			for _, cpu := range cpus {
-				m.intOwner[cpu] = container.Id
-			}
+		// Update integer ownership
+		for _, cpu := range cpus {
+			m.intOwner[cpu] = container.Id
 		}
 	}
 
-	// Second pass: update shared containers
+	// Phase 3: Process shared containers (lowest priority)
 	sharedPool := m.computeSharedPool(alloc.GetOnlineCPUs())
-	
-	for _, container := range containers {
-		info := m.byCID[container.Id]
-		if info == nil || info.Mode != ModeShared {
+	if len(sharedContainers) > 0 {
+		fmt.Printf("Shared containers: using CPU pool %v\n", sharedPool)
+	}
+
+	for _, container := range sharedContainers {
+		pod := m.findPod(pods, container.PodSandboxId)
+		if pod == nil {
 			continue
 		}
 
-		// Update shared container to use current shared pool
+		info := &ContainerInfo{
+			ID:     container.Id,
+			Mode:   ModeShared,
+			CPUs:   sharedPool,
+			PodID:  container.PodSandboxId,
+			PodUID: pod.Uid,
+		}
+
+		m.byCID[container.Id] = info
+
+		// Create update for shared container to use current shared pool
 		if len(sharedPool) > 0 {
 			update := &api.ContainerUpdate{
 				ContainerId: container.Id,
@@ -127,9 +201,6 @@ func (m *Manager) Synchronize(pods []*api.PodSandbox, containers []*api.Containe
 				},
 			}
 			updates = append(updates, update)
-			
-			// Update our state
-			info.CPUs = sharedPool
 		}
 	}
 
@@ -219,14 +290,25 @@ func (m *Manager) GetReservedCPUs() []int {
 	return m.getReservedCPUsUnsafe()
 }
 
+func (m *Manager) GetIntegerReservedCPUs() []int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var reserved []int
+	for cpu := range m.intOwner {
+		reserved = append(reserved, cpu)
+	}
+	return reserved
+}
+
 func (m *Manager) getReservedCPUsUnsafe() []int {
 	reserved := make(map[int]struct{})
-	
+
 	// Add annotated CPUs
 	for cpu := range m.annotRef {
 		reserved[cpu] = struct{}{}
 	}
-	
+
 	// Add integer CPUs
 	for cpu := range m.intOwner {
 		reserved[cpu] = struct{}{}
@@ -242,12 +324,12 @@ func (m *Manager) getReservedCPUsUnsafe() []int {
 
 func (m *Manager) computeSharedPool(onlineCPUs []int) []int {
 	reserved := make(map[int]struct{})
-	
+
 	// Mark annotated CPUs as reserved
 	for cpu := range m.annotRef {
 		reserved[cpu] = struct{}{}
 	}
-	
+
 	// Mark integer CPUs as reserved
 	for cpu := range m.intOwner {
 		reserved[cpu] = struct{}{}
@@ -295,16 +377,22 @@ func (m *Manager) hasIntegerSemantics(container *api.Container) bool {
 
 	cpu := container.Linux.Resources.Cpu
 	memory := container.Linux.Resources.Memory
-	
+
 	if cpu == nil || memory == nil {
 		return false
 	}
 
-	// Check CPU limits and requests are equal and integer
+	// Check CPU quota and period are set for limits
 	if cpu.Quota == nil || cpu.Period == nil || cpu.Quota.GetValue() <= 0 || cpu.Period.GetValue() <= 0 {
 		return false
 	}
 
+	// Check memory limit is set
+	if memory.Limit == nil || memory.Limit.GetValue() <= 0 {
+		return false
+	}
+
+	// Check that limits.cpu is an integer
 	quota := cpu.Quota.GetValue()
 	period := int64(cpu.Period.GetValue())
 	if quota%period != 0 {
@@ -316,67 +404,57 @@ func (m *Manager) hasIntegerSemantics(container *api.Container) bool {
 		return false
 	}
 
-	// Check memory limits and requests are equal
-	if memory.Limit == nil || memory.Limit.GetValue() <= 0 {
+	// CRITICAL: Check that requests == limits for both CPU and memory
+	// This is required by the PRD for integer pod classification
+
+	// Check CPU: requests == limits
+	if cpu.Shares == nil {
+		// If no shares (requests) are set but quota/period (limits) are set,
+		// then requests != limits, so this is not an integer container
 		return false
 	}
 
-	// For simplicity, we assume memory requirements are met if limit is set
-	// In a real implementation, you might want to check request == limit
-	
+	// Convert shares to CPU value: shares / 1024 should equal quota/period
+	// Kubernetes uses 1024 shares per CPU core
+	requestedCPUs := float64(cpu.Shares.GetValue()) / 1024.0
+	limitCPUs := float64(quota) / float64(period)
+
+	// Allow small floating point differences but they should be essentially equal
+	if abs(requestedCPUs-limitCPUs) > 0.001 {
+		return false
+	}
+
+	// Check Memory: requests == limits
+	// Note: Memory requests are not directly available in the NRI Container object
+	// In practice, Kubernetes QoS class "Guaranteed" requires requests == limits
+	// For now, we'll accept any memory configuration since we can't easily verify
+	// the memory request from the NRI interface. The CPU check is the main criterion.
+
 	return true
 }
 
-func (m *Manager) getContainerCPUs(pod *api.PodSandbox, container *api.Container, mode ContainerMode, alloc Allocator, reserved []int) ([]int, error) {
-	switch mode {
-	case ModeAnnotated:
-		if pod.Annotations == nil {
-			return nil, fmt.Errorf("missing annotations for annotated container")
-		}
-		
-		cpuList, exists := pod.Annotations[WekaAnnotation]
-		if !exists {
-			return nil, fmt.Errorf("missing %s annotation", WekaAnnotation)
-		}
-		
-		return numa.ParseCPUList(cpuList)
-		
-	case ModeInteger:
-		if container.Linux == nil || container.Linux.Resources == nil || container.Linux.Resources.Cpu == nil {
-			return nil, fmt.Errorf("missing CPU resources for integer container")
-		}
-		
-		cpu := container.Linux.Resources.Cpu
-		if cpu.Quota == nil || cpu.Period == nil || cpu.Quota.GetValue() <= 0 || cpu.Period.GetValue() <= 0 {
-			return nil, fmt.Errorf("invalid CPU quota/period for integer container")
-		}
-		
-		cpuCores := int(cpu.Quota.GetValue() / int64(cpu.Period.GetValue()))
-		return alloc.AllocateExclusiveCPUs(cpuCores, reserved)
-		
-	case ModeShared:
-		return m.computeSharedPool(alloc.GetOnlineCPUs()), nil
-		
-	default:
-		return nil, fmt.Errorf("unknown container mode: %d", mode)
+// Helper function for floating point comparison
+func abs(x float64) float64 {
+	if x < 0 {
+		return -x
 	}
-}
-
-func (m *Manager) IsExclusive(cpu int) bool {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	
-	_, isInteger := m.intOwner[cpu]
-	return isInteger
+	return x
 }
 
 func (m *Manager) IsReserved(cpu int) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	
+
 	_, isAnnotated := m.annotRef[cpu]
 	_, isInteger := m.intOwner[cpu]
-	
+
 	return isAnnotated || isInteger
 }
 
+func (m *Manager) IsExclusive(cpu int) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	_, isInteger := m.intOwner[cpu]
+	return isInteger
+}
