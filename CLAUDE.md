@@ -147,6 +147,65 @@ KUBECONFIG=/path/to/kubeconfig ginkgo -v --focus="CPU Conflict Resolution" ./tes
 KUBECONFIG=/path/to/kubeconfig make test-e2e-live
 ```
 
+##### Live Reallocation Testing
+```bash
+# Test live reallocation functionality (implemented)
+KUBECONFIG=/path/to/kubeconfig ginkgo -v --focus="Live CPU Reallocation" ./test/e2e/
+
+# Test specific live reallocation scenarios
+KUBECONFIG=/path/to/kubeconfig ginkgo -v --focus="should reallocate integer containers when annotated pod creates conflicts" ./test/e2e/
+
+# Test conflict resolution scenarios
+KUBECONFIG=/path/to/kubeconfig ginkgo -v --focus="conflict" ./test/e2e/
+
+# Run live reallocation tests with shorter timeout (faster feedback)
+KUBECONFIG=/path/to/kubeconfig ginkgo -v --timeout=2m --focus="Live CPU Reallocation" ./test/e2e/
+```
+
+##### Alternative Ginkgo Installation Methods
+```bash
+# If ginkgo CLI is not available, install it
+go install github.com/onsi/ginkgo/v2/ginkgo@latest
+
+# Or use go run (ensures version compatibility with go.mod)
+KUBECONFIG=/path/to/kubeconfig go run github.com/onsi/ginkgo/v2/ginkgo run -v --focus="test pattern" ./test/e2e/
+
+# Check ginkgo version compatibility
+ginkgo version
+go run github.com/onsi/ginkgo/v2/ginkgo version
+```
+
+##### Debugging Plugin Issues
+```bash
+# View plugin logs for debugging
+KUBECONFIG=/path/to/kubeconfig kubectl logs -n kube-system -l app=weka-nri-cpuset -f
+
+# Check recent logs with grep for specific patterns
+KUBECONFIG=/path/to/kubeconfig kubectl logs -n kube-system -l app=weka-nri-cpuset --since=2m | grep DEBUG
+KUBECONFIG=/path/to/kubeconfig kubectl logs -n kube-system -l app=weka-nri-cpuset --since=5m | grep -E "(realloc|conflict|error)" -i
+
+# Monitor plugin status during tests
+KUBECONFIG=/path/to/kubeconfig kubectl get pods -n kube-system -l app=weka-nri-cpuset -w
+
+# Check for errors in plugin deployment
+KUBECONFIG=/path/to/kubeconfig kubectl describe pods -n kube-system -l app=weka-nri-cpuset
+```
+
+##### Test Environment Management
+```bash
+# Clean up leftover test pods (important for test reliability)
+KUBECONFIG=/path/to/kubeconfig kubectl delete pods --all -n wekaplugin-e2e --grace-period=0 --force --ignore-not-found=true
+
+# Check test namespace status
+KUBECONFIG=/path/to/kubeconfig kubectl get pods -n wekaplugin-e2e -o wide
+
+# Wait for daemonset rollout after deployment
+KUBECONFIG=/path/to/kubeconfig kubectl rollout status daemonset/weka-nri-cpuset -n kube-system --timeout=120s
+
+# Force restart plugin to clear state
+KUBECONFIG=/path/to/kubeconfig kubectl rollout restart daemonset/weka-nri-cpuset -n kube-system
+```
+
 ### Kind Cluster (Isolated Testing)
 ```bash
 # Create kind cluster, deploy, and test (self-contained)
@@ -220,6 +279,42 @@ KUBECONFIG=/path/to/kubeconfig ginkgo -v --focus="specific test description" ./t
 KUBECONFIG=/path/to/kubeconfig make test-e2e-live
 ```
 
+### Advanced Development Patterns
+
+#### Implementing New Tests
+When implementing tests for features like live reallocation:
+
+```bash
+# 1. First, implement the test logic in test/e2e/*_test.go
+# 2. Use focused runs for rapid iteration
+KUBECONFIG=/path/to/kubeconfig ginkgo -v --focus="new test name" ./test/e2e/
+
+# 3. Add debug logging to both test and implementation code for troubleshooting
+# 4. Use shorter timeouts during development (30s instead of 5m)
+# 5. Clean test environment between runs to avoid interference
+
+# Example: General test implementation pattern
+# - Create test resources and wait for ready state
+# - Verify expected behavior through status checks
+# - Clean up test resources
+```
+
+#### Debugging Plugin Issues
+```bash
+# Common debugging workflow:
+
+# 1. Check for specific log patterns
+KUBECONFIG=/path/to/kubeconfig kubectl logs -n kube-system -l app=weka-nri-cpuset --since=2m | grep "DEBUG"
+
+# 2. Monitor plugin behavior during test execution
+KUBECONFIG=/path/to/kubeconfig kubectl logs -n kube-system -l app=weka-nri-cpuset -f &
+# Run your test
+KUBECONFIG=/path/to/kubeconfig ginkgo -v --focus="test pattern" ./test/e2e/
+
+# 3. Check for errors or unexpected behavior
+KUBECONFIG=/path/to/kubeconfig kubectl logs -n kube-system -l app=weka-nri-cpuset --since=5m | grep -E "(error|fail)" -i
+```
+
 ## Prerequisites
 - Go 1.21+
 - Docker with registry access
@@ -233,5 +328,23 @@ KUBECONFIG=/path/to/kubeconfig make test-e2e-live
 4. **Plugin not loading**: Verify containerd NRI configuration and binary placement
 5. **Malformed annotations**: Check CPU list syntax (fixed in recent updates)
 6. **KUBECONFIG issues**: Verify path exists and kubectl can connect to cluster
+7. **Plugin behavior issues**: Use debug logging and plugin logs to diagnose (see debugging commands above)
+8. **Test timing issues**: Clean test namespace between runs and add explicit waits where needed
+
+## Implementation Notes
+
+### General Development Infrastructure
+Key patterns for reliable plugin development and testing:
+
+- **State Management**: Plugin maintains internal state that must be properly synchronized
+- **Debug Logging**: Strategic logging helps diagnose complex plugin behavior
+- **Test Environment**: Clean environment between test runs prevents interference
+- **Container Lifecycle**: Proper handling of container creation, updates, and removal events
+
+### Common Development Patterns
+```go
+// Example: Adding debug logging for troubleshooting
+fmt.Printf("DEBUG: Processing container %s in pod %s/%s\n", container.Id, pod.Namespace, pod.Name)
+```
 
 For detailed implementation explanations, architecture decisions, and comprehensive requirements, see `docs/prd.md` and other documentation in the `docs/` directory.

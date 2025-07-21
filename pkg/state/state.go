@@ -73,9 +73,15 @@ func (m *Manager) AllocateAnnotatedWithReallocation(pod *api.PodSandbox, alloc A
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// First, try normal allocation without reallocation
+	// First, try normal allocation without reallocation  
 	integerReserved := m.getIntegerReservedCPUsUnsafe()
 	fmt.Printf("DEBUG: Current integer reserved CPUs: %v\n", integerReserved)
+	fmt.Printf("DEBUG: Current integer containers in state: %d\n", len(m.intOwner))
+	for cpu, containerID := range m.intOwner {
+		if container := m.byCID[containerID]; container != nil {
+			fmt.Printf("DEBUG: Integer container %s owns CPU %d (has CPUs %v)\n", containerID[:12], cpu, container.CPUs)
+		}
+	}
 	result, err := alloc.HandleAnnotatedContainerWithIntegerConflictCheck(pod, integerReserved)
 	if err == nil {
 		// No conflicts, proceed normally
@@ -376,12 +382,30 @@ func (m *Manager) Synchronize(pods []*api.PodSandbox, containers []*api.Containe
 			continue
 		}
 
-		reserved := m.getReservedCPUsUnsafe()
-
-		cpus, _, err := alloc.AllocateContainerCPUs(pod, container, reserved)
-		if err != nil {
-			fmt.Printf("Error allocating CPUs for integer container %s: %v\n", container.Id, err)
-			continue
+		// CRITICAL FIX: During synchronization, we need to discover what CPUs the container 
+		// already has, NOT reallocate new ones. The container is already running with specific CPUs.
+		
+		// Get current CPU assignment from container's Linux resources
+		var currentCPUs []int
+		if container.Linux != nil && container.Linux.Resources != nil && 
+		   container.Linux.Resources.Cpu != nil && container.Linux.Resources.Cpu.Cpus != "" {
+			var err error
+			currentCPUs, err = numa.ParseCPUList(container.Linux.Resources.Cpu.Cpus)
+			if err != nil {
+				fmt.Printf("Error parsing current CPUs for integer container %s: %v\n", container.Id, err)
+				continue
+			}
+			fmt.Printf("DEBUG: Synchronizing integer container %s with existing CPUs %v\n", container.Id, currentCPUs)
+		} else {
+			// Fallback: If we can't discover current CPUs, allocate new ones
+			fmt.Printf("DEBUG: Cannot discover existing CPUs for integer container %s, fallback to allocation\n", container.Id)
+			reserved := m.getReservedCPUsUnsafe()
+			var err error
+			currentCPUs, _, err = alloc.AllocateContainerCPUs(pod, container, reserved)
+			if err != nil {
+				fmt.Printf("Error allocating CPUs for integer container %s: %v\n", container.Id, err)
+				continue
+			}
 		}
 
 		// Integer container allocation successful
@@ -389,7 +413,7 @@ func (m *Manager) Synchronize(pods []*api.PodSandbox, containers []*api.Containe
 		info := &ContainerInfo{
 			ID:     container.Id,
 			Mode:   ModeInteger,
-			CPUs:   cpus,
+			CPUs:   currentCPUs,
 			PodID:  container.PodSandboxId,
 			PodUID: pod.Uid,
 		}
@@ -397,7 +421,7 @@ func (m *Manager) Synchronize(pods []*api.PodSandbox, containers []*api.Containe
 		m.byCID[container.Id] = info
 
 		// Update integer ownership
-		for _, cpu := range cpus {
+		for _, cpu := range currentCPUs {
 			m.intOwner[cpu] = container.Id
 		}
 	}
@@ -536,6 +560,7 @@ func (m *Manager) getIntegerReservedCPUsUnsafe() []int {
 	for cpu := range m.intOwner {
 		reserved = append(reserved, cpu)
 	}
+	fmt.Printf("DEBUG: getIntegerReservedCPUsUnsafe() returning %v, intOwner map has %d entries\n", reserved, len(m.intOwner))
 	return reserved
 }
 
