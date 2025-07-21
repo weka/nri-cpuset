@@ -259,13 +259,13 @@ func (p *plugin) hasIntegerSemantics(container *api.Container) bool {
 }
 
 func (p *plugin) handleAnnotatedContainer(pod *api.PodSandbox, container *api.Container, reserved []int) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
-	return p.allocator.AllocateContainer(pod, container)
+	return p.allocator.AllocateContainer(pod, container, reserved)
 }
 
 func (p *plugin) handleIntegerContainer(pod *api.PodSandbox, container *api.Container, reserved []int) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
-	return p.allocator.AllocateContainer(pod, container)
+	return p.allocator.AllocateContainer(pod, container, reserved)
 }
 
 func (p *plugin) handleSharedContainer(pod *api.PodSandbox, container *api.Container, reserved []int) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
-	return p.allocator.AllocateContainer(pod, container)
+	return p.allocator.AllocateContainer(pod, container, reserved)
 }

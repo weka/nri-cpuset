@@ -16,13 +16,8 @@ import (
 var _ = Describe("Plugin Recovery and Synchronization", Label("e2e"), func() {
 	Context("When plugin restarts or crashes", func() {
 		AfterEach(func() {
-			// Clean up any pods created in tests
-			pods, err := kubeClient.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{})
-			if err == nil {
-				for _, pod := range pods.Items {
-					_ = kubeClient.CoreV1().Pods(testNamespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
-				}
-			}
+			// Clean up any pods created in tests and wait for termination
+			cleanupAllPodsAndWait()
 		})
 
 		It("should rebuild state from existing containers after plugin restart", func() {
@@ -86,7 +81,7 @@ var _ = Describe("Plugin Recovery and Synchronization", Label("e2e"), func() {
 				ds.Spec.Template.Annotations = make(map[string]string)
 			}
 			ds.Spec.Template.Annotations["test.restart"] = fmt.Sprintf("%d", time.Now().Unix())
-			
+
 			var updatedDS *appsv1.DaemonSet
 			updatedDS, err = kubeClient.AppsV1().DaemonSets("kube-system").Update(ctx, ds, metav1.UpdateOptions{})
 			Expect(err).ToNot(HaveOccurred())
@@ -99,7 +94,7 @@ var _ = Describe("Plugin Recovery and Synchronization", Label("e2e"), func() {
 					return false
 				}
 				return currentDS.Status.UpdatedNumberScheduled == currentDS.Status.DesiredNumberScheduled &&
-					   currentDS.Status.NumberReady == currentDS.Status.DesiredNumberScheduled
+					currentDS.Status.NumberReady == currentDS.Status.DesiredNumberScheduled
 			}, timeout*2, interval).Should(BeTrue(), "Plugin DaemonSet should complete restart")
 
 			By("Verifying CPU assignments are maintained after plugin restart")
@@ -113,7 +108,7 @@ var _ = Describe("Plugin Recovery and Synchronization", Label("e2e"), func() {
 
 				// CPU assignments should be the same or equivalent after restart
 				return strings.Contains(ann, "0") && strings.Contains(ann, "1") && // Annotated pod should still have 0,1
-					   len(int) > 0 && len(shared) > 0 // Integer and shared should still have assignments
+					len(int) > 0 && len(shared) > 0 // Integer and shared should still have assignments
 			}, timeout, interval).Should(BeTrue(), "CPU assignments should be maintained after plugin restart")
 		})
 
@@ -121,7 +116,7 @@ var _ = Describe("Plugin Recovery and Synchronization", Label("e2e"), func() {
 			By("Simulating containers started before plugin")
 			// In a real scenario, we'd need to start containers without the plugin
 			// For this test, we'll create pods and then verify they get corrected
-			
+
 			sharedPod1 := createTestPod("preexisting-shared-1", nil, nil)
 			sharedPod2 := createTestPod("preexisting-shared-2", nil, nil)
 
@@ -157,7 +152,7 @@ var _ = Describe("Plugin Recovery and Synchronization", Label("e2e"), func() {
 				shared1CPU, err1 := getPodCPUSet(createdShared1.Name)
 				shared2CPU, err2 := getPodCPUSet(createdShared2.Name)
 				integerCPU, err3 := getPodCPUSet(createdInteger.Name)
-				
+
 				if err1 != nil || err2 != nil || err3 != nil {
 					return false
 				}
@@ -172,7 +167,7 @@ var _ = Describe("Plugin Recovery and Synchronization", Label("e2e"), func() {
 			annotatedPod := createTestPod("sync-annotated", map[string]string{
 				"weka.io/cores-ids": "0,2",
 			}, nil)
-			
+
 			sharedPod := createTestPod("sync-shared", nil, nil)
 
 			createdAnnotated, err := kubeClient.CoreV1().Pods(testNamespace).Create(ctx, annotatedPod, metav1.CreateOptions{})
@@ -206,7 +201,7 @@ var _ = Describe("Plugin Recovery and Synchronization", Label("e2e"), func() {
 					corev1.ResourceMemory: resource.MustParse("1Gi"),
 				},
 			}
-			
+
 			integerPod := createTestPod("sync-integer", nil, integerResources)
 			createdInteger, err := kubeClient.CoreV1().Pods(testNamespace).Create(ctx, integerPod, metav1.CreateOptions{})
 			Expect(err).ToNot(HaveOccurred())
@@ -220,7 +215,7 @@ var _ = Describe("Plugin Recovery and Synchronization", Label("e2e"), func() {
 				if err != nil {
 					return false
 				}
-				
+
 				// Shared pool should be updated (different from initial)
 				return sharedOutput != initialSharedCPU && strings.Contains(sharedOutput, "Cpus_allowed_list:")
 			}, timeout, interval).Should(BeTrue(), "Shared pool should be updated after integer pod allocation")
@@ -235,7 +230,7 @@ var _ = Describe("Plugin Recovery and Synchronization", Label("e2e"), func() {
 				if err != nil {
 					return false
 				}
-				
+
 				// Shared pool should expand again (different from when integer was running)
 				return strings.Contains(sharedOutput, "Cpus_allowed_list:")
 			}, timeout, interval).Should(BeTrue(), "Shared pool should expand after integer pod removal")
@@ -246,12 +241,8 @@ var _ = Describe("Plugin Recovery and Synchronization", Label("e2e"), func() {
 var _ = Describe("Live Container Updates", Label("e2e"), func() {
 	Context("When containers need live CPU updates", func() {
 		AfterEach(func() {
-			pods, err := kubeClient.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{})
-			if err == nil {
-				for _, pod := range pods.Items {
-					_ = kubeClient.CoreV1().Pods(testNamespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
-				}
-			}
+			// Clean up any pods created in tests and wait for termination
+			cleanupAllPodsAndWait()
 		})
 
 		It("should update running shared containers when shared pool changes", func() {
@@ -291,7 +282,7 @@ var _ = Describe("Live Container Updates", Label("e2e"), func() {
 					corev1.ResourceMemory: resource.MustParse("1Gi"),
 				},
 			}
-			
+
 			integerPod := createTestPod("live-integer", nil, integerResources)
 			createdInteger, err := kubeClient.CoreV1().Pods(testNamespace).Create(ctx, integerPod, metav1.CreateOptions{})
 			Expect(err).ToNot(HaveOccurred())
@@ -304,7 +295,7 @@ var _ = Describe("Live Container Updates", Label("e2e"), func() {
 				cpu1, err1 := getPodCPUSet(createdShared1.Name)
 				cpu2, err2 := getPodCPUSet(createdShared2.Name)
 				integerCPU, err3 := getPodCPUSet(createdInteger.Name)
-				
+
 				if err1 != nil || err2 != nil || err3 != nil {
 					return false
 				}
@@ -322,7 +313,7 @@ var _ = Describe("Live Container Updates", Label("e2e"), func() {
 			Eventually(func() bool {
 				cpu1, err1 := getPodCPUSet(createdShared1.Name)
 				cpu2, err2 := getPodCPUSet(createdShared2.Name)
-				
+
 				if err1 != nil || err2 != nil {
 					return false
 				}
@@ -371,7 +362,7 @@ var _ = Describe("Live Container Updates", Label("e2e"), func() {
 					corev1.ResourceMemory: resource.MustParse("1Gi"),
 				},
 			}
-			
+
 			integerPod := createTestPod("live-integer-with-annotated", nil, integerResources)
 			_, err = kubeClient.CoreV1().Pods(testNamespace).Create(ctx, integerPod, metav1.CreateOptions{})
 			Expect(err).ToNot(HaveOccurred())
@@ -380,14 +371,14 @@ var _ = Describe("Live Container Updates", Label("e2e"), func() {
 			Eventually(func() bool {
 				ann, err1 := getPodCPUSet(createdAnnotated.Name)
 				shared, err2 := getPodCPUSet(createdShared.Name)
-				
+
 				if err1 != nil || err2 != nil {
 					return false
 				}
 
 				// Annotated should remain the same, shared should be updated
 				return strings.Contains(ann, "0") && strings.Contains(ann, "1") && // Annotated unchanged
-					   len(shared) > 0 // Shared pool should be updated
+					len(shared) > 0 // Shared pool should be updated
 			}, timeout, interval).Should(BeTrue(), "Annotated pods should maintain assignments during shared pool updates")
 		})
 	})

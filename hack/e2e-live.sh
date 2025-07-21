@@ -90,6 +90,37 @@ deploy_plugin() {
     log_info "Plugin deployed successfully"
 }
 
+# Monitor test pods in real-time
+monitor_test_pods() {
+    log_info "Monitoring test pods in namespace $TEST_NS..."
+    
+    # Start background monitoring
+    {
+        while true; do
+            sleep 10
+            local pod_count=$(kubectl get pods -n "$TEST_NS" --no-headers 2>/dev/null | wc -l || echo "0")
+            if [[ "$pod_count" -gt 0 ]]; then
+                echo ">>> Active test pods: $pod_count"
+                kubectl get pods -n "$TEST_NS" --no-headers 2>/dev/null | while read line; do
+                    echo "    $line"
+                done
+            fi
+        done
+    } &
+    
+    # Store PID for cleanup
+    MONITOR_PID=$!
+}
+
+# Stop monitoring
+stop_monitoring() {
+    if [[ -n "${MONITOR_PID:-}" ]]; then
+        kill "$MONITOR_PID" 2>/dev/null || true
+        wait "$MONITOR_PID" 2>/dev/null || true
+        unset MONITOR_PID
+    fi
+}
+
 # Verify plugin is working
 verify_plugin() {
     log_info "Verifying plugin is working..."
@@ -114,6 +145,11 @@ verify_plugin() {
     else
         log_info "No errors found in plugin logs"
     fi
+    
+    # Additional verification: Check if NRI is available on nodes
+    log_info "Verifying NRI socket availability on nodes..."
+    local node_count=$(kubectl get nodes --no-headers | wc -l)
+    log_info "Cluster has $node_count nodes"
 }
 
 # Run e2e tests
@@ -127,23 +163,87 @@ run_tests() {
     export KUBECONFIG="$KUBECONFIG"
     export TEST_NS="$TEST_NS"
     
-    # Run tests
+    # Pre-test validation
+    log_info "Performing pre-test validation..."
+    local available_nodes=$(kubectl get nodes --no-headers | grep " Ready " | wc -l)
+    log_info "Available nodes for testing: $available_nodes"
+    
+    # Start monitoring test pods
+    monitor_test_pods
+    
+    log_info "Starting test execution with verbose output..."
+    echo "==============================================================================="
+    echo "Test Progress:"
+    echo "- Use Ctrl+C to interrupt if needed"
+    echo "- Test pod status will be shown periodically"
+    echo "- Individual test progress will be displayed below"
+    echo "- Using Ginkgo v2 with verbose output (-vv) and node events"
+    echo "==============================================================================="
+    
+    # Run tests with verbose and progress output
+    local test_result=0
     if command -v ginkgo &> /dev/null; then
-        ginkgo -r --timeout="$TEST_TIMEOUT" --label-filter="e2e" ./test/e2e/
+        # Use ginkgo binary with verbose output and progress
+        ginkgo -r \
+            --timeout="$TEST_TIMEOUT" \
+            --label-filter="e2e" \
+            -vv \
+            --show-node-events \
+            --json-report=test-results.json \
+            --junit-report=test-results.xml \
+            ./test/e2e/ || test_result=$?
     else
-        go run github.com/onsi/ginkgo/v2/ginkgo -r --timeout="$TEST_TIMEOUT" --label-filter="e2e" ./test/e2e/
+        # Use go run with verbose flags
+        go run github.com/onsi/ginkgo/v2/ginkgo -r \
+            --timeout="$TEST_TIMEOUT" \
+            --label-filter="e2e" \
+            -vv \
+            --show-node-events \
+            --json-report=test-results.json \
+            --junit-report=test-results.xml \
+            ./test/e2e/ || test_result=$?
     fi
     
-    return $?
+    # Stop monitoring
+    stop_monitoring
+    
+    echo "==============================================================================="
+    log_info "Test execution completed"
+    
+    # Show final test pod status
+    log_info "Final test namespace status:"
+    kubectl get pods -n "$TEST_NS" -o wide 2>/dev/null || log_info "No pods found in test namespace"
+    
+    # Show test summary if reports were generated
+    if [[ -f test-results.json ]]; then
+        log_info "Test results summary available in test-results.json"
+    fi
+    
+    return $test_result
 }
 
 # Cleanup function
 cleanup() {
+    # Stop monitoring if it's running
+    stop_monitoring
+    
     if [[ "${SKIP_CLEANUP:-}" != "true" ]]; then
         log_info "Cleaning up test namespace..."
         kubectl delete namespace "$TEST_NS" --ignore-not-found=true
+        
+        # Clean up test report files unless preserving them
+        if [[ "${PRESERVE_REPORTS:-}" != "true" ]]; then
+            log_info "Cleaning up test report files..."
+            rm -f test-results.json test-results.xml
+        else
+            log_info "Preserving test reports (PRESERVE_REPORTS=true)"
+            [[ -f test-results.json ]] && log_info "JSON report: test-results.json"
+            [[ -f test-results.xml ]] && log_info "JUnit report: test-results.xml"
+        fi
     else
         log_info "Skipping cleanup (SKIP_CLEANUP=true)"
+        [[ -f test-results.json ]] && log_info "JSON report: test-results.json"
+        [[ -f test-results.xml ]] && log_info "JUnit report: test-results.xml"
     fi
 }
 
@@ -155,6 +255,7 @@ main() {
     log_info "Starting e2e test on live cluster"
     log_info "Cluster: $(kubectl config current-context)"
     log_info "Test namespace: $TEST_NS"
+    log_info "Test timeout: $TEST_TIMEOUT"
     
     # Check prerequisites
     check_prerequisites
@@ -165,8 +266,9 @@ main() {
     # Verify plugin
     verify_plugin
     
-    # Set up cleanup
+    # Set up cleanup and interrupt handling
     trap cleanup EXIT
+    trap 'log_warn "Interrupted by user, cleaning up..."; cleanup; exit 130' INT TERM
     
     # Run tests
     if run_tests; then
@@ -180,14 +282,23 @@ main() {
         echo "=== Plugin Pod Status ==="
         kubectl get pods -n kube-system -l app=weka-nri-cpuset -o wide
         
-        echo "=== Plugin Logs ==="
+        echo "=== Plugin Logs (last 50 lines) ==="
         kubectl logs -n kube-system -l app=weka-nri-cpuset --tail=50
         
         echo "=== Test Pods Status ==="
         kubectl get pods -n "$TEST_NS" -o wide || true
         
+        echo "=== Test Pod Logs (if any) ==="
+        kubectl get pods -n "$TEST_NS" --no-headers 2>/dev/null | while read name rest; do
+            echo "--- Logs for $name ---"
+            kubectl logs -n "$TEST_NS" "$name" || true
+        done
+        
         echo "=== Node Information ==="
         kubectl get nodes -o wide
+        
+        echo "=== Node Resources ==="
+        kubectl top nodes 2>/dev/null || log_warn "Could not get node resource usage (metrics-server may not be available)"
         
         exit 1
     fi
@@ -198,7 +309,14 @@ if [[ "${1:-}" == "--help" ]] || [[ "${1:-}" == "-h" ]]; then
     cat << EOF
 Usage: $0 [options]
 
-Run e2e tests against a live Kubernetes cluster.
+Run e2e tests against a live Kubernetes cluster with real-time monitoring.
+
+Features:
+  - Real-time test progress output
+  - Background monitoring of test pods
+  - Detailed test reports (JSON/JUnit)
+  - Comprehensive debug information on failure
+  - Proper cleanup on interruption (Ctrl+C)
 
 Environment Variables:
   KUBECONFIG      Path to kubeconfig file (default: \$HOME/.kube/config)
@@ -207,6 +325,7 @@ Environment Variables:
   TEST_TIMEOUT    Test timeout (default: 30m)
   FORCE_DEPLOY    Force plugin redeployment (default: false)
   SKIP_CLEANUP    Skip test namespace cleanup (default: false)
+  PRESERVE_REPORTS Keep test report files after completion (default: false)
 
 Examples:
   # Basic usage
@@ -220,6 +339,12 @@ Examples:
 
   # Skip cleanup for debugging
   SKIP_CLEANUP=true $0
+
+  # Preserve reports for debugging
+  PRESERVE_REPORTS=true $0
+  
+  # Run with custom image and preserve reports
+  PLUGIN_IMAGE=my-registry/nri-cpuset:dev PRESERVE_REPORTS=true $0
 EOF
     exit 0
 fi

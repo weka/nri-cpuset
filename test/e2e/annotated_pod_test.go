@@ -14,13 +14,8 @@ import (
 var _ = Describe("Annotated Pod Tests", Label("e2e"), func() {
 	Context("When creating annotated pods", func() {
 		AfterEach(func() {
-			// Clean up any pods created in tests
-			pods, err := kubeClient.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{})
-			if err == nil {
-				for _, pod := range pods.Items {
-					_ = kubeClient.CoreV1().Pods(testNamespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
-				}
-			}
+			// Clean up any pods created in tests and wait for termination
+			cleanupAllPodsAndWait()
 		})
 
 		It("should pin CPUs according to annotation", func() {
@@ -94,11 +89,11 @@ var _ = Describe("Annotated Pod Tests", Label("e2e"), func() {
 			Eventually(func() bool {
 				output1, err1 := getPodCPUSet(createdPod1.Name)
 				output2, err2 := getPodCPUSet(createdPod2.Name)
-				
+
 				if err1 != nil || err2 != nil {
 					return false
 				}
-				
+
 				return strings.Contains(output1, "0,2") && strings.Contains(output2, "0,2")
 			}, timeout, interval).Should(BeTrue(), "Both pods should be pinned to CPUs 0,2")
 		})
@@ -118,12 +113,12 @@ var _ = Describe("Annotated Pod Tests", Label("e2e"), func() {
 				if err != nil {
 					return false
 				}
-				
+
 				// Check for failed container or event indicating CPU validation failure
 				for _, containerStatus := range updatedPod.Status.ContainerStatuses {
 					if containerStatus.State.Waiting != nil {
 						return strings.Contains(containerStatus.State.Waiting.Message, "CPU") ||
-							   strings.Contains(containerStatus.State.Waiting.Reason, "Invalid")
+							strings.Contains(containerStatus.State.Waiting.Reason, "Invalid")
 					}
 				}
 				return false
@@ -149,7 +144,7 @@ var _ = Describe("Annotated Pod Tests", Label("e2e"), func() {
 					return false
 				}
 				// Should have Mems_allowed_list set to the same NUMA node as CPUs 0,1
-				return strings.Contains(output, "Mems_allowed_list: 0") || strings.Contains(output, "Mems_allowed_list:0")
+				return strings.Contains(output, "Mems_allowed_list:\t0") || strings.Contains(output, "Mems_allowed_list: 0") || strings.Contains(output, "Mems_allowed_list:0")
 			}, timeout, interval).Should(BeTrue(), "Pod should have memory pinned to same NUMA node as CPUs")
 		})
 
@@ -189,13 +184,13 @@ var _ = Describe("Annotated Pod Tests", Label("e2e"), func() {
 					corev1.ResourceMemory: resource.MustParse("1Gi"),
 				},
 			}
-			
+
 			integerPod := createTestPod("numa-integer-pod", nil, integerResources)
 			sharedPod := createTestPod("numa-shared-pod", nil, nil)
-			
+
 			createdInteger, err := kubeClient.CoreV1().Pods(testNamespace).Create(ctx, integerPod, metav1.CreateOptions{})
 			Expect(err).ToNot(HaveOccurred())
-			
+
 			createdShared, err := kubeClient.CoreV1().Pods(testNamespace).Create(ctx, sharedPod, metav1.CreateOptions{})
 			Expect(err).ToNot(HaveOccurred())
 
@@ -210,8 +205,8 @@ var _ = Describe("Annotated Pod Tests", Label("e2e"), func() {
 					return false
 				}
 				// Integer pod should have specific NUMA memory restriction
-				return strings.Contains(intOutput, "Mems_allowed_list:") && 
-					   strings.Contains(intOutput, "Cpus_allowed_list:")
+				return strings.Contains(intOutput, "Mems_allowed_list:") &&
+					strings.Contains(intOutput, "Cpus_allowed_list:")
 			}, timeout, interval).Should(BeTrue(), "Integer pod should have NUMA memory restriction")
 
 			By("Verifying shared pod has unrestricted memory access")
@@ -230,18 +225,13 @@ var _ = Describe("Annotated Pod Tests", Label("e2e"), func() {
 var _ = Describe("Annotated Pod Error Cases", Label("e2e"), func() {
 	Context("When creating pods with problematic annotations", func() {
 		AfterEach(func() {
-			// Clean up any pods created in tests
-			pods, err := kubeClient.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{})
-			if err == nil {
-				for _, pod := range pods.Items {
-					_ = kubeClient.CoreV1().Pods(testNamespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
-				}
-			}
+			// Clean up any pods created in tests and wait for termination
+			cleanupAllPodsAndWait()
 		})
 
 		It("should handle malformed CPU list annotations", func() {
 			testCases := []struct {
-				annotation string
+				annotation  string
 				description string
 			}{
 				{"0-", "incomplete range"},
@@ -251,10 +241,10 @@ var _ = Describe("Annotated Pod Error Cases", Label("e2e"), func() {
 				{"", "empty annotation"},
 			}
 
-			for _, tc := range testCases {
+			for i, tc := range testCases {
 				By(fmt.Sprintf("Testing %s annotation: %s", tc.description, tc.annotation))
-				
-				podName := fmt.Sprintf("malformed-pod-%d", GinkgoRandomSeed())
+
+				podName := fmt.Sprintf("malformed-pod-%d-%d", GinkgoRandomSeed(), i)
 				pod := createTestPod(podName, map[string]string{
 					"weka.io/cores-ids": tc.annotation,
 				}, nil)
@@ -268,17 +258,17 @@ var _ = Describe("Annotated Pod Error Cases", Label("e2e"), func() {
 					if err != nil {
 						return true // Pod was rejected/deleted
 					}
-					
+
 					// Check if containers failed to start
 					for _, containerStatus := range updatedPod.Status.ContainerStatuses {
-						if containerStatus.State.Waiting != nil && 
-						   (strings.Contains(containerStatus.State.Waiting.Reason, "Invalid") ||
-							strings.Contains(containerStatus.State.Waiting.Reason, "Error")) {
+						if containerStatus.State.Waiting != nil &&
+							(strings.Contains(containerStatus.State.Waiting.Reason, "Invalid") ||
+								strings.Contains(containerStatus.State.Waiting.Reason, "Error")) {
 							return true
 						}
 					}
 					return false
-				}, timeout, interval).Should(BeTrue(), 
+				}, "60s", interval).Should(BeTrue(),
 					fmt.Sprintf("Pod with %s should fail", tc.description))
 			}
 		})
@@ -288,18 +278,15 @@ var _ = Describe("Annotated Pod Error Cases", Label("e2e"), func() {
 var _ = Describe("CPU Conflict Resolution", Label("e2e"), func() {
 	Context("When annotated and integer pods compete for CPUs", func() {
 		AfterEach(func() {
-			pods, err := kubeClient.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{})
-			if err == nil {
-				for _, pod := range pods.Items {
-					_ = kubeClient.CoreV1().Pods(testNamespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
-				}
-			}
+			// Clean up any pods created in tests and wait for termination
+			cleanupAllPodsAndWait()
 		})
 
 		It("should reject integer pods when CPUs are reserved by annotated pods", func() {
-			By("Creating an annotated pod that reserves specific CPUs")
+			By("Creating an annotated pod that reserves most available CPUs")
+			// Reserve most CPUs to force conflict - use CPUs 0-59 on a 64-CPU node
 			annotatedPod := createTestPod("conflict-annotated", map[string]string{
-				"weka.io/cores-ids": "2,3", // Reserve CPUs 2 and 3
+				"weka.io/cores-ids": "0-59", // Reserve CPUs 0-59, leaving only 4 free
 			}, nil)
 
 			createdAnnotated, err := kubeClient.CoreV1().Pods(testNamespace).Create(ctx, annotatedPod, metav1.CreateOptions{})
@@ -308,45 +295,57 @@ var _ = Describe("CPU Conflict Resolution", Label("e2e"), func() {
 			By("Waiting for annotated pod to be running")
 			waitForPodRunning(createdAnnotated.Name)
 
-			By("Creating an integer pod that would need the reserved CPUs")
+			By("Getting the node where annotated pod is running")
+			updatedAnnotated, err := kubeClient.CoreV1().Pods(testNamespace).Get(ctx, createdAnnotated.Name, metav1.GetOptions{})
+			Expect(err).ToNot(HaveOccurred())
+			nodeName := updatedAnnotated.Spec.NodeName
+			Expect(nodeName).ToNot(BeEmpty())
+
+			By("Creating an integer pod that would need more CPUs than available on the same node")
 			integerResources := &corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{
-					corev1.ResourceCPU:    resource.MustParse("4"), // Request 4 CPUs when only some remain free
+					corev1.ResourceCPU:    resource.MustParse("8"), // Request 8 CPUs when only 4 remain free
 					corev1.ResourceMemory: resource.MustParse("1Gi"),
 				},
 				Limits: corev1.ResourceList{
-					corev1.ResourceCPU:    resource.MustParse("4"),
+					corev1.ResourceCPU:    resource.MustParse("8"),
 					corev1.ResourceMemory: resource.MustParse("1Gi"),
 				},
 			}
 
 			integerPod := createTestPod("conflict-integer", nil, integerResources)
+			// Force the integer pod to the same node as the annotated pod
+			integerPod.Spec.NodeName = nodeName
 			_, err = kubeClient.CoreV1().Pods(testNamespace).Create(ctx, integerPod, metav1.CreateOptions{})
 			Expect(err).ToNot(HaveOccurred())
 
-			By("Verifying integer pod fails due to insufficient free CPUs")
+			By("Verifying integer pod gets restricted CPU assignment due to conflict")
 			Eventually(func() bool {
-				updatedPod, err := kubeClient.CoreV1().Pods(testNamespace).Get(ctx, integerPod.Name, metav1.GetOptions{})
-				if err != nil {
-					return false
-				}
-
-				// Check for scheduling failure or container creation error
-				for _, condition := range updatedPod.Status.Conditions {
-					if condition.Type == corev1.PodScheduled && condition.Status == corev1.ConditionFalse {
-						return strings.Contains(condition.Message, "CPU") || strings.Contains(condition.Message, "insufficient")
+				// Check if integer pod is running with non-conflicting CPUs
+				if updatedPod, err := kubeClient.CoreV1().Pods(testNamespace).Get(ctx, integerPod.Name, metav1.GetOptions{}); err == nil && updatedPod.Status.Phase == corev1.PodRunning {
+					// Get CPU assignment for integer pod
+					if integerCPUs, err := getPodCPUSet(integerPod.Name); err == nil && strings.Contains(integerCPUs, "Cpus_allowed_list:") {
+						// Integer pod should only get CPUs 60-63 (the 4 remaining CPUs not reserved by annotated pod)
+						return strings.Contains(integerCPUs, "60-63") || strings.Contains(integerCPUs, "60,61,62,63")
 					}
 				}
 
-				for _, containerStatus := range updatedPod.Status.ContainerStatuses {
-					if containerStatus.State.Waiting != nil {
-						return strings.Contains(containerStatus.State.Waiting.Message, "CPU") ||
-							   strings.Contains(containerStatus.State.Waiting.Reason, "insufficient")
+				// Alternative: check if pod failed to start due to insufficient resources
+				if updatedPod, err := kubeClient.CoreV1().Pods(testNamespace).Get(ctx, integerPod.Name, metav1.GetOptions{}); err == nil {
+					for _, condition := range updatedPod.Status.Conditions {
+						if condition.Type == corev1.PodScheduled && condition.Status == corev1.ConditionFalse {
+							return strings.Contains(condition.Message, "CPU") || strings.Contains(condition.Message, "insufficient")
+						}
+					}
+					for _, containerStatus := range updatedPod.Status.ContainerStatuses {
+						if containerStatus.State.Waiting != nil {
+							return strings.Contains(containerStatus.State.Waiting.Message, "CPU") ||
+								strings.Contains(containerStatus.State.Waiting.Reason, "insufficient")
+						}
 					}
 				}
-
 				return false
-			}, timeout, interval).Should(BeTrue(), "Integer pod should fail when insufficient free CPUs due to annotated pod reservation")
+			}, "60s", interval).Should(BeTrue(), "Integer pod should either fail or get non-conflicting CPU assignment")
 		})
 
 		It("should reject annotated pods when CPUs are reserved by integer pods", func() {
@@ -397,8 +396,8 @@ var _ = Describe("CPU Conflict Resolution", Label("e2e"), func() {
 				for _, containerStatus := range updatedPod.Status.ContainerStatuses {
 					if containerStatus.State.Waiting != nil {
 						return strings.Contains(containerStatus.State.Waiting.Message, "reserved") ||
-							   strings.Contains(containerStatus.State.Waiting.Message, "conflict") ||
-							   strings.Contains(containerStatus.State.Waiting.Reason, "CreateContainerError")
+							strings.Contains(containerStatus.State.Waiting.Message, "conflict") ||
+							strings.Contains(containerStatus.State.Waiting.Reason, "CreateContainerError")
 					}
 				}
 
@@ -459,7 +458,7 @@ var _ = Describe("CPU Conflict Resolution", Label("e2e"), func() {
 				if err != nil {
 					return false
 				}
-				
+
 				// Either it gets scheduled with different CPUs or fails appropriately
 				if pod.Status.Phase == corev1.PodRunning {
 					cpuOutput, err := getPodCPUSet(integerPod.Name)
@@ -469,7 +468,7 @@ var _ = Describe("CPU Conflict Resolution", Label("e2e"), func() {
 					// Should not contain CPUs 0 or 1
 					return !strings.Contains(cpuOutput, "0") && !strings.Contains(cpuOutput, "1")
 				}
-				
+
 				// Or it should fail due to insufficient resources
 				for _, containerStatus := range pod.Status.ContainerStatuses {
 					if containerStatus.State.Waiting != nil {

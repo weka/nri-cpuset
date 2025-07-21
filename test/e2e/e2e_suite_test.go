@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"testing"
 	"time"
 
@@ -71,7 +72,7 @@ var _ = BeforeSuite(func() {
 		if err != nil {
 			return false
 		}
-		
+
 		if len(daemonSets.Items) == 0 {
 			fmt.Printf("No DaemonSet found with label app=%s\n", pluginName)
 			return false
@@ -107,7 +108,7 @@ func createTestPod(name string, annotations map[string]string, resources *corev1
 					Name:  "test-container",
 					Image: "busybox:1.35",
 					Command: []string{
-						"sh", "-c", "while true; do cat /proc/self/status | grep -E '^(Cpus_allowed|Mems_allowed)' && sleep 30; done",
+						"sh", "-c", "echo 'Test container started' && exec sleep infinity",
 					},
 				},
 			},
@@ -149,8 +150,72 @@ func getPodCPUSet(podName string) (string, error) {
 }
 
 func execInPod(pod *corev1.Pod, command []string) ([]byte, error) {
-	// Simplified exec implementation
-	// In a real implementation, you would use the Kubernetes exec API
-	return []byte("Cpus_allowed_list: 0-3\nMems_allowed_list: 0"), nil
+	// Use kubectl exec to get the real CPU/memory status
+	kubeconfigPath := os.Getenv("KUBECONFIG")
+	if kubeconfigPath == "" {
+		kubeconfigPath = os.ExpandEnv("$HOME/.kube/config")
+	}
+
+	cmdArgs := []string{"--kubeconfig", kubeconfigPath, "exec", "-n", pod.Namespace, pod.Name, "--"}
+	cmdArgs = append(cmdArgs, command...)
+
+	cmd := exec.Command("kubectl", cmdArgs...)
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("failed to exec command in pod %s/%s: %v", pod.Namespace, pod.Name, err)
+	}
+
+	return output, nil
 }
 
+// waitForPodTermination waits for a pod to be fully terminated and removed
+func waitForPodTermination(podName string) {
+	Eventually(func() bool {
+		_, err := kubeClient.CoreV1().Pods(testNamespace).Get(ctx, podName, metav1.GetOptions{})
+		// Pod is considered terminated when it no longer exists
+		return err != nil
+	}, timeout, interval).Should(BeTrue(), fmt.Sprintf("Pod %s should be fully terminated", podName))
+}
+
+// waitForPodsTermination waits for multiple pods to be fully terminated
+func waitForPodsTermination(podNames []string) {
+	for _, podName := range podNames {
+		waitForPodTermination(podName)
+	}
+}
+
+// cleanupAllPodsAndWait deletes all pods in the test namespace and waits for termination
+func cleanupAllPodsAndWait() {
+	pods, err := kubeClient.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return
+	}
+
+	var podNames []string
+	for _, pod := range pods.Items {
+		podNames = append(podNames, pod.Name)
+		// Use graceful deletion with a 30-second timeout
+		gracePeriod := int64(30)
+		deleteOptions := metav1.DeleteOptions{
+			GracePeriodSeconds: &gracePeriod,
+		}
+		_ = kubeClient.CoreV1().Pods(testNamespace).Delete(ctx, pod.Name, deleteOptions)
+	}
+
+	// Wait for all pods to be fully terminated
+	waitForPodsTermination(podNames)
+}
+
+// deletePodAndWait deletes a specific pod and waits for its termination
+func deletePodAndWait(podName string) {
+	gracePeriod := int64(30)
+	deleteOptions := metav1.DeleteOptions{
+		GracePeriodSeconds: &gracePeriod,
+	}
+	err := kubeClient.CoreV1().Pods(testNamespace).Delete(ctx, podName, deleteOptions)
+	if err != nil {
+		// Pod might already be deleted or not exist
+		return
+	}
+	waitForPodTermination(podName)
+}

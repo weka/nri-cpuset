@@ -31,9 +31,6 @@
 ---
 
 ## Commands
-
-> **IMPORTANT:** Always use `/usr/bin/make` instead of `make` to avoid zsh autoload function conflicts in automated environments.
-
 | Task | Command |
 |------|---------|
 | Local build | `make build` → `./bin/weka-cpuset` |

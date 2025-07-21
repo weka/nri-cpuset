@@ -13,13 +13,8 @@ import (
 var _ = Describe("Integer Pod Tests", Label("e2e"), func() {
 	Context("When creating integer pods", func() {
 		AfterEach(func() {
-			// Clean up any pods created in tests
-			pods, err := kubeClient.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{})
-			if err == nil {
-				for _, pod := range pods.Items {
-					_ = kubeClient.CoreV1().Pods(testNamespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
-				}
-			}
+			// Clean up any pods created in tests and wait for termination
+			cleanupAllPodsAndWait()
 		})
 
 		It("should allocate exclusive CPUs for integer pods", func() {
@@ -49,7 +44,7 @@ var _ = Describe("Integer Pod Tests", Label("e2e"), func() {
 					return ""
 				}
 				return output
-			}, timeout, interval).Should(MatchRegexp(`Cpus_allowed_list:\s*\d+[,-]\d+`), 
+			}, timeout, interval).Should(MatchRegexp(`Cpus_allowed_list:\s*\d+[,-]\d+`),
 				"Pod should have exactly 2 exclusive CPUs")
 		})
 
@@ -82,7 +77,7 @@ var _ = Describe("Integer Pod Tests", Label("e2e"), func() {
 				}
 				pod1CPUs = output
 				return output
-			}, timeout, interval).Should(MatchRegexp(`Cpus_allowed_list:\s*\d+`), 
+			}, timeout, interval).Should(MatchRegexp(`Cpus_allowed_list:\s*\d+`),
 				"First pod should have exactly 1 CPU")
 
 			By("Creating second integer pod")
@@ -110,7 +105,7 @@ var _ = Describe("Integer Pod Tests", Label("e2e"), func() {
 				if err != nil {
 					return false
 				}
-				
+
 				// In a real implementation, you would parse the CPU lists and verify no overlap
 				// For now, just check that both pods have CPU assignments
 				return len(pod1CPUs) > 0 && len(output2) > 0 && pod1CPUs != output2
@@ -121,7 +116,7 @@ var _ = Describe("Integer Pod Tests", Label("e2e"), func() {
 			By("Creating pods to exhaust available exclusive CPUs")
 			// This test assumes a system with limited CPUs
 			// Create multiple integer pods until one should fail
-			
+
 			resources := &corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{
 					corev1.ResourceCPU:    resource.MustParse("4"), // Request many CPUs
@@ -181,8 +176,8 @@ var _ = Describe("Integer Pod Tests", Label("e2e"), func() {
 			}
 
 			integerPod := createTestPod("terminating-integer-pod", nil, resources)
-			integerPod.Spec.Containers[0].Command = []string{"sh", "-c", "sleep 30"} // Short-lived
-			
+			integerPod.Spec.Containers[0].Command = []string{"sh", "-c", "sleep 1"} // Short-lived
+
 			createdIntegerPod, err := kubeClient.CoreV1().Pods(testNamespace).Create(ctx, integerPod, metav1.CreateOptions{})
 			Expect(err).ToNot(HaveOccurred())
 
@@ -221,7 +216,7 @@ var _ = Describe("Integer Pod Tests", Label("e2e"), func() {
 				if err != nil {
 					return false
 				}
-				
+
 				// In a real implementation, you would parse and compare CPU counts
 				// For now, assume expansion if the output changes
 				return output != initialSharedCPUs
@@ -233,12 +228,8 @@ var _ = Describe("Integer Pod Tests", Label("e2e"), func() {
 var _ = Describe("Integer Pod Edge Cases", Label("e2e"), func() {
 	Context("When testing edge cases for integer pods", func() {
 		AfterEach(func() {
-			pods, err := kubeClient.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{})
-			if err == nil {
-				for _, pod := range pods.Items {
-					_ = kubeClient.CoreV1().Pods(testNamespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
-				}
-			}
+			// Clean up any pods created in tests and wait for termination
+			cleanupAllPodsAndWait()
 		})
 
 		It("should reject pods with fractional CPU requests", func() {
@@ -260,7 +251,7 @@ var _ = Describe("Integer Pod Edge Cases", Label("e2e"), func() {
 
 			By("Verifying pod is treated as shared, not integer")
 			waitForPodRunning(createdPod.Name)
-			
+
 			// This pod should get shared treatment since CPU is not an integer
 			Eventually(func() string {
 				output, err := getPodCPUSet(createdPod.Name)
@@ -268,7 +259,7 @@ var _ = Describe("Integer Pod Edge Cases", Label("e2e"), func() {
 					return ""
 				}
 				return output
-			}, timeout, interval).Should(ContainSubstring("Cpus_allowed_list:"), 
+			}, timeout, interval).Should(ContainSubstring("Cpus_allowed_list:"),
 				"Pod should get shared CPU treatment")
 		})
 
@@ -291,14 +282,14 @@ var _ = Describe("Integer Pod Edge Cases", Label("e2e"), func() {
 
 			By("Verifying pod is treated as shared due to mismatch")
 			waitForPodRunning(createdPod.Name)
-			
+
 			Eventually(func() string {
 				output, err := getPodCPUSet(createdPod.Name)
 				if err != nil {
 					return ""
 				}
 				return output
-			}, timeout, interval).Should(ContainSubstring("Cpus_allowed_list:"), 
+			}, timeout, interval).Should(ContainSubstring("Cpus_allowed_list:"),
 				"Pod should get shared CPU treatment due to request/limit mismatch")
 		})
 
@@ -329,8 +320,8 @@ var _ = Describe("Integer Pod Edge Cases", Label("e2e"), func() {
 					return false
 				}
 				// Should have both CPU and memory node restrictions
-				return strings.Contains(output, "Cpus_allowed_list:") && 
-					   strings.Contains(output, "Mems_allowed_list:")
+				return strings.Contains(output, "Cpus_allowed_list:") &&
+					strings.Contains(output, "Mems_allowed_list:")
 			}, timeout, interval).Should(BeTrue(), "Integer pod should have NUMA memory restriction matching assigned CPU")
 		})
 
@@ -362,8 +353,8 @@ var _ = Describe("Integer Pod Edge Cases", Label("e2e"), func() {
 				}
 				// Should have both CPU and memory node restrictions
 				// Memory nodes should correspond to NUMA nodes of assigned CPUs
-				return strings.Contains(output, "Cpus_allowed_list:") && 
-					   strings.Contains(output, "Mems_allowed_list:")
+				return strings.Contains(output, "Cpus_allowed_list:") &&
+					strings.Contains(output, "Mems_allowed_list:")
 			}, timeout, interval).Should(BeTrue(), "Integer pod should have NUMA memory restriction spanning assigned CPU nodes")
 		})
 	})
@@ -372,12 +363,8 @@ var _ = Describe("Integer Pod Edge Cases", Label("e2e"), func() {
 var _ = Describe("Integer Pod NUMA Memory Placement", Label("e2e"), func() {
 	Context("When testing NUMA memory placement for integer pods", func() {
 		AfterEach(func() {
-			pods, err := kubeClient.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{})
-			if err == nil {
-				for _, pod := range pods.Items {
-					_ = kubeClient.CoreV1().Pods(testNamespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
-				}
-			}
+			// Clean up any pods created in tests and wait for termination
+			cleanupAllPodsAndWait()
 		})
 
 		It("should restrict memory to single NUMA node when all CPUs on same node", func() {
@@ -406,7 +393,7 @@ var _ = Describe("Integer Pod NUMA Memory Placement", Label("e2e"), func() {
 				if err != nil {
 					return false
 				}
-				
+
 				// Parse the output to verify memory node matches CPU node
 				lines := strings.Split(output, "\n")
 				var cpuLine, memLine string
@@ -418,7 +405,7 @@ var _ = Describe("Integer Pod NUMA Memory Placement", Label("e2e"), func() {
 						memLine = line
 					}
 				}
-				
+
 				// Both should be present and memory should be restricted
 				return cpuLine != "" && memLine != "" && !strings.Contains(memLine, "0-1") && !strings.Contains(memLine, "0,1")
 			}, timeout, interval).Should(BeTrue(), "Memory should be restricted to single NUMA node")
@@ -450,10 +437,10 @@ var _ = Describe("Integer Pod NUMA Memory Placement", Label("e2e"), func() {
 				if err != nil {
 					return false
 				}
-				
+
 				// Should have memory nodes corresponding to CPU placement
-				return strings.Contains(output, "Cpus_allowed_list:") && 
-					   strings.Contains(output, "Mems_allowed_list:")
+				return strings.Contains(output, "Cpus_allowed_list:") &&
+					strings.Contains(output, "Mems_allowed_list:")
 			}, timeout, interval).Should(BeTrue(), "Memory should span NUMA nodes containing assigned CPUs")
 		})
 	})

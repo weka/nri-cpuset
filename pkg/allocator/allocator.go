@@ -34,7 +34,7 @@ func (a *CPUAllocator) GetOnlineCPUs() []int {
 	return append([]int(nil), a.onlineCPUs...)
 }
 
-func (a *CPUAllocator) AllocateContainer(pod *api.PodSandbox, container *api.Container) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
+func (a *CPUAllocator) AllocateContainer(pod *api.PodSandbox, container *api.Container, reserved []int) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
 	mode := a.determineContainerMode(pod, container)
 
 	var result *AllocationResult
@@ -42,11 +42,11 @@ func (a *CPUAllocator) AllocateContainer(pod *api.PodSandbox, container *api.Con
 
 	switch mode {
 	case "annotated":
-		result, err = a.handleAnnotatedContainer(pod)
+		result, err = a.handleAnnotatedContainer(pod, reserved)
 	case "integer":
-		result, err = a.handleIntegerContainer(container, nil) // TODO: pass reserved CPUs
+		result, err = a.handleIntegerContainer(container, reserved)
 	case "shared":
-		result, err = a.handleSharedContainer(nil) // TODO: pass reserved CPUs
+		result, err = a.handleSharedContainer(reserved)
 	default:
 		return nil, nil, fmt.Errorf("unknown container mode: %s", mode)
 	}
@@ -156,7 +156,7 @@ func (a *CPUAllocator) hasIntegerSemantics(container *api.Container) bool {
 	return true
 }
 
-func (a *CPUAllocator) handleAnnotatedContainer(pod *api.PodSandbox) (*AllocationResult, error) {
+func (a *CPUAllocator) handleAnnotatedContainer(pod *api.PodSandbox, reserved []int) (*AllocationResult, error) {
 	if pod.Annotations == nil {
 		return nil, fmt.Errorf("missing annotations for annotated container")
 	}
@@ -180,6 +180,18 @@ func (a *CPUAllocator) handleAnnotatedContainer(pod *api.PodSandbox) (*Allocatio
 	for _, cpu := range cpus {
 		if _, isOnline := onlineSet[cpu]; !isOnline {
 			return nil, fmt.Errorf("CPU %d is not online", cpu)
+		}
+	}
+
+	// Check for conflicts with reserved CPUs
+	reservedSet := make(map[int]struct{})
+	for _, cpu := range reserved {
+		reservedSet[cpu] = struct{}{}
+	}
+
+	for _, cpu := range cpus {
+		if _, isReserved := reservedSet[cpu]; isReserved {
+			return nil, fmt.Errorf("CPU %d is already reserved by another container", cpu)
 		}
 	}
 

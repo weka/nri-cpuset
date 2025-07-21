@@ -348,7 +348,7 @@ var _ = Describe("Advanced Allocation Scenarios", func() {
 					WekaAnnotation: "5",
 				},
 			}
-			result, err := allocator.handleAnnotatedContainer(pod)
+			result, err := allocator.handleAnnotatedContainer(pod, []int{})
 			Expect(err).ToNot(HaveOccurred())
 			Expect(result.CPUs).To(Equal([]int{5}))
 			Expect(result.Mode).To(Equal("annotated"))
@@ -360,7 +360,7 @@ var _ = Describe("Advanced Allocation Scenarios", func() {
 					WekaAnnotation: "0-2",
 				},
 			}
-			result, err := allocator.handleAnnotatedContainer(pod)
+			result, err := allocator.handleAnnotatedContainer(pod, []int{})
 			Expect(err).ToNot(HaveOccurred())
 			Expect(result.CPUs).To(Equal([]int{0, 1, 2}))
 		})
@@ -371,14 +371,14 @@ var _ = Describe("Advanced Allocation Scenarios", func() {
 					WekaAnnotation: "0,2-3,7",
 				},
 			}
-			result, err := allocator.handleAnnotatedContainer(pod)
+			result, err := allocator.handleAnnotatedContainer(pod, []int{})
 			Expect(err).ToNot(HaveOccurred())
 			Expect(result.CPUs).To(Equal([]int{0, 2, 3, 7}))
 		})
 
 		It("should return error for missing annotations", func() {
 			pod := &api.PodSandbox{}
-			_, err := allocator.handleAnnotatedContainer(pod)
+			_, err := allocator.handleAnnotatedContainer(pod, []int{})
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("missing annotations"))
 		})
@@ -389,7 +389,7 @@ var _ = Describe("Advanced Allocation Scenarios", func() {
 					"other.io/annotation": "value",
 				},
 			}
-			_, err := allocator.handleAnnotatedContainer(pod)
+			_, err := allocator.handleAnnotatedContainer(pod, []int{})
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("missing weka.io/cores-ids"))
 		})
@@ -400,7 +400,7 @@ var _ = Describe("Advanced Allocation Scenarios", func() {
 					WekaAnnotation: "0,99", // 99 is offline
 				},
 			}
-			_, err := allocator.handleAnnotatedContainer(pod)
+			_, err := allocator.handleAnnotatedContainer(pod, []int{})
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("not online"))
 		})
@@ -411,7 +411,7 @@ var _ = Describe("Advanced Allocation Scenarios", func() {
 					WekaAnnotation: "0-", // Invalid range
 				},
 			}
-			_, err := allocator.handleAnnotatedContainer(pod)
+			_, err := allocator.handleAnnotatedContainer(pod, []int{})
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("invalid CPU list"))
 		})
