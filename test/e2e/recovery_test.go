@@ -3,17 +3,15 @@ package e2e
 import (
 	"fmt"
 	"strings"
-	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-var _ = Describe("Plugin Recovery and Synchronization", Label("e2e", "sequential"), func() {
+var _ = Describe("Plugin Recovery and Synchronization", Label("e2e", "parallel"), func() {
 	Context("When plugin restarts or crashes", func() {
 		AfterEach(func() {
 			// Clean up any pods created in tests (conditional on failure)
@@ -67,35 +65,37 @@ var _ = Describe("Plugin Recovery and Synchronization", Label("e2e", "sequential
 				return len(ann) > 0 && len(int) > 0 && len(shared) > 0
 			}, timeout, interval).Should(BeTrue(), "All pods should have initial CPU assignments")
 
-			By("Simulating plugin restart by restarting DaemonSet")
-			// Restart plugin DaemonSet
-			daemonSets, err := kubeClient.AppsV1().DaemonSets("kube-system").List(ctx, metav1.ListOptions{
+			By("Simulating plugin restart by killing node-local plugin pod")
+			// Find the plugin pod running on our exclusive test node
+			pods, err := kubeClient.CoreV1().Pods("kube-system").List(ctx, metav1.ListOptions{
 				LabelSelector: "app=" + pluginName,
+				FieldSelector: "spec.nodeName=" + exclusiveNode,
 			})
 			Expect(err).ToNot(HaveOccurred())
-			Expect(daemonSets.Items).ToNot(BeEmpty(), "Plugin DaemonSet should exist")
+			Expect(len(pods.Items)).To(BeNumerically(">", 0), fmt.Sprintf("Plugin pod should exist on node %s", exclusiveNode))
 
-			ds := &daemonSets.Items[0]
-			// Force restart by updating an annotation
-			if ds.Spec.Template.Annotations == nil {
-				ds.Spec.Template.Annotations = make(map[string]string)
-			}
-			ds.Spec.Template.Annotations["test.restart"] = fmt.Sprintf("%d", time.Now().Unix())
+			pluginPod := &pods.Items[0]
+			oldPodUID := pluginPod.UID
 
-			var updatedDS *appsv1.DaemonSet
-			updatedDS, err = kubeClient.AppsV1().DaemonSets("kube-system").Update(ctx, ds, metav1.UpdateOptions{})
+			// Delete the plugin pod to simulate crash/restart
+			err = kubeClient.CoreV1().Pods("kube-system").Delete(ctx, pluginPod.Name, metav1.DeleteOptions{})
 			Expect(err).ToNot(HaveOccurred())
 
-			By("Waiting for plugin to restart")
-			// Wait for rolling update to complete
+			By("Waiting for plugin pod to be recreated on the same node")
+			// DaemonSet should recreate the pod automatically
 			Eventually(func() bool {
-				currentDS, err := kubeClient.AppsV1().DaemonSets("kube-system").Get(ctx, updatedDS.Name, metav1.GetOptions{})
-				if err != nil {
+				newPods, err := kubeClient.CoreV1().Pods("kube-system").List(ctx, metav1.ListOptions{
+					LabelSelector: "app=" + pluginName,
+					FieldSelector: "spec.nodeName=" + exclusiveNode,
+				})
+				if err != nil || len(newPods.Items) == 0 {
 					return false
 				}
-				return currentDS.Status.UpdatedNumberScheduled == currentDS.Status.DesiredNumberScheduled &&
-					currentDS.Status.NumberReady == currentDS.Status.DesiredNumberScheduled
-			}, timeout*2, interval).Should(BeTrue(), "Plugin DaemonSet should complete restart")
+
+				// Check if it's a different pod (new UID) and it's running
+				newPod := &newPods.Items[0]
+				return newPod.UID != oldPodUID && newPod.Status.Phase == corev1.PodRunning
+			}, timeout*2, interval).Should(BeTrue(), fmt.Sprintf("Plugin pod should be recreated and running on node %s", exclusiveNode))
 
 			By("Verifying CPU assignments are maintained after plugin restart")
 			Eventually(func() bool {
@@ -238,7 +238,7 @@ var _ = Describe("Plugin Recovery and Synchronization", Label("e2e", "sequential
 	})
 })
 
-var _ = Describe("Live Container Updates", Label("e2e", "sequential"), func() {
+var _ = Describe("Live Container Updates", Label("e2e", "parallel"), func() {
 	Context("When containers need live CPU updates", func() {
 		AfterEach(func() {
 			// Clean up any pods created in tests (conditional on failure)

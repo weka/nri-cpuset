@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/containerd/nri/pkg/api"
@@ -181,11 +182,22 @@ func (p *plugin) RemoveContainer(ctx context.Context, pod *api.PodSandbox, conta
 		return fmt.Errorf("container removal failed: %w", err)
 	}
 
-	// Apply updates to shared containers
+	// Apply updates to shared containers via UpdateContainers call
 	if len(updates) > 0 {
-		// In a real implementation, we would need to apply these updates
-		// For now, just log them
-		fmt.Printf("Would apply %d updates to shared containers\n", len(updates))
+		fmt.Printf("Applying %d updates to shared containers\n", len(updates))
+		_, err := p.stub.UpdateContainers(updates)
+		if err != nil {
+			// Check if this is a critical ttrpc connection error
+			errStr := err.Error()
+			if strings.Contains(errStr, "ttrpc: closed") || 
+			   strings.Contains(errStr, "connection") ||
+			   strings.Contains(errStr, "broken pipe") {
+				// Critical connection error - plugin should restart
+				return fmt.Errorf("critical NRI connection error during container updates: %w", err)
+			}
+			// Non-critical error, log warning and continue
+			fmt.Printf("Warning: Failed to update containers: %v\n", err)
+		}
 	}
 
 	return nil
@@ -287,6 +299,16 @@ func (p *plugin) handleAnnotatedContainer(pod *api.PodSandbox, container *api.Co
 		return nil, nil, err
 	}
 
+	// Apply live reallocation updates immediately if any were generated
+	if len(updates) > 0 {
+		fmt.Printf("Applying %d live reallocation updates for annotated container %s\n", len(updates), container.Name)
+		_, err := p.stub.UpdateContainers(updates)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to apply live reallocation updates: %w", err)
+		}
+		fmt.Printf("Successfully applied live reallocation updates\n")
+	}
+
 	// Record the successful allocation with proper reference counting for annotated containers
 	if adjustment != nil {
 		err := p.state.RecordAnnotatedContainer(container, pod, adjustment)
@@ -295,7 +317,8 @@ func (p *plugin) handleAnnotatedContainer(pod *api.PodSandbox, container *api.Co
 		}
 	}
 
-	return adjustment, updates, nil
+	// Return adjustment only, since updates have been applied already
+	return adjustment, nil, nil
 }
 
 func (p *plugin) handleIntegerContainer(pod *api.PodSandbox, container *api.Container) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {

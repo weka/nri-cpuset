@@ -7,7 +7,7 @@ KUBECONFIG=${KUBECONFIG:-"$HOME/.kube/config"}
 TEST_NS=${TEST_NS:-wekaplugin-e2e}
 PLUGIN_IMAGE=${PLUGIN_IMAGE:-weka/nri-cpuset:latest}
 TEST_TIMEOUT=${TEST_TIMEOUT:-30m}
-TEST_PARALLEL=${TEST_PARALLEL:-8}
+TEST_PARALLEL=${TEST_PARALLEL:-16}
 PRESERVE_ON_FAILURE=${PRESERVE_ON_FAILURE:-true}
 CONTINUE_ON_FAILURE=${CONTINUE_ON_FAILURE:-false}
 
@@ -159,12 +159,7 @@ verify_plugin() {
 run_tests() {
     log_info "Running e2e tests against live cluster"
     
-    # Reset environment to clean state first
-    reset_test_environment
-    
-    # Create fresh test namespace
-    log_info "Creating fresh test namespace..."
-    kubectl create namespace "$TEST_NS"
+    log_info "Note: Test namespaces will be preserved for debugging - no cleanup performed"
     
     # Export required environment variables
     export KUBECONFIG="$KUBECONFIG"
@@ -255,37 +250,28 @@ run_tests() {
     return $test_result
 }
 
-# Cleanup function
+# Cleanup function - only show debug info if tests actually failed
 cleanup() {
     # Stop monitoring if it's running
     stop_monitoring
     
-    if [[ "${SKIP_CLEANUP:-}" != "true" ]]; then
-        log_info "Cleaning up test namespaces..."
-        kubectl delete namespace "$TEST_NS" --ignore-not-found=true
-        # Also clean up any worker-specific namespaces
-        kubectl get namespaces -o name | grep "namespace/${TEST_NS}-w" | xargs -r kubectl delete --ignore-not-found=true
-        
-        # Clean up test report files unless preserving them
-        if [[ "${PRESERVE_REPORTS:-}" != "true" ]]; then
-            log_info "Cleaning up test report files..."
-            rm -f test-results*.json test-results*.xml
-        else
-            log_info "Preserving test reports (PRESERVE_REPORTS=true)"
-            [[ -f test-results-parallel.json ]] && log_info "Parallel JSON report: test-results-parallel.json"
-            [[ -f test-results-sequential.json ]] && log_info "Sequential JSON report: test-results-sequential.json"
-            [[ -f test-results-parallel.xml ]] && log_info "Parallel JUnit report: test-results-parallel.xml"
-            [[ -f test-results-sequential.xml ]] && log_info "Sequential JUnit report: test-results-sequential.xml"
-            [[ -f test-results.json ]] && log_info "Combined JSON report: test-results.json"
-            [[ -f test-results.xml ]] && log_info "Combined JUnit report: test-results.xml"
-        fi
+    # Only show debugging info if tests failed (indicated by TEST_FAILED variable)
+    if [[ "${TEST_FAILED:-false}" == "true" ]]; then
+        log_info "Test execution completed with failures - preserving namespaces for debugging"
+        log_info "Debug commands:"
+        log_info "  kubectl get pods -n $TEST_NS* -o wide"
+        log_info "  kubectl logs -n kube-system -l app=weka-nri-cpuset --since=5m"
+        log_info "  kubectl get namespaces | grep $TEST_NS"
+        log_info "Manual cleanup when ready: kubectl delete namespace \$(kubectl get ns | grep $TEST_NS | awk '{print \$1}')"
     else
-        log_info "Skipping cleanup (SKIP_CLEANUP=true)"
-        [[ -f test-results-parallel.json ]] && log_info "Parallel JSON report: test-results-parallel.json"
-        [[ -f test-results-sequential.json ]] && log_info "Sequential JSON report: test-results-sequential.json"
-        [[ -f test-results.json ]] && log_info "Combined JSON report: test-results.json"
-        [[ -f test-results.xml ]] && log_info "Combined JUnit report: test-results.xml"
+        log_info "Test execution completed successfully"
     fi
+    
+    # Show available reports
+    [[ -f test-results-parallel.json ]] && log_info "Parallel JSON report: test-results-parallel.json"
+    [[ -f test-results-sequential.json ]] && log_info "Sequential JSON report: test-results-sequential.json"
+    [[ -f test-results.json ]] && log_info "Combined JSON report: test-results.json"
+    [[ -f test-results.xml ]] && log_info "Combined JUnit report: test-results.xml"
 }
 
 # Reset test environment to clean state
@@ -355,9 +341,11 @@ main() {
     # Run tests
     if run_tests; then
         log_info "All e2e tests passed!"
+        export TEST_FAILED=false
         exit 0
     else
         log_error "Some e2e tests failed"
+        export TEST_FAILED=true
         
         # Print debug information
         log_warn "Debug information:"

@@ -41,7 +41,7 @@ Whenever the reserved set changes (creation or termination of annotated/integer 
 
 ### 3.3 Memory Placement
 
-#### Annotated and Integer Pods (Exclusive Allocation)
+#### Annotated Pods (Fixed CPU Allocation)
 
 1. Determine NUMA node(s) of all assigned CPUs
 2. Set `cpuset.mems` to the union of NUMA nodes containing the assigned CPUs
@@ -49,7 +49,14 @@ Whenever the reserved set changes (creation or termination of annotated/integer 
    - If CPUs span 2 NUMA nodes → use both nodes  
    - If CPUs span 4 NUMA nodes → use all four nodes
 3. This ensures memory placement is restricted only to NUMA nodes that contain the allocated CPUs
-4. During live reassignment, memory placement is recalculated based on new CPU assignments
+4. Since annotated pods have fixed CPU assignments, NUMA memory placement remains stable
+
+#### Integer Pods (Dynamic CPU Allocation)
+
+1. Leave `cpuset.mems` unchanged (inherit system default)
+2. Integer pods may access memory from all NUMA nodes regardless of their CPU constraints
+3. This provides maximum memory allocation flexibility since integer pods can be reallocated to different CPUs during conflict resolution
+4. Avoiding NUMA memory binding prevents memory placement conflicts during live reassignment
 
 #### Shared Pods
 

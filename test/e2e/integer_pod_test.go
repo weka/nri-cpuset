@@ -367,8 +367,8 @@ var _ = Describe("Integer Pod NUMA Memory Placement", Label("e2e", "parallel"), 
 			cleanupAllPodsConditional()
 		})
 
-		It("should restrict memory to single NUMA node when all CPUs on same node", func() {
-			By("Creating integer pod that should get CPUs from single NUMA node")
+		It("should have flexible NUMA memory access to support live reallocation", func() {
+			By("Creating integer pod that should get exclusive CPU allocation")
 			resources := &corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{
 					corev1.ResourceCPU:    resource.MustParse("1"),
@@ -380,21 +380,21 @@ var _ = Describe("Integer Pod NUMA Memory Placement", Label("e2e", "parallel"), 
 				},
 			}
 
-			pod := createTestPod("numa-single-node-integer", nil, resources)
+			pod := createTestPod("numa-flexible-integer", nil, resources)
 			createdPod, err := kubeClient.CoreV1().Pods(testNamespace).Create(ctx, pod, metav1.CreateOptions{})
 			Expect(err).ToNot(HaveOccurred())
 
 			By("Waiting for pod to be running")
 			waitForPodRunning(createdPod.Name)
 
-			By("Verifying memory is restricted to single NUMA node")
+			By("Verifying memory has flexible NUMA access (not restricted)")
 			Eventually(func() bool {
 				output, err := getPodCPUSet(createdPod.Name)
 				if err != nil {
 					return false
 				}
 
-				// Parse the output to verify memory node matches CPU node
+				// Parse the output to verify CPU allocation is exclusive but memory is flexible
 				lines := strings.Split(output, "\n")
 				var cpuLine, memLine string
 				for _, line := range lines {
@@ -406,16 +406,16 @@ var _ = Describe("Integer Pod NUMA Memory Placement", Label("e2e", "parallel"), 
 					}
 				}
 
-				// Both should be present and memory should be restricted
-				return cpuLine != "" && memLine != "" && !strings.Contains(memLine, "0-1") && !strings.Contains(memLine, "0,1")
-			}, timeout, interval).Should(BeTrue(), "Memory should be restricted to single NUMA node")
+				// CPU should be allocated (exclusive) but memory should be flexible (access to multiple NUMA nodes)
+				return cpuLine != "" && memLine != "" && (strings.Contains(memLine, "0-1") || strings.Contains(memLine, "0,1"))
+			}, timeout, interval).Should(BeTrue(), "Integer pods should have flexible NUMA memory access")
 		})
 
-		It("should use union of NUMA nodes when CPUs span multiple nodes", func() {
-			By("Creating integer pod that should get CPUs from multiple NUMA nodes")
+		It("should maintain flexible memory access regardless of CPU NUMA distribution", func() {
+			By("Creating integer pod that should get exclusive CPUs")
 			resources := &corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{
-					corev1.ResourceCPU:    resource.MustParse("4"), // More likely to span NUMA nodes
+					corev1.ResourceCPU:    resource.MustParse("4"), // Request multiple CPUs 
 					corev1.ResourceMemory: resource.MustParse("4Gi"),
 				},
 				Limits: corev1.ResourceList{
@@ -424,24 +424,24 @@ var _ = Describe("Integer Pod NUMA Memory Placement", Label("e2e", "parallel"), 
 				},
 			}
 
-			pod := createTestPod("numa-multi-node-integer", nil, resources)
+			pod := createTestPod("numa-multi-cpu-integer", nil, resources)
 			createdPod, err := kubeClient.CoreV1().Pods(testNamespace).Create(ctx, pod, metav1.CreateOptions{})
 			Expect(err).ToNot(HaveOccurred())
 
 			By("Waiting for pod to be running")
 			waitForPodRunning(createdPod.Name)
 
-			By("Verifying memory includes all necessary NUMA nodes")
+			By("Verifying CPU allocation is exclusive and memory access is flexible")
 			Eventually(func() bool {
 				output, err := getPodCPUSet(createdPod.Name)
 				if err != nil {
 					return false
 				}
 
-				// Should have memory nodes corresponding to CPU placement
+				// Should have exclusive CPU allocation and flexible memory access 
 				return strings.Contains(output, "Cpus_allowed_list:") &&
 					strings.Contains(output, "Mems_allowed_list:")
-			}, timeout, interval).Should(BeTrue(), "Memory should span NUMA nodes containing assigned CPUs")
+			}, timeout, interval).Should(BeTrue(), "Integer pods should have exclusive CPU allocation with flexible memory access")
 		})
 	})
 })

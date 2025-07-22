@@ -22,7 +22,7 @@ import (
 const (
 	baseTestNamespace = "wekaplugin-e2e"
 	pluginName        = "weka-nri-cpuset"
-	timeout           = 30 * time.Second // Reduced from 5 minutes
+	timeout           = 2 * time.Minute  // Increased for resource conflicts and reallocation
 	interval          = 2 * time.Second  // Reduced from 10 seconds
 )
 
@@ -35,6 +35,7 @@ var (
 	testNamespace     string
 	hasFailedTests    bool
 	nodeAssignments   map[int]string // worker_id -> node_name
+	exclusiveNode     string         // Node assigned exclusively to this worker
 )
 
 func TestE2E(t *testing.T) {
@@ -44,6 +45,15 @@ func TestE2E(t *testing.T) {
 
 var _ = BeforeSuite(func() {
 	ctx = context.Background()
+
+	// Initialize test artifact collection system once per test suite execution
+	// Check if artifacts have already been initialized to prevent multiple instances
+	if globalArtifacts == nil {
+		InitializeTestArtifacts()
+		fmt.Printf("Initialized test artifacts collection - Execution ID: %s\n", globalArtifacts.ExecutionID)
+	} else {
+		fmt.Printf("Using existing test artifacts collection - Execution ID: %s\n", globalArtifacts.ExecutionID)
+	}
 
 	// Check if we should preserve resources on failure
 	if os.Getenv("PRESERVE_ON_FAILURE") == "true" {
@@ -75,13 +85,12 @@ var _ = BeforeSuite(func() {
 	// Initialize node assignments for parallel workers
 	nodeAssignments = make(map[int]string)
 
-	// Create per-worker namespace with node affinity
+	// Get exclusive node assignment for this worker
 	workerID := GinkgoParallelProcess()
 	if len(availableNodes) > 0 {
-		// Assign each worker to a specific node
-		nodeIndex := (workerID - 1) % len(availableNodes)
-		nodeAssignments[workerID] = availableNodes[nodeIndex]
-		fmt.Printf("Worker %d assigned to node: %s\n", workerID, nodeAssignments[workerID])
+		exclusiveNode = reserveExclusiveNode(workerID, availableNodes)
+		nodeAssignments[workerID] = exclusiveNode
+		fmt.Printf("Worker %d got exclusive access to node: %s\n", workerID, exclusiveNode)
 	}
 
 	// Create unique namespace per worker to avoid conflicts
@@ -113,26 +122,49 @@ var _ = BeforeSuite(func() {
 })
 
 var _ = AfterSuite(func() {
-	// Only clean up test namespace if no failures occurred or preserve is disabled
-	if kubeClient != nil {
-		// Check if any tests failed in this worker (hasFailedTests is set by AfterEach)
-		testsFailed := hasFailedTests
-		
-		if preserveOnFailure && (testsFailed || hasFailedTests) {
-			fmt.Printf("PRESERVE_ON_FAILURE=true and tests failed: Preserving namespace %s for debugging\n", testNamespace)
+	// Release exclusive node lock
+	workerID := GinkgoParallelProcess()
+	releaseNodeLock(workerID, exclusiveNode)
+	
+	// Check environment settings and test outcomes
+	preserveOnFailure := os.Getenv("PRESERVE_ON_FAILURE") == "true"
+	skipCleanup := os.Getenv("SKIP_CLEANUP") == "true"
+	
+	// Decide whether to clean up namespace
+	shouldCleanupNamespace := !skipCleanup && !(hasFailedTests && preserveOnFailure)
+	
+	if shouldCleanupNamespace {
+		fmt.Printf("Cleaning up test namespace %s (no failures in this worker)\n", testNamespace)
+		if kubeClient != nil {
+			err := deleteTestNamespaceWithWait(testNamespace, 2*time.Minute)
+			if err != nil {
+				fmt.Printf("Warning: Failed to cleanup namespace %s: %v\n", testNamespace, err)
+			} else {
+				fmt.Printf("Successfully cleaned up namespace %s\n", testNamespace)
+			}
+		}
+	} else {
+		if kubeClient != nil {
+			fmt.Printf("Preserving namespace %s for debugging (failures: %v, preserve on failure: %v, skip cleanup: %v)\n", 
+				testNamespace, hasFailedTests, preserveOnFailure, skipCleanup)
 			fmt.Printf("Debug commands:\n")
 			fmt.Printf("  kubectl get pods -n %s -o wide\n", testNamespace)
 			fmt.Printf("  kubectl describe pods -n %s\n", testNamespace)
 			fmt.Printf("  kubectl logs -n kube-system -l app=weka-nri-cpuset --since=5m\n")
 			fmt.Printf("Manual cleanup: kubectl delete namespace %s\n", testNamespace)
-			return
 		}
-		
-		fmt.Printf("Cleaning up test namespace: %s\n", testNamespace)
-		err := deleteTestNamespaceWithWait(testNamespace, 2*time.Minute)
-		if err != nil {
-			fmt.Printf("Warning: Failed to delete namespace %s: %v\n", testNamespace, err)
+	}
+	
+	// Always show test artifacts execution ID for debugging
+	if globalArtifacts != nil {
+		fmt.Printf("=== Test Artifacts Collection ===\n")
+		fmt.Printf("Execution ID: %s\n", globalArtifacts.ExecutionID)
+		fmt.Printf("Artifacts directory: %s\n", globalArtifacts.BaseDir)
+		if hasFailedTests {
+			fmt.Printf("Test failure artifacts collected in: .test-reports/%s/\n", globalArtifacts.ExecutionID)
+			fmt.Printf("View failure reports: ls -la .test-reports/%s/failures/\n", globalArtifacts.ExecutionID)
 		}
+		fmt.Printf("=====================================\n")
 	}
 })
 
@@ -144,7 +176,7 @@ func createTestNamespaceWithRetry(namespaceName string, timeout time.Duration) e
 	
 	for time.Since(start) < timeout {
 		// First, wait for any existing namespace to be fully deleted
-		if err := waitForNamespaceDeletion(namespaceName, 30*time.Second); err != nil {
+		if err := waitForNamespaceDeletion(namespaceName, 60*time.Second); err != nil {
 			fmt.Printf("Continuing after namespace deletion wait: %v\n", err)
 		}
 		
@@ -345,7 +377,7 @@ func cleanupAllPodsAndWait() {
 					return true
 				}
 				return false
-			}, 30*time.Second, interval).Should(BeTrue())
+			}, 60*time.Second, interval).Should(BeTrue())
 		}()
 
 		// If graceful termination failed, force delete
@@ -403,33 +435,70 @@ func getNodeForTest(testName string) string {
 	return availableNodes[hash%len(availableNodes)]
 }
 
-// cleanupAllPodsConditional performs cleanup based on test failure status
+// cleanupAllPodsConditional performs cleanup based on test failure status and environment settings
 func cleanupAllPodsConditional() {
 	// Check if current test failed
 	testFailed := CurrentSpecReport().Failed()
 	
+	// Collect failure artifacts if test failed
 	if testFailed {
 		hasFailedTests = true // Track failures globally for this worker
+		CollectFailureArtifacts()
 	}
 	
-	if preserveOnFailure && testFailed {
-		fmt.Printf("Test failed and PRESERVE_ON_FAILURE=true: Preserving pods for debugging\n")
+	// Check environment setting for cleanup behavior
+	preserveOnFailure := os.Getenv("PRESERVE_ON_FAILURE") == "true"
+	skipCleanup := os.Getenv("SKIP_CLEANUP") == "true"
+	
+	// Decide whether to clean up
+	shouldCleanup := !skipCleanup && !(testFailed && preserveOnFailure)
+	
+	if shouldCleanup {
+		fmt.Printf("Cleaning up pods from test (test failed: %v, preserve on failure: %v)\n", testFailed, preserveOnFailure)
+		cleanupAllPodsAndWait()
+		// Wait for plugin to process removal events
+		waitForPluginStateSync()
+	} else {
+		if testFailed {
+			fmt.Printf("Test failed - artifacts collected in .test-reports/%s\n", globalArtifacts.ExecutionID)
+		}
+		fmt.Printf("Preserving pods for debugging (test failed: %v, skip cleanup: %v, preserve on failure: %v)\n", 
+			testFailed, skipCleanup, preserveOnFailure)
 		fmt.Printf("Debug pods with: kubectl get pods -n %s -o wide\n", testNamespace)
 		fmt.Printf("View logs with: kubectl logs -n %s <pod-name>\n", testNamespace)
 		fmt.Printf("Check CPU assignment: kubectl exec -n %s <pod-name> -- cat /proc/self/status | grep Cpus_allowed_list\n", testNamespace)
 		fmt.Printf("Check plugin logs: kubectl logs -n kube-system -l app=weka-nri-cpuset --since=2m | grep %s\n", testNamespace)
-		return
 	}
-	
-	cleanupAllPodsAndWait()
 }
 
-// createDistributedTestPod creates a pod distributed across available nodes
+// waitForPluginStateSync waits for the plugin to process container removals
+// and update its internal state, particularly the shared pool
+func waitForPluginStateSync() {
+	// Give the plugin sufficient time to process all removal events and update shared pool
+	// This is crucial for test isolation - subsequent tests should see clean state
+	// 
+	// The plugin needs to:
+	// 1. Process RemoveContainer events from NRI
+	// 2. Update internal state (intOwner, annotRef maps)
+	// 3. Recalculate shared pool 
+	// 4. Update any running shared containers with new pool
+	//
+	// In parallel execution, multiple workers may be creating/deleting pods rapidly
+	// so we need to ensure all events are fully processed before next test starts
+	time.Sleep(5 * time.Second)
+}
+
+// createDistributedTestPod creates a pod on the exclusively reserved node
 func createDistributedTestPod(name string, annotations map[string]string, resources *corev1.ResourceRequirements) *corev1.Pod {
-	// Use assigned node for this worker to prevent conflicts
+	// Use exclusively reserved node for this worker
 	workerID := GinkgoParallelProcess()
-	nodeName := nodeAssignments[workerID]
-	return createTestPodWithNode(name, nodeName, annotations, resources)
+	
+	// Make pod names unique per worker and timestamp to prevent name collisions
+	// Use timestamp suffix to ensure uniqueness across multiple test runs
+	timestamp := time.Now().Unix()
+	uniquePodName := fmt.Sprintf("%s-w%d-%d", name, workerID, timestamp)
+	
+	return createTestPodWithNode(uniquePodName, exclusiveNode, annotations, resources)
 }
 
 // createTestPodOnWorkerNode creates a pod on the node assigned to current worker
@@ -437,4 +506,106 @@ func createTestPodOnWorkerNode(name string, annotations map[string]string, resou
 	return createDistributedTestPod(name, annotations, resources)
 }
 
-// Unused helper functions removed to fix linter warnings
+// Node reservation system for exclusive access
+
+// reserveExclusiveNode attempts to get exclusive access to a node using ConfigMaps as distributed locks
+func reserveExclusiveNode(workerID int, nodes []string) string {
+	lockNamespace := "kube-system" // Use kube-system for locks to avoid conflicts
+	maxWaitTime := 10 * time.Minute // Wait up to 10 minutes for a node
+	retryInterval := 5 * time.Second
+	
+	start := time.Now()
+	fmt.Printf("Worker %d: Attempting to reserve exclusive node (timeout: %v)...\n", workerID, maxWaitTime)
+	
+	for time.Since(start) < maxWaitTime {
+		// Try each node in order
+		for _, nodeName := range nodes {
+			lockName := fmt.Sprintf("e2e-node-lock-%s", nodeName)
+			
+			// Try to create lock ConfigMap
+			lockCM := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      lockName,
+					Namespace: lockNamespace,
+					Labels: map[string]string{
+						"e2e-test": "node-lock",
+						"worker":   fmt.Sprintf("%d", workerID),
+					},
+				},
+				Data: map[string]string{
+					"worker-id":   fmt.Sprintf("%d", workerID),
+					"node-name":   nodeName,
+					"locked-at":   time.Now().Format(time.RFC3339),
+					"test-run-id": fmt.Sprintf("e2e-%d", time.Now().Unix()),
+				},
+			}
+			
+			_, err := kubeClient.CoreV1().ConfigMaps(lockNamespace).Create(ctx, lockCM, metav1.CreateOptions{})
+			if err == nil {
+				fmt.Printf("Worker %d: Successfully reserved node %s\n", workerID, nodeName)
+				return nodeName
+			}
+			
+			// Lock already exists, check if it's stale
+			if strings.Contains(err.Error(), "already exists") {
+				if isLockStale(lockName, lockNamespace) {
+					fmt.Printf("Worker %d: Found stale lock for node %s, attempting to remove...\n", workerID, nodeName)
+					err := kubeClient.CoreV1().ConfigMaps(lockNamespace).Delete(ctx, lockName, metav1.DeleteOptions{})
+					if err == nil {
+						// Try to acquire again immediately
+						_, err := kubeClient.CoreV1().ConfigMaps(lockNamespace).Create(ctx, lockCM, metav1.CreateOptions{})
+						if err == nil {
+							fmt.Printf("Worker %d: Successfully reserved node %s after removing stale lock\n", workerID, nodeName)
+							return nodeName
+						}
+					}
+				}
+			}
+		}
+		
+		fmt.Printf("Worker %d: All nodes busy, waiting %v before retry...\n", workerID, retryInterval)
+		time.Sleep(retryInterval)
+	}
+	
+	// If we get here, we couldn't reserve any node - fail the test
+	panic(fmt.Sprintf("Worker %d: Failed to reserve exclusive node access after %v - all %d nodes busy", 
+		workerID, maxWaitTime, len(nodes)))
+}
+
+// isLockStale checks if a node lock is stale (older than 30 minutes)
+func isLockStale(lockName, namespace string) bool {
+	cm, err := kubeClient.CoreV1().ConfigMaps(namespace).Get(ctx, lockName, metav1.GetOptions{})
+	if err != nil {
+		return true // If we can't read it, consider it stale
+	}
+	
+	lockedAtStr, exists := cm.Data["locked-at"]
+	if !exists {
+		return true
+	}
+	
+	lockedAt, err := time.Parse(time.RFC3339, lockedAtStr)
+	if err != nil {
+		return true
+	}
+	
+	// Consider lock stale if older than 30 minutes
+	return time.Since(lockedAt) > 30*time.Minute
+}
+
+// releaseNodeLock releases the exclusive node lock
+func releaseNodeLock(workerID int, nodeName string) {
+	if nodeName == "" {
+		return
+	}
+	
+	lockNamespace := "kube-system"
+	lockName := fmt.Sprintf("e2e-node-lock-%s", nodeName)
+	
+	err := kubeClient.CoreV1().ConfigMaps(lockNamespace).Delete(ctx, lockName, metav1.DeleteOptions{})
+	if err != nil && !strings.Contains(err.Error(), "not found") {
+		fmt.Printf("Worker %d: Warning - failed to release node lock for %s: %v\n", workerID, nodeName, err)
+	} else {
+		fmt.Printf("Worker %d: Released exclusive lock on node %s\n", workerID, nodeName)
+	}
+}

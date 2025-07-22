@@ -4,3 +4,4 @@ vendor
 .local/
 .idea
 bin/
+.test-reports/

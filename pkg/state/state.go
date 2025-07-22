@@ -162,14 +162,13 @@ func (m *Manager) planReallocation(conflictingContainers map[string]*ContainerIn
 			return nil, fmt.Errorf("cannot reallocate integer container %s", containerID)
 		}
 
-		// Calculate NUMA nodes for new CPU assignment
-		memNodes := m.calculateMemNodes(newCPUs, alloc)
-
+		// Integer pods keep flexible NUMA memory (no binding) per PRD 3.3
+		// This prevents memory placement conflicts during live reallocation
 		plans = append(plans, ReallocationPlan{
 			ContainerID: containerID,
 			OldCPUs:     container.CPUs,
 			NewCPUs:     newCPUs,
-			MemNodes:    memNodes,
+			MemNodes:    nil, // No NUMA memory binding for integer pods
 		})
 
 		// Update allReserved for next iteration
@@ -180,12 +179,6 @@ func (m *Manager) planReallocation(conflictingContainers map[string]*ContainerIn
 	return plans, nil
 }
 
-// calculateMemNodes calculates NUMA memory nodes for given CPUs
-func (m *Manager) calculateMemNodes(cpus []int, alloc Allocator) []int {
-	// This is a simplified implementation - in a real scenario we'd access the NUMA manager
-	// For now, assume we can calculate this from the allocator
-	return []int{0} // Simplified
-}
 
 // updateReservedSetForPlan updates the reserved set by removing old CPUs and adding new ones
 func (m *Manager) updateReservedSetForPlan(reserved []int, oldCPUs []int, newCPUs []int) []int {
@@ -395,7 +388,30 @@ func (m *Manager) Synchronize(pods []*api.PodSandbox, containers []*api.Containe
 				fmt.Printf("Error parsing current CPUs for integer container %s: %v\n", container.Id, err)
 				continue
 			}
-			fmt.Printf("DEBUG: Synchronizing integer container %s with existing CPUs %v\n", container.Id, currentCPUs)
+			
+			// CRITICAL FIX: Validate that the existing CPU assignment makes sense for an integer container
+			// Calculate expected CPU count from container resource requirements
+			expectedCPUCount := 0
+			if container.Linux.Resources.Cpu != nil && 
+			   container.Linux.Resources.Cpu.Quota != nil && 
+			   container.Linux.Resources.Cpu.Period != nil {
+				quota := container.Linux.Resources.Cpu.Quota.GetValue()
+				period := int64(container.Linux.Resources.Cpu.Period.GetValue())
+				if quota > 0 && period > 0 {
+					expectedCPUCount = int(quota / period)
+				}
+			}
+			
+			// If the current CPU assignment is unreasonable (too many CPUs compared to quota), 
+			// treat this as a system container that shouldn't be managed as integer
+			if expectedCPUCount > 0 && len(currentCPUs) > expectedCPUCount*4 {
+				fmt.Printf("DEBUG: Skipping container %s: has %d CPUs but expected ~%d (likely system container)\n", 
+					container.Id, len(currentCPUs), expectedCPUCount)
+				continue
+			}
+			
+			fmt.Printf("DEBUG: Synchronizing integer container %s with existing CPUs %v (expected ~%d CPUs)\n", 
+				container.Id, currentCPUs, expectedCPUCount)
 		} else {
 			// Fallback: If we can't discover current CPUs, allocate new ones
 			fmt.Printf("DEBUG: Cannot discover existing CPUs for integer container %s, fallback to allocation\n", container.Id)

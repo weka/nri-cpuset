@@ -60,10 +60,6 @@ make clean
 
 # Skip Docker build (use existing image)
 ./hack/build-and-deploy.sh --kubeconfig /path/to/kubeconfig --skip-build
-
-# If KUBECONFIG env var is set, you can omit --kubeconfig flag:
-export KUBECONFIG=/path/to/kubeconfig
-./hack/build-and-deploy.sh
 ```
 
 #### E2E Testing
@@ -331,15 +327,106 @@ KUBECONFIG=/path/to/kubeconfig kubectl logs -n kube-system -l app=weka-nri-cpuse
 - kubectl configured for target cluster
 - KUBECONFIG pointing to cluster with NRI support
 
+## Test Artifact Collection & Analysis
+
+### Automated Test Reporting
+
+E2E tests automatically generate comprehensive failure reports in `.test-reports/` with unique execution IDs for systematic debugging.
+
+#### Test Execution Structure
+```
+.test-reports/
+└── 20240722-143052-a1b2c3d4/          # Execution ID (timestamp + UUID)
+    ├── execution-summary.md            # Main overview and analysis workflow
+    ├── test-failures-index.md          # List of all failed tests
+    ├── failures/                       # Individual test failure reports
+    │   └── [test-name]-[timestamp]/
+    │       ├── summary.md              # Test failure analysis
+    │       ├── pod-states.md           # All pod states across namespaces
+    │       ├── plugin-logs.txt         # Plugin daemon logs
+    │       ├── cluster-snapshot.md     # Node resources and DaemonSet status
+    │       └── test-debug-output.txt   # Custom test debug info
+    ├── logs/                          # Raw log files
+    ├── pod-describes/                 # Detailed pod descriptions
+    ├── plugin-logs/                   # Plugin logs by node
+    ├── cluster-state/                 # Cluster snapshots
+    └── test-debug/                    # Custom debug output by test
+```
+
+#### Analysis Workflow for LLMs
+
+1. **Start with `execution-summary.md`**: Overview of test run and directory structure
+2. **Check `test-failures-index.md`**: Quick list of all failures with links
+3. **For each failure**: Navigate to `failures/[test-name]/summary.md` for detailed analysis
+4. **Review artifacts**: Pod states, plugin logs, and cluster state for root cause
+
+#### Key Analysis Files (LLM-Optimized)
+
+**Quick Assessment:**
+- `test-failures-index.md` - Overview of all failures
+- `execution-summary.md` - Test run context and artifact navigation
+
+**Per-Test Deep Dive:**
+- `failures/[test]/summary.md` - Comprehensive failure report with analysis tips
+- `failures/[test]/pod-states.md` - Pod states across all test namespaces
+- `failures/[test]/plugin-logs.txt` - Plugin behavior during test execution
+
+#### Exploration Commands
+
+```bash
+# List all test executions
+ls -la .test-reports/
+
+# Quick failure overview for specific execution
+cat .test-reports/[execution-id]/test-failures-index.md
+
+# Detailed analysis of specific failure
+cat .test-reports/[execution-id]/failures/[test-name]/summary.md
+
+# Review plugin behavior for failure
+cat .test-reports/[execution-id]/failures/[test-name]/plugin-logs.txt
+```
+
+#### LLM Analysis Patterns
+
+When analyzing test failures, follow this pattern:
+
+1. **Identify execution context** from `execution-summary.md`
+2. **Categorize failures** from `test-failures-index.md`
+3. **Analyze failure patterns**:
+   - Pod creation issues → Check `pod-states.md`
+   - Resource conflicts → Review `plugin-logs.txt`
+   - Plugin behavior → Examine `cluster-snapshot.md`
+4. **Root cause analysis** using test-specific debug output
+
+### Manual Debugging (Fallback)
+
+If artifact collection is not available, use manual debugging:
+
+```bash
+# Check test namespace status
+KUBECONFIG=/path/to/kubeconfig kubectl get pods -n wekaplugin-e2e-w* -o wide
+
+# Get plugin logs for recent failures
+KUBECONFIG=/path/to/kubeconfig kubectl logs -n kube-system -l app=weka-nri-cpuset --since=10m
+
+# Describe failing pods
+KUBECONFIG=/path/to/kubeconfig kubectl describe pods -n wekaplugin-e2e-w1
+
+# Check for CreateContainerError or scheduling issues
+KUBECONFIG=/path/to/kubeconfig kubectl get events -n wekaplugin-e2e-w1 --sort-by='.lastTimestamp'
+```
+
 ## Troubleshooting Quick Reference
 1. **Build fails**: Check Go version and dependencies with `go mod tidy`
 2. **Deploy fails**: Verify Docker registry access and kubectl connectivity
-3. **Tests fail**: Check cluster has sufficient CPU resources and NRI support
+3. **Tests fail**: Check cluster has sufficient CPU resources and NRI support; review `.test-reports/` for detailed failure analysis
 4. **Plugin not loading**: Verify containerd NRI configuration and binary placement
 5. **Malformed annotations**: Check CPU list syntax (fixed in recent updates)
 6. **KUBECONFIG issues**: Verify path exists and kubectl can connect to cluster
 7. **Plugin behavior issues**: Use debug logging and plugin logs to diagnose (see debugging commands above)
 8. **Test timing issues**: Clean test namespace between runs and add explicit waits where needed
+9. **Sporadic failures**: Use test artifact reports in `.test-reports/` for systematic analysis
 
 ## Implementation Notes
 

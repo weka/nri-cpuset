@@ -262,12 +262,12 @@ func (a *CPUAllocator) AllocateContainer(pod *api.PodSandbox, container *api.Con
 		},
 	}
 
-	// Set memory nodes for exclusive containers (annotated and integer)
-	// Per PRD 3.3: restrict memory to NUMA nodes containing the assigned CPUs
-	if (mode == "annotated" || mode == "integer") && len(result.MemNodes) > 0 {
+	// Set memory nodes only for annotated containers (fixed CPU allocation)
+	// Per PRD 3.3: integer pods keep flexible NUMA memory to support live reallocation
+	if mode == "annotated" && len(result.MemNodes) > 0 {
 		adjustment.Linux.Resources.Cpu.Mems = numa.FormatCPUList(result.MemNodes)
 	}
-	// Shared containers inherit system default memory placement (no restriction)
+	// Integer and shared containers inherit system default memory placement (no restriction)
 
 	return adjustment, nil, nil
 }

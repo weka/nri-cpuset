@@ -278,7 +278,7 @@ var _ = Describe("Annotated Pod Error Cases", Label("e2e", "parallel"), func() {
 	})
 })
 
-var _ = Describe("CPU Conflict Resolution", Label("e2e", "sequential"), func() {
+var _ = Describe("CPU Conflict Resolution", Label("e2e", "parallel"), func() {
 	Context("When annotated and integer pods compete for CPUs", func() {
 		AfterEach(func() {
 			// Clean up any pods created in tests (conditional on failure)

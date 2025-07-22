@@ -245,7 +245,7 @@ var _ = Describe("Shared Pod Tests", Label("e2e", "parallel"), func() {
 	})
 })
 
-var _ = Describe("Mixed Workload Scenarios", Label("e2e", "sequential"), func() {
+var _ = Describe("Mixed Workload Scenarios", Label("e2e", "parallel"), func() {
 	Context("When running mixed workloads", func() {
 		AfterEach(func() {
 			// Clean up any pods created in tests (conditional on failure)
