@@ -11,11 +11,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-var _ = Describe("Annotated Pod Tests", Label("e2e"), func() {
+var _ = Describe("Annotated Pod Tests", Label("e2e", "parallel"), func() {
 	Context("When creating annotated pods", func() {
 		AfterEach(func() {
-			// Clean up any pods created in tests and wait for termination
-			cleanupAllPodsAndWait()
+			// Clean up any pods created in tests (conditional on failure)
+			cleanupAllPodsConditional()
 		})
 
 		It("should pin CPUs according to annotation", func() {
@@ -225,11 +225,11 @@ var _ = Describe("Annotated Pod Tests", Label("e2e"), func() {
 	})
 })
 
-var _ = Describe("Annotated Pod Error Cases", Label("e2e"), func() {
+var _ = Describe("Annotated Pod Error Cases", Label("e2e", "parallel"), func() {
 	Context("When creating pods with problematic annotations", func() {
 		AfterEach(func() {
-			// Clean up any pods created in tests and wait for termination
-			cleanupAllPodsAndWait()
+			// Clean up any pods created in tests (conditional on failure)
+			cleanupAllPodsConditional()
 		})
 
 		It("should handle malformed CPU list annotations", func() {
@@ -278,11 +278,11 @@ var _ = Describe("Annotated Pod Error Cases", Label("e2e"), func() {
 	})
 })
 
-var _ = Describe("CPU Conflict Resolution", Label("e2e"), func() {
+var _ = Describe("CPU Conflict Resolution", Label("e2e", "sequential"), func() {
 	Context("When annotated and integer pods compete for CPUs", func() {
 		AfterEach(func() {
-			// Clean up any pods created in tests and wait for termination
-			cleanupAllPodsAndWait()
+			// Clean up any pods created in tests (conditional on failure)
+			cleanupAllPodsConditional()
 		})
 
 		It("should reject integer pods when CPUs are reserved by annotated pods", func() {

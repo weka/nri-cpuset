@@ -7,6 +7,9 @@ KUBECONFIG=${KUBECONFIG:-"$HOME/.kube/config"}
 TEST_NS=${TEST_NS:-wekaplugin-e2e}
 PLUGIN_IMAGE=${PLUGIN_IMAGE:-weka/nri-cpuset:latest}
 TEST_TIMEOUT=${TEST_TIMEOUT:-30m}
+TEST_PARALLEL=${TEST_PARALLEL:-8}
+PRESERVE_ON_FAILURE=${PRESERVE_ON_FAILURE:-true}
+CONTINUE_ON_FAILURE=${CONTINUE_ON_FAILURE:-false}
 
 # Color codes for output
 RED='\033[0;31m'
@@ -166,6 +169,7 @@ run_tests() {
     # Export required environment variables
     export KUBECONFIG="$KUBECONFIG"
     export TEST_NS="$TEST_NS"
+    export PRESERVE_ON_FAILURE="$PRESERVE_ON_FAILURE"
     
     # Pre-test validation
     log_info "Performing pre-test validation..."
@@ -181,7 +185,10 @@ run_tests() {
     echo "- Use Ctrl+C to interrupt if needed"
     echo "- Test pod status will be shown periodically"
     echo "- Individual test progress will be displayed below"
-    echo "- Using Ginkgo v2 with verbose output (-vv) and node events"
+    echo "- Using Ginkgo v2 with parallel execution (${TEST_PARALLEL} workers - default: 8)"
+    echo "- Parallel tests: annotated pods, integer pods, shared pods"
+    echo "- Sequential tests: recovery, live reallocation, conflict resolution"
+    echo "- Resource preservation on failure: $PRESERVE_ON_FAILURE"
     echo "==============================================================================="
     
     # Run tests with verbose and progress output
@@ -189,22 +196,39 @@ run_tests() {
     cd "$(dirname "$0")/.."  # Ensure we're in the project root
     
     if command -v ginkgo &> /dev/null; then
-        # Use ginkgo binary with verbose output and progress
+        # Run parallel tests first (faster execution)
+        log_info "Running parallel tests (annotated pods, integer pods, shared pods)..."
         ginkgo -r \
             --timeout="$TEST_TIMEOUT" \
-            --label-filter="e2e" \
-            -vv \
+            --label-filter="parallel" \
+            --procs="$TEST_PARALLEL" \
+            -v \
             --show-node-events \
-            --json-report=test-results.json \
-            --junit-report=test-results.xml \
+            --json-report=test-results-parallel.json \
+            --junit-report=test-results-parallel.xml \
             ./test/e2e/ || test_result=$?
+        
+        # Run sequential tests if parallel tests passed or if we want to continue regardless
+        if [[ "$test_result" -eq 0 ]] || [[ "${CONTINUE_ON_FAILURE:-false}" == "true" ]]; then
+            log_info "Running sequential tests (recovery, live reallocation, conflicts)..."
+            ginkgo -r \
+                --timeout="$TEST_TIMEOUT" \
+                --label-filter="sequential" \
+                -v \
+                --show-node-events \
+                --json-report=test-results-sequential.json \
+                --junit-report=test-results-sequential.xml \
+                ./test/e2e/ || test_result=$?
+        else
+            log_warn "Parallel tests failed, skipping sequential tests (set CONTINUE_ON_FAILURE=true to run all)"
+        fi
     else
-        # Use go test with ginkgo
+        # Fallback to go test (less optimal)
         go test ./test/e2e \
             -timeout="$TEST_TIMEOUT" \
             -v \
             -ginkgo.label-filter="e2e" \
-            -ginkgo.vv \
+            -ginkgo.procs="$TEST_PARALLEL" \
             -ginkgo.show-node-events \
             -ginkgo.json-report=test-results.json \
             -ginkgo.junit-report=test-results.xml || test_result=$?
@@ -221,8 +245,11 @@ run_tests() {
     kubectl get pods -n "$TEST_NS" -o wide 2>/dev/null || log_info "No pods found in test namespace"
     
     # Show test summary if reports were generated
-    if [[ -f test-results.json ]]; then
-        log_info "Test results summary available in test-results.json"
+    if [[ -f test-results-parallel.json ]] || [[ -f test-results-sequential.json ]] || [[ -f test-results.json ]]; then
+        log_info "Test results summary available in test-results-*.json files"
+        [[ -f test-results-parallel.json ]] && log_info "Parallel test results: test-results-parallel.json"
+        [[ -f test-results-sequential.json ]] && log_info "Sequential test results: test-results-sequential.json"
+        [[ -f test-results.json ]] && log_info "Combined test results: test-results.json"
     fi
     
     return $test_result
@@ -234,22 +261,30 @@ cleanup() {
     stop_monitoring
     
     if [[ "${SKIP_CLEANUP:-}" != "true" ]]; then
-        log_info "Cleaning up test namespace..."
+        log_info "Cleaning up test namespaces..."
         kubectl delete namespace "$TEST_NS" --ignore-not-found=true
+        # Also clean up any worker-specific namespaces
+        kubectl get namespaces -o name | grep "namespace/${TEST_NS}-w" | xargs -r kubectl delete --ignore-not-found=true
         
         # Clean up test report files unless preserving them
         if [[ "${PRESERVE_REPORTS:-}" != "true" ]]; then
             log_info "Cleaning up test report files..."
-            rm -f test-results.json test-results.xml
+            rm -f test-results*.json test-results*.xml
         else
             log_info "Preserving test reports (PRESERVE_REPORTS=true)"
-            [[ -f test-results.json ]] && log_info "JSON report: test-results.json"
-            [[ -f test-results.xml ]] && log_info "JUnit report: test-results.xml"
+            [[ -f test-results-parallel.json ]] && log_info "Parallel JSON report: test-results-parallel.json"
+            [[ -f test-results-sequential.json ]] && log_info "Sequential JSON report: test-results-sequential.json"
+            [[ -f test-results-parallel.xml ]] && log_info "Parallel JUnit report: test-results-parallel.xml"
+            [[ -f test-results-sequential.xml ]] && log_info "Sequential JUnit report: test-results-sequential.xml"
+            [[ -f test-results.json ]] && log_info "Combined JSON report: test-results.json"
+            [[ -f test-results.xml ]] && log_info "Combined JUnit report: test-results.xml"
         fi
     else
         log_info "Skipping cleanup (SKIP_CLEANUP=true)"
-        [[ -f test-results.json ]] && log_info "JSON report: test-results.json"
-        [[ -f test-results.xml ]] && log_info "JUnit report: test-results.xml"
+        [[ -f test-results-parallel.json ]] && log_info "Parallel JSON report: test-results-parallel.json"
+        [[ -f test-results-sequential.json ]] && log_info "Sequential JSON report: test-results-sequential.json"
+        [[ -f test-results.json ]] && log_info "Combined JSON report: test-results.json"
+        [[ -f test-results.xml ]] && log_info "Combined JUnit report: test-results.xml"
     fi
 }
 
@@ -257,13 +292,15 @@ cleanup() {
 reset_test_environment() {
     log_info "Resetting test environment to clean state..."
     
-    # Clean up any existing test namespace and all its resources
-    log_info "Cleaning up existing test namespace..."
+    # Clean up any existing test namespaces (including per-worker namespaces)
+    log_info "Cleaning up existing test namespaces..."
     kubectl delete namespace "$TEST_NS" --ignore-not-found=true --timeout=60s
+    # Clean up any worker-specific namespaces from previous runs
+    kubectl get namespaces -o name | grep "namespace/${TEST_NS}-w" | xargs -r kubectl delete --timeout=60s
     
-    # Wait for namespace to be fully deleted
+    # Wait for namespaces to be fully deleted
     log_info "Waiting for namespace deletion to complete..."
-    while kubectl get namespace "$TEST_NS" &> /dev/null; do
+    while kubectl get namespace "$TEST_NS" &> /dev/null || kubectl get namespaces -o name | grep -q "namespace/${TEST_NS}-w"; do
         sleep 2
     done
     
@@ -299,6 +336,8 @@ main() {
     log_info "Cluster: $(kubectl config current-context)"
     log_info "Test namespace: $TEST_NS"
     log_info "Test timeout: $TEST_TIMEOUT"
+    log_info "Parallel workers: $TEST_PARALLEL"
+    log_info "Preserve on failure: $PRESERVE_ON_FAILURE"
     
     # Check prerequisites
     check_prerequisites
@@ -366,6 +405,9 @@ Environment Variables:
   TEST_NS         Test namespace (default: wekaplugin-e2e)
   PLUGIN_IMAGE    Plugin container image (default: weka/nri-cpuset:latest)
   TEST_TIMEOUT    Test timeout (default: 30m)
+  TEST_PARALLEL   Number of parallel workers (default: 8)
+  PRESERVE_ON_FAILURE Preserve failed test resources for debugging (default: true)
+  CONTINUE_ON_FAILURE Continue with sequential tests even if parallel tests fail (default: false)
   FORCE_DEPLOY    Force plugin redeployment (default: false)
   SKIP_CLEANUP    Skip test namespace cleanup (default: false)
   PRESERVE_REPORTS Keep test report files after completion (default: false)
@@ -383,11 +425,20 @@ Examples:
   # Skip cleanup for debugging
   SKIP_CLEANUP=true $0
 
-  # Preserve reports for debugging
-  PRESERVE_REPORTS=true $0
+  # Preserve reports and failed resources for debugging
+  PRESERVE_REPORTS=true PRESERVE_ON_FAILURE=true $0
   
-  # Run with custom image and preserve reports
-  PLUGIN_IMAGE=my-registry/nri-cpuset:dev PRESERVE_REPORTS=true $0
+  # Run with custom image and debugging
+  PLUGIN_IMAGE=my-registry/nri-cpuset:dev PRESERVE_ON_FAILURE=true $0
+  
+  # Run with fewer parallel workers (reduce from default 8)
+  TEST_PARALLEL=4 $0
+  
+  # Continue all tests even if some fail (preserve is already default)
+  CONTINUE_ON_FAILURE=true $0
+  
+  # Disable failure preservation (faster cleanup)
+  PRESERVE_ON_FAILURE=false $0
 EOF
     exit 0
 fi

@@ -13,11 +13,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-var _ = Describe("Plugin Recovery and Synchronization", Label("e2e"), func() {
+var _ = Describe("Plugin Recovery and Synchronization", Label("e2e", "sequential"), func() {
 	Context("When plugin restarts or crashes", func() {
 		AfterEach(func() {
-			// Clean up any pods created in tests and wait for termination
-			cleanupAllPodsAndWait()
+			// Clean up any pods created in tests (conditional on failure)
+			cleanupAllPodsConditional()
 		})
 
 		It("should rebuild state from existing containers after plugin restart", func() {
@@ -238,11 +238,11 @@ var _ = Describe("Plugin Recovery and Synchronization", Label("e2e"), func() {
 	})
 })
 
-var _ = Describe("Live Container Updates", Label("e2e"), func() {
+var _ = Describe("Live Container Updates", Label("e2e", "sequential"), func() {
 	Context("When containers need live CPU updates", func() {
 		AfterEach(func() {
-			// Clean up any pods created in tests and wait for termination
-			cleanupAllPodsAndWait()
+			// Clean up any pods created in tests (conditional on failure)
+			cleanupAllPodsConditional()
 		})
 
 		It("should update running shared containers when shared pool changes", func() {

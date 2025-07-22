@@ -8,11 +8,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-var _ = Describe("Shared Pod Tests", Label("e2e"), func() {
+var _ = Describe("Shared Pod Tests", Label("e2e", "parallel"), func() {
 	Context("When creating shared pods", func() {
 		AfterEach(func() {
-			// Clean up any pods created in tests and wait for termination
-			cleanupAllPodsAndWait()
+			// Clean up any pods created in tests (conditional on failure)
+			cleanupAllPodsConditional()
 		})
 
 		It("should assign shared pods to the shared CPU pool", func() {
@@ -245,11 +245,11 @@ var _ = Describe("Shared Pod Tests", Label("e2e"), func() {
 	})
 })
 
-var _ = Describe("Mixed Workload Scenarios", Label("e2e"), func() {
+var _ = Describe("Mixed Workload Scenarios", Label("e2e", "sequential"), func() {
 	Context("When running mixed workloads", func() {
 		AfterEach(func() {
-			// Clean up any pods created in tests and wait for termination
-			cleanupAllPodsAndWait()
+			// Clean up any pods created in tests (conditional on failure)
+			cleanupAllPodsConditional()
 		})
 
 		It("should handle annotated, integer, and shared pods together", func() {

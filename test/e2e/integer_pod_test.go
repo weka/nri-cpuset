@@ -10,11 +10,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-var _ = Describe("Integer Pod Tests", Label("e2e"), func() {
+var _ = Describe("Integer Pod Tests", Label("e2e", "parallel"), func() {
 	Context("When creating integer pods", func() {
 		AfterEach(func() {
-			// Clean up any pods created in tests and wait for termination
-			cleanupAllPodsAndWait()
+			// Clean up any pods created in tests (conditional on failure)
+			cleanupAllPodsConditional()
 		})
 
 		It("should allocate exclusive CPUs for integer pods", func() {
@@ -225,11 +225,11 @@ var _ = Describe("Integer Pod Tests", Label("e2e"), func() {
 	})
 })
 
-var _ = Describe("Integer Pod Edge Cases", Label("e2e"), func() {
+var _ = Describe("Integer Pod Edge Cases", Label("e2e", "parallel"), func() {
 	Context("When testing edge cases for integer pods", func() {
 		AfterEach(func() {
-			// Clean up any pods created in tests and wait for termination
-			cleanupAllPodsAndWait()
+			// Clean up any pods created in tests (conditional on failure)
+			cleanupAllPodsConditional()
 		})
 
 		It("should reject pods with fractional CPU requests", func() {
@@ -360,11 +360,11 @@ var _ = Describe("Integer Pod Edge Cases", Label("e2e"), func() {
 	})
 })
 
-var _ = Describe("Integer Pod NUMA Memory Placement", Label("e2e"), func() {
+var _ = Describe("Integer Pod NUMA Memory Placement", Label("e2e", "parallel"), func() {
 	Context("When testing NUMA memory placement for integer pods", func() {
 		AfterEach(func() {
-			// Clean up any pods created in tests and wait for termination
-			cleanupAllPodsAndWait()
+			// Clean up any pods created in tests (conditional on failure)
+			cleanupAllPodsConditional()
 		})
 
 		It("should restrict memory to single NUMA node when all CPUs on same node", func() {

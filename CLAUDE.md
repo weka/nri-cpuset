@@ -73,13 +73,23 @@ export KUBECONFIG=/path/to/kubeconfig
 - **Once specific test passes** → Run full test suite to ensure no regressions
 - **Use focused tests for faster iteration during development**
 
-##### Running All E2E Tests
+##### Running All E2E Tests (Optimized for Parallel Execution)
 ```bash
-# Run all E2E tests against live cluster (use when all tests should pass)
+# Run all E2E tests with optimized defaults (8 parallel workers, preserve failures)
 KUBECONFIG=/path/to/kubeconfig make test-e2e-live
 
-# Direct script execution
+# Direct script execution with optimized defaults
 KUBECONFIG=/path/to/kubeconfig ./hack/e2e-live.sh
+
+# Default behavior (as of latest optimization):
+# - TEST_PARALLEL=8 (8 parallel workers for faster execution)
+# - PRESERVE_ON_FAILURE=true (preserve failed pods for debugging)
+# - CONTINUE_ON_FAILURE=false (stop on parallel test failures)
+
+# Customization examples:
+KUBECONFIG=/path/to/kubeconfig TEST_PARALLEL=4 ./hack/e2e-live.sh  # Fewer workers
+KUBECONFIG=/path/to/kubeconfig PRESERVE_ON_FAILURE=false ./hack/e2e-live.sh  # Fast cleanup
+KUBECONFIG=/path/to/kubeconfig CONTINUE_ON_FAILURE=true ./hack/e2e-live.sh  # Run all tests
 
 # With extended timeout for slow clusters  
 KUBECONFIG=/path/to/kubeconfig TEST_TIMEOUT=60m ./hack/e2e-live.sh

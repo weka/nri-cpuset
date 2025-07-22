@@ -11,7 +11,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-var _ = Describe("Live CPU Reallocation Features", func() {
+var _ = Describe("Live CPU Reallocation Features", Label("e2e", "sequential"), func() {
 	// const (
 	// 	WekaAnnotation = "weka.io/cores-ids"
 	// )
@@ -22,7 +22,7 @@ var _ = Describe("Live CPU Reallocation Features", func() {
 
 	AfterEach(func() {
 		// Clean up any test pods created
-		cleanupAllPodsAndWait()
+		cleanupAllPodsConditional()
 	})
 
 	Describe("Integer container live reallocation", func() {
