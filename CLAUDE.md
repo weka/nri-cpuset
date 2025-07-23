@@ -21,8 +21,14 @@ make test
 # Run all verification (unit + lint + format)
 make verify
 
-# Build Docker image
-make image IMAGE_TAG=dev
+# Build Docker image (supports configurable registry)
+make image REGISTRY=my-registry.com IMAGE_NAME=weka-nri-cpuset IMAGE_TAG=dev
+
+# Build and push Docker image
+make image-push REGISTRY=my-registry.com IMAGE_NAME=weka-nri-cpuset IMAGE_TAG=dev
+
+# Build with timestamp (used by build-and-deploy script)
+make image-with-timestamp REGISTRY=my-registry.com IMAGE_NAME=weka-nri-cpuset
 
 # Clean build artifacts
 make clean
@@ -49,7 +55,7 @@ make clean
 
 #### Build & Deploy
 ```bash
-# Automated build and deploy to live cluster
+# Automated build and deploy to live cluster (uses existing Dockerfile via Makefile)
 ./hack/build-and-deploy.sh --kubeconfig /path/to/kubeconfig
 
 # With custom registry
@@ -60,6 +66,9 @@ make clean
 
 # Skip Docker build (use existing image)
 ./hack/build-and-deploy.sh --kubeconfig /path/to/kubeconfig --skip-build
+
+# Alternative: Use Makefile directly for just building/pushing
+make image-push REGISTRY=my-registry.com:5000 IMAGE_NAME=weka-nri-cpuset
 ```
 
 #### E2E Testing
@@ -166,6 +175,27 @@ KUBECONFIG=/path/to/kubeconfig ginkgo -v --focus="conflict" ./test/e2e/
 
 # Run live reallocation tests with shorter timeout (faster feedback)
 KUBECONFIG=/path/to/kubeconfig ginkgo -v --timeout=2m --focus="Live CPU Reallocation" ./test/e2e/
+```
+
+##### E2E Test Script (Unified with Build-Deploy)
+```bash
+# Run full E2E suite with fresh build and deployment (uses build-and-deploy.sh internally)
+KUBECONFIG=/path/to/kubeconfig ./hack/e2e-live.sh
+
+# Run E2E with custom registry (builds fresh image)
+KUBECONFIG=/path/to/kubeconfig PLUGIN_REGISTRY=my-registry.com:5000 ./hack/e2e-live.sh
+
+# Run E2E with existing image (skips building)
+KUBECONFIG=/path/to/kubeconfig PLUGIN_IMAGE=my-registry.com/weka-nri-cpuset:v1.2.3 ./hack/e2e-live.sh
+
+# Skip build and use existing image at default registry
+KUBECONFIG=/path/to/kubeconfig SKIP_BUILD=true ./hack/e2e-live.sh
+
+# Force plugin redeployment before testing
+KUBECONFIG=/path/to/kubeconfig FORCE_DEPLOY=true ./hack/e2e-live.sh
+
+# Run with custom configuration
+KUBECONFIG=/path/to/kubeconfig TEST_PARALLEL=4 PRESERVE_ON_FAILURE=true ./hack/e2e-live.sh
 ```
 
 ##### Alternative Ginkgo Installation Methods

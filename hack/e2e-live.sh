@@ -5,7 +5,10 @@ set -euo pipefail
 # Configuration
 KUBECONFIG=${KUBECONFIG:-"$HOME/.kube/config"}
 TEST_NS=${TEST_NS:-wekaplugin-e2e}
-PLUGIN_IMAGE=${PLUGIN_IMAGE:-weka/nri-cpuset:latest}
+PLUGIN_IMAGE=${PLUGIN_IMAGE:-""}  # Empty by default - will use build-and-deploy.sh to build if not specified
+PLUGIN_REGISTRY=${PLUGIN_REGISTRY:-"images.scalar.dev.weka.io:5002"}
+PLUGIN_NAME=${PLUGIN_NAME:-"weka-nri-cpuset"}
+SKIP_BUILD=${SKIP_BUILD:-false}
 TEST_TIMEOUT=${TEST_TIMEOUT:-30m}
 TEST_PARALLEL=${TEST_PARALLEL:-8}
 PRESERVE_ON_FAILURE=${PRESERVE_ON_FAILURE:-true}
@@ -70,25 +73,63 @@ deploy_plugin() {
         fi
     fi
     
-    log_info "Deploying Weka NRI CPUSet plugin..."
+    log_info "Deploying Weka NRI CPUSet plugin using build-and-deploy.sh..."
     
-    # Apply manifests
-    kubectl apply -f deploy/manifests/rbac.yaml
-    kubectl apply -f deploy/manifests/configmap.yaml
+    # Prepare arguments for build-and-deploy.sh
+    local deploy_args=("--kubeconfig" "$KUBECONFIG")
     
-    # Update image in DaemonSet if specified
-    if [[ -n "${PLUGIN_IMAGE:-}" ]]; then
-        log_info "Using plugin image: $PLUGIN_IMAGE"
-        cat deploy/manifests/daemonset.yaml | \
-          sed "s|image: weka/nri-cpuset:latest|image: $PLUGIN_IMAGE|" | \
-          kubectl apply -f -
-    else
-        kubectl apply -f deploy/manifests/daemonset.yaml
+    # Add registry if specified
+    if [[ -n "$PLUGIN_REGISTRY" ]]; then
+        deploy_args+=("--registry" "$PLUGIN_REGISTRY")
     fi
     
-    # Wait for rollout
-    log_info "Waiting for plugin DaemonSet to be ready..."
-    kubectl rollout status daemonset/weka-nri-cpuset -n kube-system --timeout=300s
+    # Add image name
+    deploy_args+=("--image-name" "$PLUGIN_NAME")
+    
+    # If PLUGIN_IMAGE is specified, parse it to get registry, name, and tag
+    if [[ -n "$PLUGIN_IMAGE" ]]; then
+        # Parse the image format: [registry/]name:tag
+        local image_registry=""
+        local image_name=""
+        local image_tag=""
+        
+        if [[ "$PLUGIN_IMAGE" =~ ^([^/]+/)?([^:]+):(.+)$ ]]; then
+            image_registry="${BASH_REMATCH[1]%/}"  # Remove trailing slash
+            image_name="${BASH_REMATCH[2]}"
+            image_tag="${BASH_REMATCH[3]}"
+        elif [[ "$PLUGIN_IMAGE" =~ ^([^/]+/)?([^:]+)$ ]]; then
+            image_registry="${BASH_REMATCH[1]%/}"  # Remove trailing slash
+            image_name="${BASH_REMATCH[2]}"
+            image_tag="latest"
+        else
+            log_error "Invalid PLUGIN_IMAGE format: $PLUGIN_IMAGE"
+            return 1
+        fi
+        
+        # Override with parsed values if they exist
+        if [[ -n "$image_registry" ]]; then
+            deploy_args=("--kubeconfig" "$KUBECONFIG" "--registry" "$image_registry")
+        fi
+        if [[ -n "$image_name" ]]; then
+            deploy_args+=("--image-name" "$image_name")
+        fi
+        
+        # If we have a specific image, skip building
+        deploy_args+=("--skip-build")
+        log_info "Using existing plugin image: $PLUGIN_IMAGE"
+    elif [[ "$SKIP_BUILD" == "true" ]]; then
+        deploy_args+=("--skip-build")
+        log_info "Skipping build, using existing image: ${PLUGIN_REGISTRY}/${PLUGIN_NAME}:latest"
+    else
+        log_info "Building and deploying new plugin image with registry: $PLUGIN_REGISTRY"
+    fi
+    
+    # Call build-and-deploy.sh with the prepared arguments
+    local script_dir="$(dirname "$0")"
+    if ! "$script_dir/build-and-deploy.sh" "${deploy_args[@]}"; then
+        log_error "Failed to deploy plugin using build-and-deploy.sh"
+        return 1
+    fi
     
     log_info "Plugin deployed successfully"
 }
@@ -399,7 +440,10 @@ Features:
 Environment Variables:
   KUBECONFIG      Path to kubeconfig file (default: \$HOME/.kube/config)
   TEST_NS         Test namespace (default: wekaplugin-e2e)
-  PLUGIN_IMAGE    Plugin container image (default: weka/nri-cpuset:latest)
+  PLUGIN_IMAGE    Plugin container image - if specified, will use existing image and skip build
+  PLUGIN_REGISTRY Docker registry for building images (default: images.scalar.dev.weka.io:5002)
+  PLUGIN_NAME     Plugin image name (default: weka-nri-cpuset)
+  SKIP_BUILD      Skip building and use existing image at registry (default: false)
   TEST_TIMEOUT    Test timeout (default: 30m)
   TEST_PARALLEL   Number of parallel workers (default: 8)
   PRESERVE_ON_FAILURE Preserve failed test resources for debugging (default: true)
@@ -409,23 +453,26 @@ Environment Variables:
   PRESERVE_REPORTS Keep test report files after completion (default: false)
 
 Examples:
-  # Basic usage
+  # Basic usage (builds and deploys fresh image)
   $0
 
-  # Use specific kubeconfig and namespace
+  # Use specific kubeconfig and namespace  
   KUBECONFIG=~/.kube/prod TEST_NS=my-test $0
 
-  # Force plugin redeployment
+  # Build with custom registry
+  PLUGIN_REGISTRY=my-registry.com:5000 $0
+
+  # Use existing image (skip building)
+  PLUGIN_IMAGE=my-registry/nri-cpuset:v1.2.3 $0
+  
+  # Skip build and use latest at default registry  
+  SKIP_BUILD=true $0
+
+  # Force plugin redeployment (will rebuild if no PLUGIN_IMAGE specified)
   FORCE_DEPLOY=true $0
 
-  # Skip cleanup for debugging
-  SKIP_CLEANUP=true $0
-
-  # Preserve reports and failed resources for debugging
-  PRESERVE_REPORTS=true PRESERVE_ON_FAILURE=true $0
-  
-  # Run with custom image and debugging
-  PLUGIN_IMAGE=my-registry/nri-cpuset:dev PRESERVE_ON_FAILURE=true $0
+  # Run with custom registry and debugging
+  PLUGIN_REGISTRY=my-registry.com PRESERVE_ON_FAILURE=true $0
   
   # Run with fewer parallel workers (reduce from default 8)
   TEST_PARALLEL=4 $0

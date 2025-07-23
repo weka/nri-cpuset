@@ -28,7 +28,7 @@ Options:
   --help              Show this help
 
 Description:
-  Build Docker image and deploy weka-cpuset as a DaemonSet.
+  Build Docker image using existing Dockerfile and deploy weka-cpuset as a DaemonSet.
   Uses unix timestamp as image version for simplicity.
 
 Examples:
@@ -127,6 +127,10 @@ check_dependencies() {
         error "kubectl not found in PATH"
     fi
     
+    if ! command -v make >/dev/null 2>&1; then
+        error "make not found in PATH"
+    fi
+    
     # Test kubectl access
     if ! kubectl --kubeconfig="$KUBECONFIG_FILE" cluster-info >/dev/null 2>&1; then
         error "Cannot access Kubernetes cluster with provided kubeconfig"
@@ -140,66 +144,6 @@ check_dependencies() {
     log "Dependencies check passed"
 }
 
-create_dockerfile() {
-    local dockerfile_path="$PROJECT_ROOT/Dockerfile.daemonset"
-    
-    log "Creating Dockerfile for daemonset deployment..."
-    
-    cat > "$dockerfile_path" << 'EOF'
-# Multi-stage build for weka-nri-cpuset daemonset
-FROM golang:1.24-alpine AS builder
-
-WORKDIR /app
-COPY go.mod go.sum ./
-RUN go mod download
-
-COPY . .
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -installsuffix cgo -o weka-cpuset ./cmd/weka-cpuset/
-
-# Final stage
-FROM alpine:3.19
-
-RUN apk --no-cache add ca-certificates
-WORKDIR /root/
-
-# Copy the binary
-COPY --from=builder /app/weka-cpuset /usr/local/bin/weka-cpuset
-
-# Ensure the binary is executable
-RUN chmod +x /usr/local/bin/weka-cpuset
-
-# Create non-root user (although we'll run as root in daemonset due to privileges needed)
-RUN addgroup -g 1001 -S weka && \
-    adduser -S -u 1001 -G weka weka
-
-ENTRYPOINT ["/usr/local/bin/weka-cpuset"]
-EOF
-    
-    debug "Dockerfile created at $dockerfile_path"
-}
-
-build_and_push_image() {
-    local timestamp=$(date +%s)
-    local full_image_tag="${REGISTRY}/${IMAGE_NAME}:${timestamp}"
-    local dockerfile_path="$PROJECT_ROOT/Dockerfile.daemonset"
-    
-    log "Building Docker image: $full_image_tag"
-    
-    # Create Dockerfile if it doesn't exist
-    if [[ ! -f "$dockerfile_path" ]]; then
-        create_dockerfile
-    fi
-    
-    # Build the image
-    run_command "cd '$PROJECT_ROOT' && docker build --platform linux/amd64 -f '$dockerfile_path' -t '$full_image_tag' ." \
-        "Building Docker image"
-    
-    # Push the image
-    run_command "docker push '$full_image_tag' >/dev/null 2>&1" \
-        "Pushing image to registry"
-    
-    echo "$full_image_tag" # Return the image tag for use in deployment
-}
 
 update_daemonset_manifest() {
     local image_tag="$1"
@@ -288,11 +232,6 @@ cleanup_temp_files() {
         rm -f "$PROJECT_ROOT/deploy/manifests/daemonset-temp.yaml"
         debug "Removed temporary manifest file"
     fi
-    
-    if [[ -f "$PROJECT_ROOT/Dockerfile.daemonset" ]]; then
-        rm -f "$PROJECT_ROOT/Dockerfile.daemonset"
-        debug "Removed temporary Dockerfile"
-    fi
 }
 
 main() {
@@ -316,9 +255,18 @@ main() {
         # Use latest tag or ask user to specify
         image_tag="${REGISTRY}/${IMAGE_NAME}:latest"
         log "Using existing image: $image_tag"
-    else
-        # Build and push image
-        image_tag=$(build_and_push_image 2>/dev/null | tail -n 1)
+        else
+        # Build and push image using Makefile
+        local timestamp=$(date +%s)
+        local full_image_tag="${REGISTRY}/${IMAGE_NAME}:${timestamp}"
+        
+        log "Building Docker image using existing Dockerfile: $full_image_tag"
+        
+        # Use the existing Makefile to build and push the image
+        run_command "cd '$PROJECT_ROOT' && make image-push REGISTRY='$REGISTRY' IMAGE_NAME='$IMAGE_NAME' IMAGE_TAG='$timestamp'" \
+            "Building and pushing Docker image via Makefile"
+        
+        image_tag="$full_image_tag"
     fi
     
     # Update manifest with new image tag

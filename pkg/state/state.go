@@ -548,9 +548,25 @@ func (m *Manager) Synchronize(pods []*api.PodSandbox, containers []*api.Containe
 
 		m.byCID[container.Id] = info
 
-		// Update integer ownership
+		// Update integer ownership - resolve conflicts with annotated containers
+		var conflictFreeCPUs []int
 		for _, cpu := range currentCPUs {
-			m.intOwner[cpu] = container.Id
+			if _, hasAnnotated := m.annotRef[cpu]; hasAnnotated {
+				fmt.Printf("WARNING: CPU %d conflict detected - assigned to both integer container %s and annotated containers during sync\n", cpu, container.Id)
+				// Per PRD: annotated containers have priority, integer containers should be reallocated
+				// During sync, we'll exclude this CPU from integer container assignment
+			} else {
+				m.intOwner[cpu] = container.Id
+				conflictFreeCPUs = append(conflictFreeCPUs, cpu)
+			}
+		}
+
+		// If we have conflicts, update the container info to reflect only non-conflicting CPUs
+		if len(conflictFreeCPUs) != len(currentCPUs) {
+			fmt.Printf("DEBUG: Integer container %s had %d CPU conflicts, now assigned %d CPUs: %v\n", 
+				container.Id, len(currentCPUs)-len(conflictFreeCPUs), len(conflictFreeCPUs), conflictFreeCPUs)
+			info.CPUs = conflictFreeCPUs
+			currentCPUs = conflictFreeCPUs // Update for the container update below
 		}
 
 		// Create container update to apply CPU restrictions during synchronization

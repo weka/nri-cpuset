@@ -8,10 +8,11 @@ GOFLAGS = -mod=vendor
 LDFLAGS = -s -w
 CGO_ENABLED = 0
 
-# Image variables
+# Image variables - now supports configurable registry
 REGISTRY ?= weka
-IMAGE_NAME = $(REGISTRY)/nri-cpuset
+IMAGE_NAME ?= nri-cpuset
 IMAGE_TAG ?= latest
+FULL_IMAGE = $(REGISTRY)/$(IMAGE_NAME):$(IMAGE_TAG)
 
 # Test variables
 GINKGO = go run github.com/onsi/ginkgo/v2/ginkgo
@@ -19,7 +20,13 @@ TEST_TIMEOUT = 30m
 
 .PHONY: help
 help: ## Show this help message
-	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+	@awk '/^[a-zA-Z_-]+:.*##/ { \
+		target = $$1; \
+		sub(/:.*$$/, "", target); \
+		desc = $$0; \
+		sub(/^[^#]*## */, "", desc); \
+		printf "\033[36m%-20s\033[0m %s\n", target, desc \
+	}' $(MAKEFILE_LIST)
 
 .PHONY: vendor
 vendor: ## Download and vendor dependencies
@@ -57,12 +64,13 @@ test-integration: ## Run integration tests (no K8s required)
 test-e2e-kind: ## Run e2e tests with kind cluster (RECOMMENDED)
 	./hack/kind-e2e.sh
 
-.PHONY: test-e2e-live  
+.PHONY: test-e2e-live
 test-e2e-live: ## Run e2e tests against live cluster
 	./hack/e2e-live.sh
 
 .PHONY: test-e2e
-test-e2e: test-e2e-kind ## Run e2e tests (defaults to kind)
+test-e2e: ## Run e2e tests (defaults to kind)
+	$(MAKE) test-e2e-kind
 
 .PHONY: kind-up
 kind-up: ## Create kind cluster for testing
@@ -73,12 +81,18 @@ kind-down: ## Delete kind cluster
 	kind delete cluster --name $${KIND_CLUSTER_NAME:-test}
 
 .PHONY: image
-image: ## Build container image
-	docker build -t $(IMAGE_NAME):$(IMAGE_TAG) .
+image: ## Build container image (REGISTRY=my-registry.com IMAGE_NAME=weka-nri-cpuset IMAGE_TAG=v1.0.0)
+	@echo "Building image: $(FULL_IMAGE)"
+	docker build --platform linux/amd64 -t $(FULL_IMAGE) .
 
 .PHONY: image-push
 image-push: image ## Build and push container image
-	docker push $(IMAGE_NAME):$(IMAGE_TAG)
+	@echo "Pushing image: $(FULL_IMAGE)"
+	docker push $(FULL_IMAGE)
+
+.PHONY: image-with-timestamp
+image-with-timestamp: ## Build and push image with timestamp tag (used by build-and-deploy)
+	$(MAKE) image-push IMAGE_TAG=$(shell date +%s)
 
 .PHONY: chart
 chart: ## Package Helm chart
