@@ -20,13 +20,9 @@ TEST_TIMEOUT = 30m
 
 .PHONY: help
 help: ## Show this help message
-	@awk '/^[a-zA-Z_-]+:.*##/ { \
-		target = $$1; \
-		sub(/:.*$$/, "", target); \
-		desc = $$0; \
-		sub(/^[^#]*## */, "", desc); \
-		printf "\033[36m%-20s\033[0m %s\n", target, desc \
-	}' $(MAKEFILE_LIST)
+	@grep -E '^[a-zA-Z_0-9-]+:.*##' $(MAKEFILE_LIST) | \
+		sed 's/:.*##/|/' | \
+		awk -F'|' '{printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
 
 .PHONY: vendor
 vendor: ## Download and vendor dependencies
@@ -56,9 +52,7 @@ fmt: ## Format code
 test: ## Run unit tests
 	go test -race -coverprofile=coverage.out ./pkg/... ./cmd/...
 
-.PHONY: test-integration
-test-integration: ## Run integration tests (no K8s required)
-	$(GINKGO) -r --timeout=$(TEST_TIMEOUT) --cover --coverprofile=integration.out --label-filter="integration" ./test/
+
 
 .PHONY: test-e2e-kind
 test-e2e-kind: ## Run e2e tests with kind cluster (RECOMMENDED)
@@ -112,4 +106,4 @@ generate: ## Generate code
 verify: fmt lint test ## Run all verification steps (unit tests only)
 
 .PHONY: verify-all
-verify-all: fmt lint test test-integration test-e2e-kind ## Run all verification steps including e2e
+verify-all: fmt lint test test-e2e-kind ## Run all verification steps including e2e

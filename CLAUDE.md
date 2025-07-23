@@ -258,9 +258,6 @@ make kind-down         # Cleanup
 # Unit tests only
 make test
 
-# Integration tests (no K8s required)
-make test-integration
-
 # All verification including E2E
 make verify-all
 
