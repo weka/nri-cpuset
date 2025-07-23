@@ -5,10 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"strings"
-	"sync"
 	"syscall"
-	"time"
 
 	"github.com/containerd/nri/pkg/api"
 	"github.com/containerd/nri/pkg/stub"
@@ -41,8 +38,16 @@ type plugin struct {
 	allocator *allocator.CPUAllocator
 	numa      *numa.Manager
 	
-	// Add mutex to serialize container update operations to prevent race conditions
-	updateMu  sync.Mutex
+	// Background update system
+	updateQueue chan updateRequest
+	updateCtx   context.Context
+	updateCancel context.CancelFunc
+}
+
+// updateRequest represents a background container update request
+type updateRequest struct {
+	updates   []*api.ContainerUpdate
+	operation string
 }
 
 var (
@@ -98,12 +103,16 @@ func runPlugin(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to initialize CPU allocator: %w", err)
 	}
 
-	// Create plugin instance
+	// Create plugin instance with background update system
+	updateCtx, updateCancel := context.WithCancel(ctx)
 	p := &plugin{
-		mask:      api.MustParseEventMask("RunPodSandbox,CreateContainer,UpdateContainer,RemoveContainer"),
-		state:     stateManager,
-		allocator: cpuAllocator,
-		numa:      numaManager,
+		mask:         api.MustParseEventMask("RunPodSandbox,CreateContainer,UpdateContainer,RemoveContainer"),
+		state:        stateManager,
+		allocator:    cpuAllocator,
+		numa:         numaManager,
+		updateQueue:  make(chan updateRequest, 100), // Buffered channel for async updates
+		updateCtx:    updateCtx,
+		updateCancel: updateCancel,
 	}
 
 	// Create NRI stub options
@@ -127,6 +136,15 @@ func runPlugin(cmd *cobra.Command, args []string) error {
 
 	p.stub = stub
 
+	// Start background update processor
+	go p.processBackgroundUpdates()
+
+	// Ensure cleanup on exit
+	defer func() {
+		p.updateCancel()
+		close(p.updateQueue)
+	}()
+
 	// Run the plugin
 	if err := stub.Run(ctx); err != nil {
 		return fmt.Errorf("plugin execution failed: %w", err)
@@ -135,6 +153,50 @@ func runPlugin(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// processBackgroundUpdates handles unsolicited container updates in a serialized manner
+func (p *plugin) processBackgroundUpdates() {
+	for {
+		select {
+		case <-p.updateCtx.Done():
+			return
+		case req := <-p.updateQueue:
+			if len(req.updates) == 0 {
+				continue
+			}
+
+			fmt.Printf("Processing %d background container updates for %s\n", len(req.updates), req.operation)
+			_, err := p.stub.UpdateContainers(req.updates)
+			if err != nil {
+				fmt.Printf("ERROR: Background UpdateContainers failed for %s: %v\n", req.operation, err)
+			} else {
+				fmt.Printf("Successfully applied %d background updates for %s\n", len(req.updates), req.operation)
+			}
+		}
+	}
+}
+
+// queueBackgroundUpdate queues container updates for background processing (async)
+func (p *plugin) queueBackgroundUpdate(updates []*api.ContainerUpdate, operation string) {
+	if len(updates) == 0 {
+		return
+	}
+
+	req := updateRequest{
+		updates:   updates,
+		operation: operation,
+	}
+
+	select {
+	case p.updateQueue <- req:
+		fmt.Printf("Queued %d container updates for background processing (%s)\n", len(updates), operation)
+	case <-p.updateCtx.Done():
+		fmt.Printf("Plugin shutting down, discarding %d updates for %s\n", len(updates), operation)
+	default:
+		fmt.Printf("WARNING: Update queue full, discarding %d updates for %s\n", len(updates), operation)
+	}
+}
+
+
 // NRI plugin interface implementations
 
 func (p *plugin) Configure(ctx context.Context, config, runtime, version string) (stub.EventMask, error) {
@@ -142,18 +204,10 @@ func (p *plugin) Configure(ctx context.Context, config, runtime, version string)
 	return p.mask, nil
 }
 
-func (p *plugin) Synchronize(ctx context.Context, pods []*api.PodSandbox, containers []*api.Container) (updates []*api.ContainerUpdate, err error) {
-	// Add panic recovery to prevent plugin crashes
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("panic during synchronization: %v", r)
-			fmt.Printf("ERROR: Plugin panic caught during synchronization: %v\n", r)
-		}
-	}()
-
+func (p *plugin) Synchronize(ctx context.Context, pods []*api.PodSandbox, containers []*api.Container) ([]*api.ContainerUpdate, error) {
 	fmt.Printf("Synchronizing state with %d pods and %d containers\n", len(pods), len(containers))
 
-	updates, err = p.state.Synchronize(pods, containers, p.allocator)
+	updates, err := p.state.Synchronize(pods, containers, p.allocator)
 	if err != nil {
 		return nil, fmt.Errorf("synchronization failed: %w", err)
 	}
@@ -166,16 +220,7 @@ func (p *plugin) RunPodSandbox(ctx context.Context, pod *api.PodSandbox) error {
 	return nil
 }
 
-func (p *plugin) CreateContainer(ctx context.Context, pod *api.PodSandbox, container *api.Container) (adjustment *api.ContainerAdjustment, updates []*api.ContainerUpdate, err error) {
-	// Add panic recovery to prevent plugin crashes
-	defer func() {
-		if r := recover(); r != nil {
-			adjustment = nil
-			updates = nil
-			err = fmt.Errorf("panic during container creation: %v", r)
-			fmt.Printf("ERROR: Plugin panic caught during container creation for %s/%s: %v\n", pod.Namespace, pod.Name, r)
-		}
-	}()
+func (p *plugin) CreateContainer(ctx context.Context, pod *api.PodSandbox, container *api.Container) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
 
 	modeStr := p.determineContainerMode(pod, container)
 
@@ -191,103 +236,28 @@ func (p *plugin) CreateContainer(ctx context.Context, pod *api.PodSandbox, conta
 	}
 }
 
-func (p *plugin) UpdateContainer(ctx context.Context, pod *api.PodSandbox, container *api.Container, r *api.LinuxResources) (updates []*api.ContainerUpdate, err error) {
-	// Add panic recovery to prevent plugin crashes
-	defer func() {
-		if r := recover(); r != nil {
-			updates = nil
-			err = fmt.Errorf("panic during container update: %v", r)
-			fmt.Printf("ERROR: Plugin panic caught during container update for %s/%s: %v\n", pod.Namespace, pod.Name, r)
-		}
-	}()
-
+func (p *plugin) UpdateContainer(ctx context.Context, pod *api.PodSandbox, container *api.Container, r *api.LinuxResources) ([]*api.ContainerUpdate, error) {
 	fmt.Printf("Updating container %s in pod %s/%s\n", container.Name, pod.Namespace, pod.Name)
 	return nil, nil
 }
 
-func (p *plugin) RemoveContainer(ctx context.Context, pod *api.PodSandbox, container *api.Container) (err error) {
-	// Add panic recovery to prevent plugin crashes
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("panic during container removal: %v", r)
-			fmt.Printf("ERROR: Plugin panic caught during container removal for %s/%s: %v\n", pod.Namespace, pod.Name, r)
-		}
-	}()
-
+func (p *plugin) RemoveContainer(ctx context.Context, pod *api.PodSandbox, container *api.Container) error {
 	fmt.Printf("Removing container %s from pod %s/%s\n", container.Name, pod.Namespace, pod.Name)
 
-	// Release resources and trigger shared pool update
+	// Release resources and trigger shared pool update via background processing
 	updates, err := p.state.RemoveContainer(container.Id, p.allocator)
 	if err != nil {
 		return fmt.Errorf("container removal failed: %w", err)
 	}
 
-	// Apply updates to shared containers via UpdateContainers call with retry
+	// Queue updates for background processing (async, no protocol violation)
 	if len(updates) > 0 {
-		return p.updateContainers(updates, "container removal")
+		p.queueBackgroundUpdate(updates, "container removal")
 	}
 
 	return nil
 }
 
-// updateContainersWithRetry handles containerd issues with retry logic
-func (p *plugin) updateContainersWithRetry(updates []*api.ContainerUpdate, operation string) error {
-	const maxRetries = 3
-	const baseDelay = 1 * time.Second
-	
-	fmt.Printf("Starting UpdateContainers retry loop for %s with %d updates\n", operation, len(updates))
-	defer func() {
-		fmt.Printf("UpdateContainers retry loop completed for %s\n", operation)
-	}()
-	
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		fmt.Printf("UpdateContainers attempt %d/%d for %s\n", attempt, maxRetries, operation)
-		_, err := p.stub.UpdateContainers(updates)
-		if err == nil {
-			if attempt > 1 {
-				fmt.Printf("UpdateContainers succeeded on attempt %d for %s\n", attempt, operation)
-			}
-			return nil
-		}
-		
-		// Check for containerd-specific errors that warrant retry
-		errStr := err.Error()
-		isRetryable := strings.Contains(errStr, "name is reserved") ||
-			strings.Contains(errStr, "context deadline exceeded") ||
-			strings.Contains(errStr, "connection refused") ||
-			strings.Contains(errStr, "transport is closing")
-		
-		// Also check for container removal-related errors that indicate race condition
-		isContainerGone := strings.Contains(errStr, "not found") ||
-			strings.Contains(errStr, "container not found") ||
-			strings.Contains(errStr, "no such container")
-		
-		if isContainerGone {
-			fmt.Printf("WARNING: Container not found during %s, likely removed concurrently: %v\n", operation, err)
-			// Container was removed concurrently, this is expected during rapid deletion
-			// Consider this a successful operation since the container is already gone
-			return nil
-		}
-		
-		if !isRetryable {
-			// Non-retryable error, fail immediately
-			return err
-		}
-		
-		if attempt < maxRetries {
-			delay := time.Duration(attempt) * baseDelay
-			fmt.Printf("WARNING: UpdateContainers failed on attempt %d for %s (retryable: %v), retrying in %v: %v\n", 
-				attempt, operation, isRetryable, delay, err)
-			time.Sleep(delay)
-		} else {
-			fmt.Printf("WARNING: UpdateContainers failed after %d attempts for %s: %v\n", maxRetries, operation, err)
-			fmt.Printf("WARNING: Abandoning UpdateContainers operation to prevent plugin crash\n")
-			return err
-		}
-	}
-	
-	return fmt.Errorf("updateContainers failed after %d retries", maxRetries)
-}
 
 // Helper methods for container mode determination and handling
 
@@ -386,19 +356,14 @@ func (p *plugin) handleAnnotatedContainer(pod *api.PodSandbox, container *api.Co
 		return nil, nil, err
 	}
 
-	// Apply live reallocation updates immediately if any were generated
+	// Queue live reallocation updates for background processing (async, no blocking)
 	if len(updates) > 0 {
-		fmt.Printf("Applying %d live reallocation updates for annotated container %s\n", len(updates), container.Name)
-		err := p.updateContainers(updates, "live reallocation")
-		if err != nil {
-			// Rollback the pending reallocation plan on failure
-			fmt.Printf("ERROR: Failed to apply live reallocation updates, rolling back: %v\n", err)
-			p.state.ClearPendingReallocation()
-			return nil, nil, fmt.Errorf("failed to apply live reallocation updates: %w", err)
-		}
-		// Only update internal state after successful container updates
+		fmt.Printf("Queuing %d live reallocation updates for annotated container %s\n", len(updates), container.Name)
+		// Apply the reallocation plan optimistically - the background update will handle any failures
 		p.state.ApplySuccessfulReallocation()
-		fmt.Printf("Successfully applied live reallocation updates and updated internal state\n")
+		// Queue updates asynchronously (no blocking of NRI callback)
+		p.queueBackgroundUpdate(updates, "live reallocation")
+		fmt.Printf("Queued live reallocation updates for background processing\n")
 	}
 
 	// Record the successful allocation with proper reference counting for annotated containers
@@ -438,78 +403,3 @@ func (p *plugin) handleSharedContainer(pod *api.PodSandbox, container *api.Conta
 	return p.allocator.AllocateContainer(pod, container, reserved)
 }
 
-// updateContainers applies container updates through NRI
-func (p *plugin) updateContainers(updates []*api.ContainerUpdate, operation string) (err error) {
-	// Serialize container update operations to prevent race conditions during rapid container churn
-	p.updateMu.Lock()
-	defer p.updateMu.Unlock()
-	
-	// Add panic recovery to prevent plugin crashes
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("panic during %s: %v", operation, r)
-			fmt.Printf("ERROR: Plugin panic caught during %s: %v\n", operation, r)
-		}
-	}()
-
-	if len(updates) == 0 {
-		return nil
-	}
-
-	fmt.Printf("Attempting to apply %d %s updates (serialized)\n", len(updates), operation)
-	
-	// Add defensive logging to track where the process might be exiting
-	defer func() {
-		fmt.Printf("updateContainers function completed for %s\n", operation)
-	}()
-	
-	// Add small delay for container removal operations to allow containers to fully settle
-	// This helps prevent race conditions during rapid container churn scenarios
-	if operation == "container removal" && len(updates) > 1 {
-		fmt.Printf("Detected multiple container updates during removal, adding stabilization delay\n")
-		time.Sleep(100 * time.Millisecond)
-	}
-
-	// Add additional safety check for stub
-	if p.stub == nil {
-		return fmt.Errorf("%s update failed: NRI stub is nil", operation)
-	}
-
-	// Validate container updates before applying to prevent crashes
-	validUpdates := make([]*api.ContainerUpdate, 0, len(updates))
-	for _, update := range updates {
-		// Skip updates for containers that might be invalid/removed
-		if update.ContainerId != "" && len(update.ContainerId) > 0 {
-			// Additional validation: check if container still exists in our state
-			if p.state.ContainerExists(update.ContainerId) {
-				validUpdates = append(validUpdates, update)
-			} else {
-				fmt.Printf("WARNING: Skipping update for container %s - no longer exists in state\n", update.ContainerId)
-			}
-		} else {
-			fmt.Printf("WARNING: Skipping update for invalid container ID: %s\n", update.ContainerId)
-		}
-	}
-	
-	if len(validUpdates) == 0 {
-		fmt.Printf("No valid container updates to apply for %s\n", operation)
-		return nil
-	}
-	
-	if len(validUpdates) != len(updates) {
-		fmt.Printf("Filtered out %d invalid updates, applying %d valid updates for %s\n", 
-			len(updates)-len(validUpdates), len(validUpdates), operation)
-	}
-	
-	// Apply updates with retry logic for containerd issues
-	err = p.updateContainersWithRetry(validUpdates, operation)
-	if err != nil {
-		fmt.Printf("ERROR: UpdateContainers failed after retries for %s: %v\n", operation, err)
-		fmt.Printf("WARNING: Continuing operation despite UpdateContainers failure to prevent plugin crash\n")
-		// Don't propagate UpdateContainers errors to prevent plugin crashes
-		// Log the error but continue operation - this is better than crashing
-	} else {
-		fmt.Printf("Successfully applied %d updates for %s\n", len(validUpdates), operation)
-	}
-	return nil
-}

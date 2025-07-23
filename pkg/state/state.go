@@ -52,27 +52,22 @@ type Manager struct {
 	// pendingReallocationPlan stores the plan that needs to be applied after successful updates
 	// This is now instance-based to prevent race conditions between concurrent allocations
 	pendingReallocationPlan []ReallocationPlan
-	
-	// Track containers that are currently being removed to prevent race conditions
-	beingRemoved map[string]bool
 }
 
 func NewManager() *Manager {
 	return &Manager{
-		annotRef:     make(map[int]int),
-		intOwner:     make(map[int]string),
-		byCID:        make(map[string]*ContainerInfo),
-		beingRemoved: make(map[string]bool),
+		annotRef: make(map[int]int),
+		intOwner: make(map[int]string),
+		byCID:    make(map[string]*ContainerInfo),
 	}
 }
 
-// ContainerExists checks if a container exists in the state manager and is not being removed
+// ContainerExists checks if a container exists in the state manager
 func (m *Manager) ContainerExists(containerID string) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	_, exists := m.byCID[containerID]
-	isBeingRemoved := m.beingRemoved[containerID]
-	return exists && !isBeingRemoved
+	return exists
 }
 
 type Allocator interface {
@@ -268,20 +263,10 @@ func (m *Manager) executeReallocationPlan(plans []ReallocationPlan, alloc Alloca
 		if container == nil {
 			return nil, fmt.Errorf("container %s not found in state", plan.ContainerID)
 		}
-		// Skip containers that are being removed to prevent race conditions
-		if m.beingRemoved[plan.ContainerID] {
-			fmt.Printf("DEBUG: Skipping reallocation plan for container %s - currently being removed\n", plan.ContainerID)
-			continue
-		}
 	}
 
 	// Create all update requests
 	for _, plan := range plans {
-		// Double-check the container is still valid before creating update
-		if m.beingRemoved[plan.ContainerID] {
-			fmt.Printf("DEBUG: Skipping reallocation update for container %s - currently being removed\n", plan.ContainerID)
-			continue
-		}
 		update := &api.ContainerUpdate{
 			ContainerId: plan.ContainerID,
 			Linux: &api.LinuxContainerUpdate{
@@ -764,13 +749,6 @@ func (m *Manager) RemoveContainer(containerID string, alloc Allocator) ([]*api.C
 	if info == nil {
 		return nil, nil
 	}
-	
-	// Mark container as being removed to prevent race conditions with concurrent updates
-	m.beingRemoved[containerID] = true
-	defer func() {
-		// Clean up the tracking after processing
-		delete(m.beingRemoved, containerID)
-	}()
 
 	// Release reservations
 	switch info.Mode {
@@ -800,12 +778,6 @@ func (m *Manager) RemoveContainer(containerID string, alloc Allocator) ([]*api.C
 	newSharedPool := m.computeSharedPool(alloc.GetOnlineCPUs())
 
 	for _, containerInfo := range m.byCID {
-		// Skip containers that are currently being removed to prevent race conditions
-		if m.beingRemoved[containerInfo.ID] {
-			fmt.Printf("DEBUG: Skipping update for container %s - currently being removed\n", containerInfo.ID)
-			continue
-		}
-		
 		if containerInfo.Mode == ModeShared && len(newSharedPool) > 0 {
 			update := &api.ContainerUpdate{
 				ContainerId: containerInfo.ID,
