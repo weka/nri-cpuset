@@ -1,0 +1,458 @@
+# Plugin Crash Fix Manual Test
+
+Tests the fix for plugin crashes during container removal operations that were causing CrashLoopBackOff with exit code 0.
+
+## Issue Background
+The plugin was crashing during `UpdateContainers()` calls triggered by container removal, specifically when trying to update shared containers that might be concurrently getting removed. This created a race condition where the plugin would exit cleanly (exit code 0) but restart repeatedly.
+
+## Test Scenario
+1. Deploy the fixed plugin version with enhanced error handling
+2. Create multiple pods with different resource patterns on the same node
+3. Let pods complete naturally to trigger container removal
+4. Verify plugin remains stable without restarts during removal operations
+5. Verify error handling logs appear for any failed container updates
+
+## Prerequisites
+- KUBECONFIG set to cluster with NRI-enabled containerd
+- Weka NRI CPUSet plugin deployed with crash fix
+- At least 6-8 CPU cores available on target node
+- Access to plugin logs via kubectl
+
+## Test Steps
+
+### 1. Identify Target Node
+Choose a node that previously experienced plugin crashes (or any available node):
+```bash
+kubectl get nodes -o wide
+export TARGET_NODE=h3-8-d  # Replace with actual node name
+echo "Testing on node: $TARGET_NODE"
+```
+
+### 2. Check Initial Plugin Status
+```bash
+echo "=== Initial Plugin Status ==="
+kubectl get pods -n kube-system -l app=weka-nri-cpuset -o wide | grep $TARGET_NODE
+PLUGIN_POD=$(kubectl get pods -n kube-system -l app=weka-nri-cpuset --field-selector spec.nodeName=$TARGET_NODE -o jsonpath='{.items[0].metadata.name}')
+echo "Target plugin pod: $PLUGIN_POD"
+kubectl get pod -n kube-system $PLUGIN_POD
+```
+
+**Expected**: Plugin pod should be Running with 0 restarts
+
+### 3. Create Test Pods with Mixed Resource Patterns
+```bash
+# Create test pods that will stress the container removal logic
+cat > /tmp/crash-test-pods.yaml << EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: crash-test-integer-1
+  namespace: default
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: $TARGET_NODE
+  containers:
+  - name: test-container
+    image: busybox:latest
+    command: ["sleep", "15"]
+    resources:
+      requests:
+        cpu: "1"        # Integer pod - gets exclusive CPU
+        memory: "100Mi"
+      limits:
+        cpu: "1"
+        memory: "100Mi"
+  restartPolicy: Never
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: crash-test-integer-2
+  namespace: default
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: $TARGET_NODE
+  containers:
+  - name: test-container
+    image: busybox:latest
+    command: ["sleep", "20"]
+    resources:
+      requests:
+        cpu: "2"        # Integer pod - gets 2 exclusive CPUs
+        memory: "100Mi"
+      limits:
+        cpu: "2"
+        memory: "100Mi"
+  restartPolicy: Never
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: crash-test-annotated
+  namespace: default
+  annotations:
+    weka.io/cores-ids: "15,16"  # Annotated pod - pins specific CPUs
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: $TARGET_NODE
+  containers:
+  - name: test-container
+    image: busybox:latest
+    command: ["sleep", "10"]   # Shortest duration - will complete first
+    resources:
+      requests:
+        cpu: "100m"     # Fractional - shared classification
+        memory: "100Mi"
+      limits:
+        cpu: "200m"
+        memory: "100Mi"
+  restartPolicy: Never
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: crash-test-shared
+  namespace: default
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: $TARGET_NODE
+  containers:
+  - name: test-container
+    image: busybox:latest
+    command: ["sleep", "12"]
+    resources:
+      requests:
+        cpu: "50m"      # Shared pod - uses shared pool
+        memory: "50Mi"
+      limits:
+        cpu: "100m"
+        memory: "100Mi"
+  restartPolicy: Never
+EOF
+
+kubectl apply -f /tmp/crash-test-pods.yaml
+```
+
+### 4. Verify Pod Creation and CPU Assignments
+```bash
+echo "=== Pod Creation Status ==="
+sleep 5
+kubectl get pods crash-test-integer-1 crash-test-integer-2 crash-test-annotated crash-test-shared -o wide
+
+echo "=== Plugin Status During Pod Creation ==="
+kubectl get pod -n kube-system $PLUGIN_POD
+```
+
+**Expected**: All pods Running on target node, plugin pod stable
+
+### 5a. Test Natural Pod Completion (Baseline)
+```bash
+echo "=== Testing Natural Pod Completion (Baseline) ==="
+# Wait for pods to complete naturally (staggered completion due to different sleep times)
+echo "Waiting for pods to complete naturally..."
+sleep 25
+
+echo "=== Pod Completion Status ==="
+kubectl get pods crash-test-integer-1 crash-test-integer-2 crash-test-annotated crash-test-shared
+
+echo "=== Plugin Status After Natural Completion ==="
+kubectl get pod -n kube-system $PLUGIN_POD
+NATURAL_RESTART_COUNT=$(kubectl get pod -n kube-system $PLUGIN_POD -o jsonpath='{.status.containerStatuses[0].restartCount}')
+echo "Plugin restart count after natural completion: $NATURAL_RESTART_COUNT"
+```
+
+**Expected**: All pods show "Completed" status, plugin remains stable
+
+### 5b. Test Forced Pod Deletion Race Condition (Critical Test)
+```bash
+echo "=== CRITICAL TEST: Forced Pod Deletion Race Condition ==="
+echo "Creating additional stress test pods for race condition testing..."
+
+# Create additional pods for stress testing the race condition
+cat > /tmp/stress-race-test.yaml << EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: stress-race-1
+  namespace: default
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: $TARGET_NODE
+  containers:
+  - name: test-container
+    image: busybox:latest
+    command: ["sleep", "60"]
+    resources:
+      requests:
+        cpu: "1"
+        memory: "100Mi"
+      limits:
+        cpu: "1"
+        memory: "100Mi"
+  restartPolicy: Never
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: stress-race-2
+  namespace: default
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: $TARGET_NODE
+  containers:
+  - name: test-container
+    image: busybox:latest
+    command: ["sleep", "60"]
+    resources:
+      requests:
+        cpu: "50m"
+        memory: "50Mi"
+      limits:
+        cpu: "100m"
+        memory: "100Mi"
+  restartPolicy: Never
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: stress-race-3
+  namespace: default
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: $TARGET_NODE
+  containers:
+  - name: test-container
+    image: busybox:latest
+    command: ["sleep", "60"]
+    resources:
+      requests:
+        cpu: "75m"
+        memory: "75Mi"
+      limits:
+        cpu: "150m"
+        memory: "150Mi"
+  restartPolicy: Never
+EOF
+
+kubectl apply -f /tmp/stress-race-test.yaml
+
+# Wait for pods to be running
+echo "Waiting for stress test pods to be running..."
+sleep 5
+kubectl get pods stress-race-1 stress-race-2 stress-race-3 -o wide
+
+# Record plugin status before race condition test
+echo "=== Plugin Status Before Race Condition Test ==="
+kubectl get pod -n kube-system $PLUGIN_POD
+BEFORE_RESTART_COUNT=$(kubectl get pod -n kube-system $PLUGIN_POD -o jsonpath='{.status.containerStatuses[0].restartCount}')
+echo "Plugin restart count before race test: $BEFORE_RESTART_COUNT"
+
+# CRITICAL: Force delete all pods simultaneously to trigger race condition
+echo "=== TRIGGERING RACE CONDITION: Force deleting all pods simultaneously ==="
+kubectl delete pods stress-race-1 stress-race-2 stress-race-3 --grace-period=0 --force &
+
+# Immediately check plugin status
+sleep 3
+echo "=== Plugin Status During Race Condition ==="
+kubectl get pod -n kube-system $PLUGIN_POD
+DURING_RESTART_COUNT=$(kubectl get pod -n kube-system $PLUGIN_POD -o jsonpath='{.status.containerStatuses[0].restartCount}')
+echo "Plugin restart count during race condition: $DURING_RESTART_COUNT"
+
+# Wait a bit more and check final status
+sleep 10
+echo "=== Plugin Status After Race Condition ==="
+kubectl get pod -n kube-system $PLUGIN_POD
+AFTER_RESTART_COUNT=$(kubectl get pod -n kube-system $PLUGIN_POD -o jsonpath='{.status.containerStatuses[0].restartCount}')
+echo "Plugin restart count after race condition: $AFTER_RESTART_COUNT"
+
+# Clean up stress test file
+rm -f /tmp/stress-race-test.yaml
+```
+
+**Expected**: Plugin should remain stable with no additional restarts  
+**ACTUAL BEHAVIOR**: Plugin crashes during forced simultaneous pod deletion
+
+### 6. Final Plugin Stability Assessment
+```bash
+echo "=== Final Plugin Stability Assessment ==="
+kubectl get pod -n kube-system $PLUGIN_POD
+
+# Get final restart count
+FINAL_RESTART_COUNT=$(kubectl get pod -n kube-system $PLUGIN_POD -o jsonpath='{.status.containerStatuses[0].restartCount}')
+echo "Final plugin restart count: $FINAL_RESTART_COUNT"
+
+# Compare with initial count (should be 0 for fresh deployment)
+echo "=== Test Results Summary ==="
+echo "Initial restart count: 0 (fresh deployment)"
+echo "Final restart count: $FINAL_RESTART_COUNT"
+
+if [ "$FINAL_RESTART_COUNT" -eq 0 ]; then
+    echo "✓ PASS: Plugin remained stable throughout all tests"
+    echo "✓ Container resiliency fix is working correctly"
+else
+    echo "✗ FAIL: Plugin restarted $FINAL_RESTART_COUNT times during testing"
+    echo "✗ Container resiliency fix is INSUFFICIENT"
+    echo "✗ Race condition crash still occurs during forced pod deletion"
+fi
+
+# Check if plugin is currently healthy
+PLUGIN_STATUS=$(kubectl get pod -n kube-system $PLUGIN_POD -o jsonpath='{.status.phase}')
+if [ "$PLUGIN_STATUS" = "Running" ]; then
+    echo "✓ Plugin is currently running"
+else
+    echo "✗ Plugin is currently in $PLUGIN_STATUS state"
+fi
+```
+
+### 7. Check for Error Handling Logs
+```bash
+echo "=== Error Handling Verification ==="
+# Look for new error handling logs that indicate the fix is working
+kubectl logs -n kube-system $PLUGIN_POD --since=2m | grep -E "(ERROR:|WARNING:|Filtered out|No valid container updates)" || echo "No error handling logs found (this may be normal if no errors occurred)"
+
+echo "=== Container Removal Logs ==="
+kubectl logs -n kube-system $PLUGIN_POD --since=2m | grep -E "(Removing container|Attempting to apply.*removal|container removal)" | tail -10
+```
+
+**Expected**: Should see container removal logs without crash indicators
+
+### 8. Force Container Removal to Test Error Handling
+```bash
+echo "=== Forcing Pod Deletion to Test Error Handling ==="
+# Delete pods explicitly to trigger immediate container removal
+kubectl delete -f /tmp/crash-test-pods.yaml
+
+# Monitor plugin immediately after deletion
+sleep 2
+kubectl get pod -n kube-system $PLUGIN_POD
+
+echo "=== Final Plugin Status ==="
+FINAL_RESTART_COUNT=$(kubectl get pod -n kube-system $PLUGIN_POD -o jsonpath='{.status.containerStatuses[0].restartCount}')
+echo "Final restart count: $FINAL_RESTART_COUNT"
+
+if [ "$FINAL_RESTART_COUNT" -eq "$RESTART_COUNT" ]; then
+    echo "✓ PASS: No additional restarts during forced pod deletion"
+else
+    echo "✗ FAIL: Plugin restarted during forced deletion"
+fi
+```
+
+### 9. Review Error Handling Implementation
+```bash
+echo "=== Recent Plugin Logs (Error Handling Evidence) ==="
+kubectl logs -n kube-system $PLUGIN_POD --since=1m | tail -15
+```
+
+### 10. Cleanup
+```bash
+rm -f /tmp/crash-test-pods.yaml
+echo "Test pods cleaned up"
+```
+
+## Success Criteria
+
+1. **Plugin Stability**: Plugin pod shows 0 restarts throughout the test
+2. **Container Handling**: All test pods created and completed successfully
+3. **Graceful Removal**: Plugin handles container removal without crashing
+4. **Error Resilience**: Any UpdateContainers errors are logged but don't crash plugin
+5. **Shared Pool Updates**: Shared containers receive CPU updates when needed
+6. **Log Evidence**: Plugin logs show container removal activity without panic/crash indicators
+
+## Failure Modes & Debugging
+
+### Plugin Restart During Test (Race Condition Crash)
+```bash
+echo "=== Debugging Race Condition Crash ==="
+# Check previous container logs for crash details
+echo "Previous container logs:"
+kubectl logs -n kube-system $PLUGIN_POD --previous
+
+# Check pod events for restart reasons  
+echo "Pod events and restart details:"
+kubectl describe pod -n kube-system $PLUGIN_POD
+
+# Look for specific error patterns in current logs
+echo "Current plugin logs for error patterns:"
+kubectl logs -n kube-system $PLUGIN_POD --since=5m | grep -E "(panic|fatal|exit|ERROR|WARNING)"
+
+# Check for container removal operations that might have failed
+echo "Container removal and update operations:"
+kubectl logs -n kube-system $PLUGIN_POD --since=5m | grep -E "(Removing|UpdateContainers|container.*removal|race)"
+
+# Check plugin state during crash
+echo "Plugin container state during restart:"
+kubectl get pod -n kube-system $PLUGIN_POD -o yaml | grep -A 10 -B 5 "restartCount"
+```
+
+**Note**: The race condition crash occurs specifically during forced pod deletion with `--grace-period=0 --force` when multiple containers are removed simultaneously. The plugin exits with code 0 (Completed) rather than a typical crash, indicating a clean exit due to unhandled race condition.
+
+### Pods Fail to Create or Complete
+```bash
+# Check pod events
+kubectl describe pods crash-test-integer-1 crash-test-integer-2 crash-test-annotated crash-test-shared
+
+# Check node resource availability
+kubectl describe node $TARGET_NODE | grep -A 10 "Allocated resources"
+
+# Verify plugin is processing pod events
+kubectl logs -n kube-system $PLUGIN_POD --since=2m | grep -E "(Pod sandbox|container|DEBUG)"
+```
+
+## Implementation Details
+
+### Current Fix Status: INSUFFICIENT
+
+The current fix attempts to address crashes by:
+
+1. **Container Validation**: Validates container IDs before UpdateContainers calls
+2. **Error Isolation**: Catches UpdateContainers errors and logs them without propagating  
+3. **Graceful Degradation**: Continues operation even if some container updates fail
+4. **Panic Recovery**: Adds defer/recover blocks to NRI methods
+
+### Issues with Current Implementation:
+
+1. **Race Condition Not Fully Handled**: The fix handles individual container update failures but does not prevent the race condition that occurs during simultaneous forced pod deletion
+2. **State Management Race**: When multiple containers are removed simultaneously with `--grace-period=0`, the plugin's internal state management encounters a race condition
+3. **Clean Exit Issue**: Plugin exits cleanly (code 0) during race condition instead of crashing, but still terminates unexpectedly
+4. **UpdateContainers Timing**: The race occurs in the timing between container removal events and UpdateContainers calls for related containers
+
+### Additional Fix Required:
+
+The current implementation needs enhancement to handle:
+- **Simultaneous container removal operations**
+- **State synchronization during rapid container churn**  
+- **Proper serialization of container update operations**
+- **More robust error handling in state management during forced deletions**
+
+## Related Files
+- `/cmd/weka-cpuset/main.go` - updateContainers() function with error handling
+- `/pkg/state/state.go` - RemoveContainer() function that generates updates
+
+## Notes
+
+### Test Validation Results (Updated):
+
+- **Natural Pod Completion**: ✅ Plugin handles normal pod lifecycle without issues
+- **Basic Container Removal**: ✅ Plugin handles individual container removal operations  
+- **Simultaneous Forced Deletion**: ❌ Plugin crashes during `kubectl delete --grace-period=0 --force` with multiple pods
+- **Race Condition**: ❌ Current fix is insufficient for high-stress container churn scenarios
+
+### Current Fix Limitations:
+
+- The fix handles individual container update failures but does not prevent the race condition
+- Plugin exits cleanly (exit code 0) during race condition, masking the actual crash
+- The race occurs specifically during forced deletion when multiple containers are removed simultaneously
+- State management needs additional synchronization for rapid container churn scenarios
+
+### Required Enhancements:
+
+1. **Enhanced State Synchronization**: Add proper locking/synchronization for concurrent container operations
+2. **Batch Operation Handling**: Improve handling of simultaneous container removal operations
+3. **Timing Mitigation**: Add delays or queuing for rapid-fire container update scenarios
+4. **Better Error Detection**: Detect and handle the specific race condition pattern that causes clean exits
+
+### Test Usage:
+
+- Use this test to validate any additional fixes for the race condition
+- The critical test is step 5b (Forced Pod Deletion Race Condition)  
+- A successful fix should show 0 restarts throughout the entire test sequence

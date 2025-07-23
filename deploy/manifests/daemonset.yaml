@@ -19,6 +19,7 @@ spec:
         app: weka-nri-cpuset
     spec:
       serviceAccountName: weka-nri-cpuset
+      restartPolicy: Always
       hostNetwork: true
       hostPID: true
       securityContext:

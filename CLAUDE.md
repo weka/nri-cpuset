@@ -12,8 +12,6 @@ A Kubernetes NRI (Node Resource Interface) plugin that provides intelligent CPU 
 
 ### Local Development
 ```bash
-# Build binary
-make build
 
 # Run unit tests
 make test
@@ -54,6 +52,7 @@ make clean
    ```
 
 #### Build & Deploy
+Prefer using this scripts instead of `make image` and patching
 ```bash
 # Automated build and deploy to live cluster (uses existing Dockerfile via Makefile)
 ./hack/build-and-deploy.sh --kubeconfig /path/to/kubeconfig
@@ -427,6 +426,9 @@ When analyzing test failures, follow this pattern:
 4. **Root cause analysis** using test-specific debug output
 
 ### Manual Debugging (Fallback)
+
+Whenever creating temporary files - rely on /tmp directory instead of work directory
+Ideally created directory for yourself within /tmp per flow
 
 If artifact collection is not available, use manual debugging:
 

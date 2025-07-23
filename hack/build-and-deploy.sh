@@ -14,10 +14,11 @@ SKIP_BUILD=false
 
 usage() {
     cat << EOF
-Usage: $0 --kubeconfig PATH [options]
+Usage: $0 [--kubeconfig PATH] [options]
 
-Required:
+Kubeconfig (one required):
   --kubeconfig PATH    Path to kubeconfig file
+  KUBECONFIG env var   Will be used if --kubeconfig flag is not provided
 
 Options:
   --registry URL       Docker registry URL (default: images.scalar.dev.weka.io:5002)
@@ -30,11 +31,14 @@ Options:
 Description:
   Build Docker image using existing Dockerfile and deploy weka-cpuset as a DaemonSet.
   Uses unix timestamp as image version for simplicity.
+  
+  If --kubeconfig is not provided, the script will use the KUBECONFIG environment
+  variable. At least one of these must be set.
 
 Examples:
   $0 --kubeconfig ~/kc/operator-demo
   $0 --kubeconfig ~/.kube/config --registry my-registry.com:5000
-  $0 --kubeconfig ~/kc/operator-demo --dry-run --debug
+  KUBECONFIG=~/kc/operator-demo $0 --dry-run --debug
 EOF
     exit 1
 }
@@ -90,8 +94,14 @@ parse_args() {
         esac
     done
 
+    # If no --kubeconfig flag provided, try to use KUBECONFIG environment variable
     if [[ -z "$KUBECONFIG_FILE" ]]; then
-        error "Missing required --kubeconfig argument"
+        if [[ -n "${KUBECONFIG:-}" ]]; then
+            KUBECONFIG_FILE="$KUBECONFIG"
+            debug "Using KUBECONFIG environment variable: $KUBECONFIG_FILE"
+        else
+            error "No kubeconfig specified. Use --kubeconfig flag or set KUBECONFIG environment variable"
+        fi
     fi
 
     if [[ ! -f "$KUBECONFIG_FILE" ]]; then

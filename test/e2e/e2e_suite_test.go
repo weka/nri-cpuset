@@ -45,15 +45,6 @@ func TestE2E(t *testing.T) {
 var _ = BeforeSuite(func() {
 	ctx = context.Background()
 
-	// Initialize test artifact collection system once per test suite execution
-	// Check if artifacts have already been initialized to prevent multiple instances
-	if globalArtifacts == nil {
-		InitializeTestArtifacts()
-		fmt.Printf("Initialized test artifacts collection - Execution ID: %s\n", globalArtifacts.ExecutionID)
-	} else {
-		fmt.Printf("Using existing test artifacts collection - Execution ID: %s\n", globalArtifacts.ExecutionID)
-	}
-
 	// Check if we should preserve resources on failure
 	if os.Getenv("PRESERVE_ON_FAILURE") == "true" {
 		preserveOnFailure = true
@@ -104,6 +95,14 @@ var _ = BeforeSuite(func() {
 	// Create test namespace with proper lifecycle management
 	err = createTestNamespaceWithRetry(testNamespace, 5*time.Minute)
 	Expect(err).ToNot(HaveOccurred(), fmt.Sprintf("Failed to create test namespace %s", testNamespace))
+
+	// Initialize test artifact collection system after kubeClient and testNamespace are ready
+	if globalArtifacts == nil {
+		globalArtifacts = InitializeTestArtifacts(kubeClient, testNamespace)
+		fmt.Printf("Initialized test artifacts collection - Execution ID: %s\n", globalArtifacts.ExecutionID)
+	} else {
+		fmt.Printf("Using existing test artifacts collection - Execution ID: %s\n", globalArtifacts.ExecutionID)
+	}
 
 	// Verify plugin is installed
 	By("Verifying the Weka NRI CPUSet plugin is installed")
@@ -463,7 +462,28 @@ func waitForPluginStateSync() {
 	//
 	// In parallel execution, multiple workers may be creating/deleting pods rapidly
 	// so we need to ensure all events are fully processed before next test starts
-	time.Sleep(5 * time.Second)
+	
+	// Increased wait time for better reliability in parallel execution
+	// Previous 5s was insufficient when multiple workers compete for resources
+	time.Sleep(15 * time.Second)
+	
+	// Additional verification: ensure no pods are in terminating state
+	// This helps prevent race conditions where new tests start before cleanup completes
+	Eventually(func() bool {
+		pods, err := kubeClient.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return false // Continue waiting if we can't check
+		}
+		
+		// Check if any pods are still terminating
+		for _, pod := range pods.Items {
+			if pod.DeletionTimestamp != nil {
+				fmt.Printf("Waiting for pod %s to finish terminating...\n", pod.Name)
+				return false
+			}
+		}
+		return true
+	}, 30 * time.Second, 2 * time.Second).Should(BeTrue(), "All pods should finish terminating before next test")
 }
 
 // createDistributedTestPod creates a pod on the deterministically assigned node

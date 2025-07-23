@@ -52,14 +52,27 @@ type Manager struct {
 	// pendingReallocationPlan stores the plan that needs to be applied after successful updates
 	// This is now instance-based to prevent race conditions between concurrent allocations
 	pendingReallocationPlan []ReallocationPlan
+	
+	// Track containers that are currently being removed to prevent race conditions
+	beingRemoved map[string]bool
 }
 
 func NewManager() *Manager {
 	return &Manager{
-		annotRef: make(map[int]int),
-		intOwner: make(map[int]string),
-		byCID:    make(map[string]*ContainerInfo),
+		annotRef:     make(map[int]int),
+		intOwner:     make(map[int]string),
+		byCID:        make(map[string]*ContainerInfo),
+		beingRemoved: make(map[string]bool),
 	}
+}
+
+// ContainerExists checks if a container exists in the state manager and is not being removed
+func (m *Manager) ContainerExists(containerID string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	_, exists := m.byCID[containerID]
+	isBeingRemoved := m.beingRemoved[containerID]
+	return exists && !isBeingRemoved
 }
 
 type Allocator interface {
@@ -168,14 +181,27 @@ func (m *Manager) AllocateAnnotatedWithReallocation(pod *api.PodSandbox, alloc A
 func (m *Manager) findConflictingIntegerContainers(requestedCPUs []int) map[string]*ContainerInfo {
 	conflicting := make(map[string]*ContainerInfo)
 
+	fmt.Printf("DEBUG: Finding conflicts for requested CPUs %v\n", requestedCPUs)
+	fmt.Printf("DEBUG: Current intOwner map has %d entries\n", len(m.intOwner))
+	for cpu, cid := range m.intOwner {
+		fmt.Printf("DEBUG: intOwner[%d] = %s\n", cpu, safeShortID(cid))
+	}
+
 	for _, cpu := range requestedCPUs {
 		if containerID, exists := m.intOwner[cpu]; exists {
+			fmt.Printf("DEBUG: CPU %d is owned by container %s\n", cpu, safeShortID(containerID))
 			if container := m.byCID[containerID]; container != nil && container.Mode == ModeInteger {
+				fmt.Printf("DEBUG: Container %s has CPUs %v, adding to conflicts\n", safeShortID(containerID), container.CPUs)
 				conflicting[containerID] = container
+			} else {
+				fmt.Printf("DEBUG: Container %s not found in byCID or not integer mode\n", safeShortID(containerID))
 			}
+		} else {
+			fmt.Printf("DEBUG: CPU %d is not owned by any integer container\n", cpu)
 		}
 	}
 
+	fmt.Printf("DEBUG: Found %d conflicting containers\n", len(conflicting))
 	return conflicting
 }
 
@@ -242,10 +268,20 @@ func (m *Manager) executeReallocationPlan(plans []ReallocationPlan, alloc Alloca
 		if container == nil {
 			return nil, fmt.Errorf("container %s not found in state", plan.ContainerID)
 		}
+		// Skip containers that are being removed to prevent race conditions
+		if m.beingRemoved[plan.ContainerID] {
+			fmt.Printf("DEBUG: Skipping reallocation plan for container %s - currently being removed\n", plan.ContainerID)
+			continue
+		}
 	}
 
 	// Create all update requests
 	for _, plan := range plans {
+		// Double-check the container is still valid before creating update
+		if m.beingRemoved[plan.ContainerID] {
+			fmt.Printf("DEBUG: Skipping reallocation update for container %s - currently being removed\n", plan.ContainerID)
+			continue
+		}
 		update := &api.ContainerUpdate{
 			ContainerId: plan.ContainerID,
 			Linux: &api.LinuxContainerUpdate{
@@ -479,6 +515,18 @@ func (m *Manager) Synchronize(pods []*api.PodSandbox, containers []*api.Containe
 
 		// Get current CPU assignment from container's Linux resources
 		var currentCPUs []int
+		
+		// DEBUG: Log what NRI data is available for this container
+		if container.Linux != nil && container.Linux.Resources != nil && container.Linux.Resources.Cpu != nil {
+			fmt.Printf("DEBUG: Container %s NRI CPU data - Cpus: '%s', Quota: %v, Period: %v\n",
+				safeShortID(container.Id),
+				container.Linux.Resources.Cpu.Cpus,
+				container.Linux.Resources.Cpu.Quota,
+				container.Linux.Resources.Cpu.Period)
+		} else {
+			fmt.Printf("DEBUG: Container %s has no NRI CPU resource data\n", safeShortID(container.Id))
+		}
+		
 		if container.Linux != nil && container.Linux.Resources != nil &&
 			container.Linux.Resources.Cpu != nil && container.Linux.Resources.Cpu.Cpus != "" {
 			var err error
@@ -716,6 +764,13 @@ func (m *Manager) RemoveContainer(containerID string, alloc Allocator) ([]*api.C
 	if info == nil {
 		return nil, nil
 	}
+	
+	// Mark container as being removed to prevent race conditions with concurrent updates
+	m.beingRemoved[containerID] = true
+	defer func() {
+		// Clean up the tracking after processing
+		delete(m.beingRemoved, containerID)
+	}()
 
 	// Release reservations
 	switch info.Mode {
@@ -745,6 +800,12 @@ func (m *Manager) RemoveContainer(containerID string, alloc Allocator) ([]*api.C
 	newSharedPool := m.computeSharedPool(alloc.GetOnlineCPUs())
 
 	for _, containerInfo := range m.byCID {
+		// Skip containers that are currently being removed to prevent race conditions
+		if m.beingRemoved[containerInfo.ID] {
+			fmt.Printf("DEBUG: Skipping update for container %s - currently being removed\n", containerInfo.ID)
+			continue
+		}
+		
 		if containerInfo.Mode == ModeShared && len(newSharedPool) > 0 {
 			update := &api.ContainerUpdate{
 				ContainerId: containerInfo.ID,

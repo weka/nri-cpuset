@@ -1,0 +1,103 @@
+# Manual Test: Invalid CPU Annotation Handling
+
+## Problem Analysis Results
+**PLUGIN BEHAVIOR IS CORRECT** - Investigation revealed that the plugin properly rejects containers with invalid CPU annotations and returns errors that cause CreateContainerError status.
+
+## Current Behavior (CORRECT)
+- Plugin logs: "Warning: Skipping annotated container ... due to invalid CPU annotation '999'"
+- Plugin returns error from NRI CreateContainer hook
+- Container fails with CreateContainerError status
+- Pod shows: Status=Pending, Container State=Waiting, Reason=CreateContainerError
+
+## Issue Identified
+The problem was with **E2E test parallel execution timing**, not plugin functionality:
+1. 5-second plugin state sync wait was insufficient for busy clusters
+2. Multiple parallel workers caused resource contention
+3. Insufficient cleanup verification between tests
+4. Individual tests PASS when run alone, but FAIL in parallel execution
+
+## Fixes Applied
+1. Increased plugin state sync wait from 5s to 15s
+2. Added verification that all pods finish terminating before next test
+3. Improved cleanup robustness with better timing
+
+## Test Steps
+
+### 1. Create test namespace
+```bash
+kubectl create namespace manual-test-invalid-annotation
+```
+
+### 2. Create pod with invalid CPU annotation
+```bash
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: invalid-annotation-pod
+  namespace: manual-test-invalid-annotation
+  annotations:
+    weka.io/cores-ids: "999"
+spec:
+  containers:
+  - name: test-container
+    image: busybox:1.35
+    command: ["sh", "-c", "echo 'Should not start!' && sleep infinity"]
+  nodeSelector:
+    kubernetes.io/hostname: h4-4-a
+EOF
+```
+
+### 3. Monitor pod status (should fail, not run)
+```bash
+# Check pod status - should show CreateContainerError or similar failure
+kubectl get pod invalid-annotation-pod -n manual-test-invalid-annotation -o wide
+
+# Check container status details - should show failure reason
+kubectl describe pod invalid-annotation-pod -n manual-test-invalid-annotation
+
+# Monitor plugin logs during creation - should show rejection, not just warning
+kubectl logs -n kube-system -l app=weka-nri-cpuset --since=2m | grep -E "(999|invalid|annotation|error)"
+```
+
+### 4. Test with malformed annotation
+```bash
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: malformed-annotation-pod
+  namespace: manual-test-invalid-annotation
+  annotations:
+    weka.io/cores-ids: "not-a-number"
+spec:
+  containers:
+  - name: test-container
+    image: busybox:1.35
+    command: ["sh", "-c", "echo 'Should not start!' && sleep infinity"]
+  nodeSelector:
+    kubernetes.io/hostname: h4-4-a
+EOF
+```
+
+### 5. Verify expected failures
+Both pods should:
+- NOT reach Running state
+- Show CreateContainerError in container status
+- Have failure reason related to CPU annotation validation
+
+### 6. Cleanup
+```bash
+kubectl delete namespace manual-test-invalid-annotation
+```
+
+## Success Criteria
+- Pods with invalid CPU annotations (999, non-numeric) must fail to start
+- Container status should show CreateContainerError with meaningful message
+- Plugin should reject container creation, not just log warnings
+- No containers should successfully start with invalid annotations
+
+## Expected Plugin Changes Needed
+- Change from logging warning + allowing fallback to shared pool
+- To: Return error from NRI hook that prevents container creation
+- Ensure proper error propagation to Kubernetes container status

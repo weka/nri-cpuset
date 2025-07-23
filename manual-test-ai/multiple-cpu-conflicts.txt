@@ -1,0 +1,275 @@
+# Multiple CPU Conflicts Manual Test
+
+Tests the "should handle multiple conflicting CPUs correctly" scenario from the E2E test that was failing with a timeout.
+
+## Test Scenario
+1. Create an integer pod with 4 CPUs 
+2. Create an annotated pod that conflicts with 2 of those CPUs
+3. Verify live reallocation moves the integer pod away from ALL conflicting CPUs
+4. Verify annotated pod gets exactly the CPUs it requested
+
+## Prerequisites
+- KUBECONFIG set to cluster with NRI-enabled containerd
+- Weka NRI CPUSet plugin deployed and running
+- At least 6-8 CPU cores available on target node
+
+## Test Steps
+
+### 1. Environment Setup
+```bash
+kubectl create namespace manual-multi-conflict --dry-run=client -o yaml | kubectl apply -f -
+export TEST_NS=manual-multi-conflict
+```
+
+### 2. Create Integer Pod with 4 CPUs
+```yaml
+# integer-4cpu-pod.yaml  
+apiVersion: v1
+kind: Pod
+metadata:
+  name: integer-4cpu-test
+  namespace: manual-multi-conflict
+spec:
+  containers:
+  - name: test-container
+    image: busybox:latest
+    command: ["sleep", "3600"]
+    resources:
+      requests:
+        cpu: "4"        # Integer value - requires exclusive CPUs
+        memory: "200Mi"
+      limits:
+        cpu: "4"        # Must equal requests for integer classification
+        memory: "200Mi"
+  restartPolicy: Never
+```
+
+```bash
+kubectl apply -f integer-4cpu-pod.yaml
+kubectl wait --for=condition=Ready pod/integer-4cpu-test -n $TEST_NS --timeout=60s
+```
+
+**Expected**: Pod gets 4 exclusive CPUs, preferably sibling cores
+
+### 3. Get Integer Pod's CPU Assignment
+```bash
+echo "=== Integer Pod Initial CPU Assignment ==="
+kubectl exec -n $TEST_NS integer-4cpu-test -- cat /proc/1/status | grep Cpus_allowed_list
+```
+
+**Example Output**: `Cpus_allowed_list: 0,2,4,6` or `Cpus_allowed_list: 0-3`
+
+### 4. Extract Conflicting CPUs for Annotation
+```bash
+# Extract CPU assignment and parse first 2 CPUs for conflict
+CPUS=$(kubectl exec -n $TEST_NS integer-4cpu-test -- cat /proc/1/status | grep Cpus_allowed_list | cut -d: -f2 | tr -d ' ')
+echo "Integer pod has CPUs: $CPUS"
+
+# Parse CPUs and extract first 2 for conflict
+if echo "$CPUS" | grep -q ","; then
+    # Comma-separated format like "0,2,4,6"
+    CONFLICT_CPUS=$(echo "$CPUS" | cut -d, -f1,2)
+elif echo "$CPUS" | grep -q "-"; then
+    # Range format like "0-3" 
+    START=$(echo "$CPUS" | cut -d- -f1)
+    NEXT=$((START + 1))
+    CONFLICT_CPUS="$START,$NEXT"
+else
+    # Single CPU - use just that one
+    CONFLICT_CPUS="$CPUS"
+fi
+
+echo "Will create annotated pod requesting conflicting CPUs: $CONFLICT_CPUS"
+```
+
+### 5. Create Annotated Pod with Conflicting CPUs
+```bash
+# Create annotated pod YAML with discovered conflicting CPUs
+cat > annotated-conflict-pod.yaml << EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: annotated-conflict-test
+  namespace: manual-multi-conflict
+  annotations:
+    weka.io/cores-ids: "$CONFLICT_CPUS"
+spec:
+  containers:
+  - name: test-container
+    image: busybox:latest
+    command: ["sleep", "3600"]
+    resources:
+      requests:
+        cpu: "100m"     # Fractional - shared classification
+        memory: "128Mi"
+      limits:
+        cpu: "200m"     # Different from requests
+        memory: "256Mi"
+  restartPolicy: Never
+EOF
+
+kubectl apply -f annotated-conflict-pod.yaml
+```
+
+### 6. Monitor Plugin Logs During Conflict Resolution
+```bash
+echo "=== Monitoring Plugin Logs for Conflict Resolution ==="
+kubectl logs -n kube-system -l app=weka-nri-cpuset -f --since=30s &
+LOG_PID=$!
+
+# Wait for annotated pod to be ready 
+kubectl wait --for=condition=Ready pod/annotated-conflict-test -n $TEST_NS --timeout=120s
+WAIT_RESULT=$?
+
+# Stop log monitoring
+kill $LOG_PID 2>/dev/null || true
+
+if [ $WAIT_RESULT -ne 0 ]; then
+    echo "ERROR: Annotated pod failed to become ready within timeout"
+    kubectl describe pod annotated-conflict-test -n $TEST_NS
+    exit 1
+fi
+```
+
+**Expected Logs**: Should show conflict detection and reallocation activity
+
+### 7. Verify Final CPU Assignments
+
+#### Check Annotated Pod Got Requested CPUs
+```bash
+echo "=== Annotated Pod Final CPU Assignment ==="
+ANNOTATED_CPUS=$(kubectl exec -n $TEST_NS annotated-conflict-test -- cat /proc/1/status | grep Cpus_allowed_list | cut -d: -f2 | tr -d ' ')
+echo "Annotated pod CPUs: $ANNOTATED_CPUS"
+echo "Requested CPUs: $CONFLICT_CPUS"
+
+# Verify each requested CPU is present
+SUCCESS=true
+IFS=',' read -ra REQUESTED <<< "$CONFLICT_CPUS"
+for cpu in "${REQUESTED[@]}"; do
+    if ! echo "$ANNOTATED_CPUS" | grep -qE "(^|,)$cpu(,|$)"; then
+        echo "ERROR: Annotated pod missing requested CPU $cpu"
+        SUCCESS=false
+    fi
+done
+
+if [ "$SUCCESS" = true ]; then
+    echo "✓ PASS: Annotated pod has all requested CPUs"
+else
+    echo "✗ FAIL: Annotated pod missing some requested CPUs"
+fi
+```
+
+#### Check Integer Pod Was Reallocated Away From Conflicts
+```bash
+echo "=== Integer Pod Final CPU Assignment ==="
+FINAL_INTEGER_CPUS=$(kubectl exec -n $TEST_NS integer-4cpu-test -- cat /proc/1/status | grep Cpus_allowed_list | cut -d: -f2 | tr -d ' ')
+echo "Integer pod final CPUs: $FINAL_INTEGER_CPUS"
+echo "Original conflicting CPUs: $CONFLICT_CPUS"
+
+# Verify no overlap with conflicting CPUs
+REALLOC_SUCCESS=true
+IFS=',' read -ra CONFLICTS <<< "$CONFLICT_CPUS"
+for cpu in "${CONFLICTS[@]}"; do
+    if echo "$FINAL_INTEGER_CPUS" | grep -qE "(^|,)$cpu(,|$)"; then
+        echo "ERROR: Integer pod still has conflicting CPU $cpu"
+        REALLOC_SUCCESS=false
+    fi
+done
+
+if [ "$REALLOC_SUCCESS" = true ]; then
+    echo "✓ PASS: Integer pod reallocated away from all conflicting CPUs"
+else
+    echo "✗ FAIL: Integer pod still has conflicting CPUs"
+fi
+```
+
+#### Verify Integer Pod Still Has 4 CPUs
+```bash
+echo "=== Integer Pod CPU Count Verification ==="
+CPU_COUNT=$(echo "$FINAL_INTEGER_CPUS" | tr ',' '\n' | wc -l)
+if echo "$FINAL_INTEGER_CPUS" | grep -q "-"; then
+    # Handle range format
+    START=$(echo "$FINAL_INTEGER_CPUS" | cut -d- -f1)
+    END=$(echo "$FINAL_INTEGER_CPUS" | cut -d- -f2)
+    CPU_COUNT=$((END - START + 1))
+fi
+
+echo "Integer pod has $CPU_COUNT CPUs (expected: 4)"
+if [ "$CPU_COUNT" -eq 4 ]; then
+    echo "✓ PASS: Integer pod maintained 4 CPU allocation"
+else
+    echo "✗ FAIL: Integer pod lost CPUs during reallocation"
+fi
+```
+
+### 8. Plugin Health and Logs Analysis
+```bash
+echo "=== Plugin Health Check ==="
+kubectl get pods -n kube-system -l app=weka-nri-cpuset -o wide
+
+echo "=== Recent Plugin Logs (Conflict Resolution) ==="
+kubectl logs -n kube-system -l app=weka-nri-cpuset --since=3m | \
+  grep -E "(conflict|reallocation|update)" -i | \
+  head -20
+
+echo "=== Reallocation Summary ==="
+kubectl logs -n kube-system -l app=weka-nri-cpuset --since=3m | \
+  grep -c "Conflicts detected" | \
+  xargs -I {} echo "Conflict events detected: {}"
+
+kubectl logs -n kube-system -l app=weka-nri-cpuset --since=3m | \
+  grep -c "container updates" | \
+  xargs -I {} echo "Container update operations: {}"
+```
+
+### 9. Troubleshooting Commands
+
+If the test fails, use these commands for debugging:
+
+```bash
+# Check pod statuses
+kubectl get pods -n $TEST_NS -o wide
+
+# Describe pods for events
+kubectl describe pods -n $TEST_NS
+
+# Get detailed plugin logs
+kubectl logs -n kube-system -l app=weka-nri-cpuset --since=5m
+
+# Check for plugin errors
+kubectl logs -n kube-system -l app=weka-nri-cpuset --since=5m | grep -i error
+
+# Check node CPU capacity
+kubectl describe nodes | grep -E "(Name:|cpu:|Capacity:|Allocatable:)" -A1
+```
+
+## Success Criteria
+
+1. **Integer Pod Creation**: Pod gets 4 exclusive CPUs initially
+2. **Conflict Detection**: Plugin logs show CPU conflicts when annotated pod is created  
+3. **Live Reallocation**: Integer pod is moved to different CPUs without restart
+4. **Annotation Compliance**: Annotated pod gets exactly the CPUs specified in weka.io/cores-ids
+5. **No CPU Overlap**: Final CPU assignments have no conflicts between pods
+6. **CPU Count Preservation**: Integer pod maintains 4 CPU allocation after reallocation
+7. **Plugin Stability**: Plugin remains healthy throughout the process
+
+## Cleanup
+```bash
+kubectl delete namespace manual-multi-conflict
+rm -f integer-4cpu-pod.yaml annotated-conflict-pod.yaml
+```
+
+## Notes
+
+- This test validates the core live reallocation functionality when multiple CPUs conflict
+- The annotated pod should get priority and force reallocation of the integer pod
+- Reallocation should be atomic - no intermediate states where pods have wrong CPUs
+- The test adapts to actual CPU assignments rather than assuming specific CPU numbers
+- Timeout in original E2E test suggests plugin may have issues with multi-CPU conflicts
+
+## Common Failure Modes
+
+1. **Annotated pod timeout**: Plugin not handling multi-CPU conflicts properly
+2. **Incomplete reallocation**: Integer pod keeps some conflicting CPUs
+3. **Plugin crash**: Error handling issues during complex reallocation
+4. **Resource exhaustion**: Not enough free CPUs for reallocation

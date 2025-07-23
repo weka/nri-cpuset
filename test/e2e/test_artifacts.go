@@ -27,15 +27,15 @@ type TestArtifacts struct {
 var globalArtifacts *TestArtifacts
 
 // InitializeTestArtifacts creates the artifacts collection system
-func InitializeTestArtifacts() *TestArtifacts {
+func InitializeTestArtifacts(client kubernetes.Interface, namespace string) *TestArtifacts {
 	executionID := generateExecutionID()
 	baseDir := filepath.Join(".test-reports", executionID)
 
 	artifacts := &TestArtifacts{
 		ExecutionID:   executionID,
 		BaseDir:       baseDir,
-		kubeClient:    kubeClient,
-		testNamespace: testNamespace,
+		kubeClient:    client,
+		testNamespace: namespace,
 	}
 
 	// Create base directory structure
