@@ -1,6 +1,7 @@
 package allocator
 
 import (
+	"fmt"
 	"sort"
 	"testing"
 
@@ -16,6 +17,7 @@ type NumaInterface interface {
 	GetNodes() []int
 	GetCPUNode(cpu int) (int, bool)
 	GetCPUNodesUnion(cpus []int) []int
+	ParseAndValidateCPUList(cpuList string) ([]int, error)
 }
 
 func TestAllocator(t *testing.T) {
@@ -72,6 +74,39 @@ func (m *MockNumaManager) GetCPUNodesUnion(cpus []int) []int {
 	return nodes
 }
 
+// ParseAndValidateCPUList parses a CPU list and validates against mock online CPUs
+func (m *MockNumaManager) ParseAndValidateCPUList(cpuList string) ([]int, error) {
+	// Use the numa package's ParseCPUList for parsing
+	cpus, err := numa.ParseCPUList(cpuList)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(cpus) == 0 {
+		return cpus, nil
+	}
+
+	// Build online CPU set for efficient lookup
+	onlineSet := make(map[int]struct{})
+	for _, cpu := range m.onlineCPUs {
+		onlineSet[cpu] = struct{}{}
+	}
+
+	// Validate all CPUs are online
+	var invalidCPUs []int
+	for _, cpu := range cpus {
+		if _, isOnline := onlineSet[cpu]; !isOnline {
+			invalidCPUs = append(invalidCPUs, cpu)
+		}
+	}
+
+	if len(invalidCPUs) > 0 {
+		return nil, fmt.Errorf("CPU(s) not online: %v (valid range: %s)", invalidCPUs, numa.FormatCPUList(m.onlineCPUs))
+	}
+
+	return cpus, nil
+}
+
 // TestCPUAllocator extends CPUAllocator for testing with mock NUMA manager
 type TestCPUAllocator struct {
 	*CPUAllocator
@@ -96,6 +131,36 @@ func (t *TestCPUAllocator) getSingleNUMANode(cpus []int) (int, bool) {
 	}
 
 	return firstNode, true
+}
+
+// Override handleAnnotatedContainer to use mock NUMA manager for validation
+func (t *TestCPUAllocator) handleAnnotatedContainer(pod *api.PodSandbox, reserved []int) (*AllocationResult, error) {
+	if pod.Annotations == nil {
+		return nil, fmt.Errorf("missing annotations for annotated container")
+	}
+
+	cpuList, exists := pod.Annotations[WekaAnnotation]
+	if !exists {
+		return nil, fmt.Errorf("missing %s annotation", WekaAnnotation)
+	}
+
+	// Use mock NUMA manager for validation instead of real one
+	cpus, err := t.mockNuma.ParseAndValidateCPUList(cpuList)
+	if err != nil {
+		return nil, fmt.Errorf("invalid CPU list in annotation '%s': %w", cpuList, err)
+	}
+
+	// Determine NUMA nodes for memory placement using mock
+	memNodes := t.mockNuma.GetCPUNodesUnion(cpus)
+	if singleNode, isSingleNode := t.getSingleNUMANode(cpus); isSingleNode {
+		memNodes = []int{singleNode}
+	}
+
+	return &AllocationResult{
+		CPUs:     cpus,
+		MemNodes: memNodes,
+		Mode:     "annotated",
+	}, nil
 }
 
 var _ = Describe("CPUAllocator", func() {

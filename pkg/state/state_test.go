@@ -780,8 +780,11 @@ var _ = Describe("Advanced State Synchronization", func() {
 			Expect(info.Mode).To(Equal(ModeAnnotated))
 			Expect(info.CPUs).To(Equal([]int{0, 1}))
 
-			// Bad container should be skipped
-			Expect(manager.byCID).ToNot(HaveKey("bad-container"))
+			// Bad container should be tracked as invalid for debugging
+			Expect(manager.byCID).To(HaveKey("bad-container"))
+			badInfo := manager.byCID["bad-container"]
+			Expect(badInfo.Mode).To(Equal("invalid-annotated"))
+			Expect(badInfo.CPUs).To(BeNil())
 
 			Expect(updates).ToNot(BeNil())
 		})

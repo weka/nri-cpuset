@@ -229,8 +229,17 @@ func ParseCPUList(cpuList string) ([]int, error) {
 				return nil, fmt.Errorf("invalid end CPU in range %s: %w", part, err)
 			}
 
+			if start < 0 || end < 0 {
+				return nil, fmt.Errorf("invalid CPU range %s: negative CPU IDs not allowed", part)
+			}
+
 			if start > end {
 				return nil, fmt.Errorf("invalid CPU range %s: start > end", part)
+			}
+
+			// More flexible sanity check for CPU numbers - allow up to 16384 CPUs for large systems
+			if start > 16384 || end > 16384 {
+				return nil, fmt.Errorf("invalid CPU range %s: CPU IDs above 16384 not supported", part)
 			}
 
 			for cpu := start; cpu <= end; cpu++ {
@@ -242,8 +251,50 @@ func ParseCPUList(cpuList string) ([]int, error) {
 			if err != nil {
 				return nil, fmt.Errorf("invalid CPU number %s: %w", part, err)
 			}
+
+			if cpu < 0 {
+				return nil, fmt.Errorf("invalid CPU number %d: negative CPU IDs not allowed", cpu)
+			}
+
+			// More flexible sanity check for CPU numbers - allow up to 16384 CPUs for large systems
+			if cpu > 16384 {
+				return nil, fmt.Errorf("invalid CPU number %d: CPU IDs above 16384 not supported", cpu)
+			}
+
 			cpus = append(cpus, cpu)
 		}
+	}
+
+	return cpus, nil
+}
+
+// ParseAndValidateCPUList parses a CPU list string and validates all CPUs are online
+func (m *Manager) ParseAndValidateCPUList(cpuList string) ([]int, error) {
+	cpus, err := ParseCPUList(cpuList)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(cpus) == 0 {
+		return cpus, nil
+	}
+
+	// Build online CPU set for efficient lookup
+	onlineSet := make(map[int]struct{})
+	for _, cpu := range m.onlineCPUs {
+		onlineSet[cpu] = struct{}{}
+	}
+
+	// Validate all CPUs are online
+	var invalidCPUs []int
+	for _, cpu := range cpus {
+		if _, isOnline := onlineSet[cpu]; !isOnline {
+			invalidCPUs = append(invalidCPUs, cpu)
+		}
+	}
+
+	if len(invalidCPUs) > 0 {
+		return nil, fmt.Errorf("CPU(s) not online: %v (valid range: %s)", invalidCPUs, FormatCPUList(m.onlineCPUs))
 	}
 
 	return cpus, nil

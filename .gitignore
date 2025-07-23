@@ -5,3 +5,5 @@ vendor
 .idea
 bin/
 .test-reports/
+test-results*
+test/e2e/e2e.test

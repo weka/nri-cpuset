@@ -94,11 +94,11 @@ var _ = Describe("Live CPU Reallocation Features", Label("e2e", "parallel"), fun
 				}
 			}
 			Expect(conflictCPU).ToNot(BeEmpty(), "Should be able to extract a CPU from integer pod allocation")
-			
+
 			// Log the initial state for debugging
 			GinkgoWriter.Printf("Integer pod CPU allocation: %s\n", integerCPUs)
 			GinkgoWriter.Printf("Will create annotated pod requesting CPU: %s\n", conflictCPU)
-			
+
 			// Add debug info for artifact collection
 			AddDebugInfo(fmt.Sprintf("Integer pod %s initial CPU allocation: %s", createdIntegerPod.Name, integerCPUs))
 			AddDebugInfo(fmt.Sprintf("Creating annotated pod requesting conflicting CPU: %s", conflictCPU))
@@ -129,7 +129,7 @@ var _ = Describe("Live CPU Reallocation Features", Label("e2e", "parallel"), fun
 					GinkgoWriter.Printf("Error getting CPU set for integer pod: %v\n", err)
 					return false
 				}
-				
+
 				// The integer pod should still be running but with different CPUs
 				// It should have 2 CPUs total but not include the conflicting CPU
 				lines := strings.Split(output, "\n")
@@ -139,10 +139,10 @@ var _ = Describe("Live CPU Reallocation Features", Label("e2e", "parallel"), fun
 						if len(parts) > 1 {
 							currentCPUs := parts[1]
 							GinkgoWriter.Printf("Integer pod current CPUs: %s, conflict CPU: %s\n", currentCPUs, conflictCPU)
-							
+
 							// Add debug info for artifact collection
 							AddDebugInfo(fmt.Sprintf("Integer pod %s current CPUs: %s, checking for conflict with: %s", createdIntegerPod.Name, currentCPUs, conflictCPU))
-							
+
 							// Should not contain the conflicting CPU
 							doesNotContainConflict := !strings.Contains(currentCPUs, conflictCPU)
 							if doesNotContainConflict {
@@ -194,7 +194,7 @@ var _ = Describe("Live CPU Reallocation Features", Label("e2e", "parallel"), fun
 			// Parse the first two CPUs from the integer pod's allocation
 			var conflictCPUs []string
 			AddDebugInfo(fmt.Sprintf("Integer pod CPU output: %s", integerCPUs))
-			
+
 			if strings.Contains(integerCPUs, "Cpus_allowed_list:") {
 				lines := strings.Split(integerCPUs, "\n")
 				for _, line := range lines {
@@ -203,7 +203,7 @@ var _ = Describe("Live CPU Reallocation Features", Label("e2e", "parallel"), fun
 						if len(parts) > 1 {
 							cpuList := parts[1]
 							AddDebugInfo(fmt.Sprintf("Parsed CPU list: %s", cpuList))
-							
+
 							// Parse CPU list and take first two CPUs
 							if strings.Contains(cpuList, ",") {
 								allCPUs := strings.Split(cpuList, ",")
@@ -228,12 +228,12 @@ var _ = Describe("Live CPU Reallocation Features", Label("e2e", "parallel"), fun
 					}
 				}
 			}
-			
+
 			AddDebugInfo(fmt.Sprintf("Extracted conflict CPUs: %v", conflictCPUs))
-			
+
 			// Ensure we got CPU allocation - this should always work
 			Expect(len(conflictCPUs)).To(BeNumerically(">", 0), "Should be able to extract CPU allocation from integer pod")
-			
+
 			// Use at least one CPU for conflict (adapt to available CPUs)
 			if len(conflictCPUs) >= 2 {
 				conflictCPUs = conflictCPUs[:2] // Use first two
@@ -272,7 +272,7 @@ var _ = Describe("Live CPU Reallocation Features", Label("e2e", "parallel"), fun
 				if err != nil {
 					return false
 				}
-				
+
 				// Should not contain any of the conflicting CPUs
 				for _, cpu := range conflictCPUs {
 					if strings.Contains(output, cpu) {
@@ -280,7 +280,7 @@ var _ = Describe("Live CPU Reallocation Features", Label("e2e", "parallel"), fun
 						return false
 					}
 				}
-				
+
 				AddDebugInfo("SUCCESS: Integer pod reallocated away from all conflicting CPUs")
 				return true
 			}, timeout, interval).Should(BeTrue(), "Integer pod should be reallocated away from all conflicting CPUs")
@@ -325,7 +325,7 @@ var _ = Describe("Live CPU Reallocation Features", Label("e2e", "parallel"), fun
 				if err != nil {
 					continue
 				}
-				
+
 				lines := strings.Split(output, "\n")
 				for _, line := range lines {
 					if strings.Contains(line, "Cpus_allowed_list:") {
@@ -343,7 +343,7 @@ var _ = Describe("Live CPU Reallocation Features", Label("e2e", "parallel"), fun
 			// Request a large number of CPUs that are already allocated to integers
 			// This should force reallocation that's impossible due to insufficient free CPUs
 			conflictingCPUs := strings.Join(allocatedCPUs[:min(len(allocatedCPUs), 8)], ",") // Request up to 8 conflicting CPUs
-			
+
 			conflictPod := createTestPod("impossible-annotated", map[string]string{
 				"weka.io/cores-ids": conflictingCPUs,
 			}, nil)
@@ -362,9 +362,9 @@ var _ = Describe("Live CPU Reallocation Features", Label("e2e", "parallel"), fun
 				for _, containerStatus := range updatedPod.Status.ContainerStatuses {
 					if containerStatus.State.Waiting != nil {
 						if strings.Contains(containerStatus.State.Waiting.Reason, "CreateContainerError") ||
-						   strings.Contains(containerStatus.State.Waiting.Message, "cannot reallocate") ||
-						   strings.Contains(containerStatus.State.Waiting.Message, "insufficient") {
-							AddDebugInfo(fmt.Sprintf("SUCCESS: Annotated pod correctly failed due to impossible reallocation: %s - %s", 
+							strings.Contains(containerStatus.State.Waiting.Message, "cannot reallocate") ||
+							strings.Contains(containerStatus.State.Waiting.Message, "insufficient") {
+							AddDebugInfo(fmt.Sprintf("SUCCESS: Annotated pod correctly failed due to impossible reallocation: %s - %s",
 								containerStatus.State.Waiting.Reason, containerStatus.State.Waiting.Message))
 							return true
 						}
@@ -374,8 +374,8 @@ var _ = Describe("Live CPU Reallocation Features", Label("e2e", "parallel"), fun
 				// Check pod conditions for scheduling failures
 				for _, condition := range updatedPod.Status.Conditions {
 					if condition.Type == corev1.PodScheduled && condition.Status == corev1.ConditionFalse {
-						if strings.Contains(condition.Message, "insufficient") || 
-						   strings.Contains(condition.Message, "resource") {
+						if strings.Contains(condition.Message, "insufficient") ||
+							strings.Contains(condition.Message, "resource") {
 							AddDebugInfo(fmt.Sprintf("SUCCESS: Annotated pod correctly failed to schedule: %s", condition.Message))
 							return true
 						}
@@ -434,7 +434,7 @@ var _ = Describe("Live CPU Reallocation Features", Label("e2e", "parallel"), fun
 				}
 			}
 			Expect(cpuList).ToNot(BeEmpty(), "Should have CPU allocation")
-			
+
 			// Parse the CPU list
 			cpuListParsed := strings.Split(cpuList, ",")
 			Expect(len(cpuListParsed)).To(Equal(2), "Should have exactly 2 CPUs allocated")
@@ -444,14 +444,14 @@ var _ = Describe("Live CPU Reallocation Features", Label("e2e", "parallel"), fun
 			if len(cpuListParsed) == 2 {
 				cpu1, err1 := strconv.Atoi(cpuListParsed[0])
 				cpu2, err2 := strconv.Atoi(cpuListParsed[1])
-				
+
 				if err1 == nil && err2 == nil {
 					// Check if they form a sibling pair
 					// In our topology: CPU X and CPU (X+32) are siblings for X < 32
 					// Or CPU X and CPU (X-32) are siblings for X >= 32
-					areSiblings := (cpu1 < 32 && cpu2 == cpu1+32) || (cpu1 >= 32 && cpu2 == cpu1-32) || 
-								 (cpu2 < 32 && cpu1 == cpu2+32) || (cpu2 >= 32 && cpu1 == cpu2-32)
-					
+					areSiblings := (cpu1 < 32 && cpu2 == cpu1+32) || (cpu1 >= 32 && cpu2 == cpu1-32) ||
+						(cpu2 < 32 && cpu1 == cpu2+32) || (cpu2 >= 32 && cpu1 == cpu2-32)
+
 					if areSiblings {
 						AddDebugInfo(fmt.Sprintf("SUCCESS: Sibling cores allocated - CPUs %d and %d are siblings", cpu1, cpu2))
 					} else {
@@ -483,13 +483,13 @@ var _ = Describe("Live CPU Reallocation Features", Label("e2e", "parallel"), fun
 			waitForPodRunning(createdFirstPod.Name)
 
 			By("Getting the CPU allocated to the first pod")
-			var firstPodCPU int = -1
+			firstPodCPU := -1
 			Eventually(func() bool {
 				output, err := getPodCPUSet(createdFirstPod.Name)
 				if err != nil {
 					return false
 				}
-				
+
 				lines := strings.Split(output, "\n")
 				for _, line := range lines {
 					if strings.Contains(line, "Cpus_allowed_list:") {
@@ -526,13 +526,13 @@ var _ = Describe("Live CPU Reallocation Features", Label("e2e", "parallel"), fun
 			waitForPodRunning(createdSecondPod.Name)
 
 			By("Verifying second pod gets the sibling of the first pod's CPU")
-			var secondPodCPU int = -1
+			secondPodCPU := -1
 			Eventually(func() bool {
 				output, err := getPodCPUSet(createdSecondPod.Name)
 				if err != nil {
 					return false
 				}
-				
+
 				lines := strings.Split(output, "\n")
 				for _, line := range lines {
 					if strings.Contains(line, "Cpus_allowed_list:") {
@@ -685,7 +685,7 @@ var _ = Describe("Live CPU Reallocation Features", Label("e2e", "parallel"), fun
 			By("Creating annotated pod that conflicts with all integer CPUs (should fail)")
 			// Request all the CPUs that integer pods are using
 			conflictingCPUs := strings.Join(allocatedCPUs[:min(len(allocatedCPUs), 4)], ",") // Request up to 4 conflicting CPUs
-			
+
 			conflictPod := createTestPod("conflict-annotated", map[string]string{
 				"weka.io/cores-ids": conflictingCPUs,
 			}, nil)
@@ -714,9 +714,9 @@ var _ = Describe("Live CPU Reallocation Features", Label("e2e", "parallel"), fun
 				for _, containerStatus := range updatedPod.Status.ContainerStatuses {
 					if containerStatus.State.Waiting != nil {
 						if strings.Contains(containerStatus.State.Waiting.Reason, "CreateContainerError") ||
-						   strings.Contains(containerStatus.State.Waiting.Message, "CPU") ||
-						   strings.Contains(containerStatus.State.Waiting.Message, "insufficient") {
-							AddDebugInfo(fmt.Sprintf("Pod correctly failed with resource error: %s - %s", 
+							strings.Contains(containerStatus.State.Waiting.Message, "CPU") ||
+							strings.Contains(containerStatus.State.Waiting.Message, "insufficient") {
+							AddDebugInfo(fmt.Sprintf("Pod correctly failed with resource error: %s - %s",
 								containerStatus.State.Waiting.Reason, containerStatus.State.Waiting.Message))
 							return true
 						}
@@ -747,7 +747,7 @@ var _ = Describe("Live CPU Reallocation Features", Label("e2e", "parallel"), fun
 		It("should handle invalid CPU annotations gracefully", func() {
 			By("Creating pod with invalid CPU annotation - non-existent CPU")
 			invalidPod := createTestPod("invalid-annotation-test", map[string]string{
-				"weka.io/cores-ids": "999",  // Assuming this CPU doesn't exist
+				"weka.io/cores-ids": "999", // Assuming this CPU doesn't exist
 			}, nil)
 
 			createdPod, err := kubeClient.CoreV1().Pods(testNamespace).Create(ctx, invalidPod, metav1.CreateOptions{})
@@ -765,9 +765,9 @@ var _ = Describe("Live CPU Reallocation Features", Label("e2e", "parallel"), fun
 					if containerStatus.State.Waiting != nil {
 						// Look for error related to CPU allocation
 						if strings.Contains(containerStatus.State.Waiting.Reason, "CreateContainerError") ||
-						   strings.Contains(containerStatus.State.Waiting.Message, "cpu") ||
-						   strings.Contains(containerStatus.State.Waiting.Message, "CPU") {
-							AddDebugInfo(fmt.Sprintf("Pod correctly failed with CPU-related error: %s - %s", 
+							strings.Contains(containerStatus.State.Waiting.Message, "cpu") ||
+							strings.Contains(containerStatus.State.Waiting.Message, "CPU") {
+							AddDebugInfo(fmt.Sprintf("Pod correctly failed with CPU-related error: %s - %s",
 								containerStatus.State.Waiting.Reason, containerStatus.State.Waiting.Message))
 							return true
 						}
@@ -800,11 +800,11 @@ var _ = Describe("Live CPU Reallocation Features", Label("e2e", "parallel"), fun
 
 				// Check for container creation errors or failed status
 				for _, containerStatus := range updatedPod.Status.ContainerStatuses {
-					if containerStatus.State.Waiting != nil && 
-					   (strings.Contains(containerStatus.State.Waiting.Reason, "CreateContainerError") ||
-					    strings.Contains(containerStatus.State.Waiting.Message, "annotation") ||
-					    strings.Contains(containerStatus.State.Waiting.Message, "parse")) {
-						AddDebugInfo(fmt.Sprintf("Pod correctly failed with annotation parsing error: %s - %s", 
+					if containerStatus.State.Waiting != nil &&
+						(strings.Contains(containerStatus.State.Waiting.Reason, "CreateContainerError") ||
+							strings.Contains(containerStatus.State.Waiting.Message, "annotation") ||
+							strings.Contains(containerStatus.State.Waiting.Message, "parse")) {
+						AddDebugInfo(fmt.Sprintf("Pod correctly failed with annotation parsing error: %s - %s",
 							containerStatus.State.Waiting.Reason, containerStatus.State.Waiting.Message))
 						return true
 					}

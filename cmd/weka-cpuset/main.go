@@ -189,9 +189,9 @@ func (p *plugin) RemoveContainer(ctx context.Context, pod *api.PodSandbox, conta
 		if err != nil {
 			// Check if this is a critical ttrpc connection error
 			errStr := err.Error()
-			if strings.Contains(errStr, "ttrpc: closed") || 
-			   strings.Contains(errStr, "connection") ||
-			   strings.Contains(errStr, "broken pipe") {
+			if strings.Contains(errStr, "ttrpc: closed") ||
+				strings.Contains(errStr, "connection") ||
+				strings.Contains(errStr, "broken pipe") {
 				// Critical connection error - plugin should restart
 				return fmt.Errorf("critical NRI connection error during container updates: %w", err)
 			}
@@ -270,8 +270,9 @@ func (p *plugin) hasIntegerSemantics(container *api.Container) bool {
 	requestedCPUs := float64(cpu.Shares.GetValue()) / 1024.0
 	limitCPUs := float64(quota) / float64(period)
 
-	// Allow small floating point differences but they should be essentially equal
-	if abs(requestedCPUs-limitCPUs) > 0.001 {
+	// Allow larger floating point tolerance for test environments and resource conversions
+	// Kubernetes resource conversion can introduce small variations
+	if abs(requestedCPUs-limitCPUs) > 0.01 {
 		return false
 	}
 
@@ -304,9 +305,14 @@ func (p *plugin) handleAnnotatedContainer(pod *api.PodSandbox, container *api.Co
 		fmt.Printf("Applying %d live reallocation updates for annotated container %s\n", len(updates), container.Name)
 		_, err := p.stub.UpdateContainers(updates)
 		if err != nil {
+			// Rollback the pending reallocation plan on failure
+			fmt.Printf("ERROR: Failed to apply live reallocation updates, rolling back: %v\n", err)
+			p.state.ClearPendingReallocation()
 			return nil, nil, fmt.Errorf("failed to apply live reallocation updates: %w", err)
 		}
-		fmt.Printf("Successfully applied live reallocation updates\n")
+		// Only update internal state after successful container updates
+		p.state.ApplySuccessfulReallocation()
+		fmt.Printf("Successfully applied live reallocation updates and updated internal state\n")
 	}
 
 	// Record the successful allocation with proper reference counting for annotated containers

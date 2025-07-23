@@ -7,7 +7,7 @@ KUBECONFIG=${KUBECONFIG:-"$HOME/.kube/config"}
 TEST_NS=${TEST_NS:-wekaplugin-e2e}
 PLUGIN_IMAGE=${PLUGIN_IMAGE:-weka/nri-cpuset:latest}
 TEST_TIMEOUT=${TEST_TIMEOUT:-30m}
-TEST_PARALLEL=${TEST_PARALLEL:-16}
+TEST_PARALLEL=${TEST_PARALLEL:-8}
 PRESERVE_ON_FAILURE=${PRESERVE_ON_FAILURE:-true}
 CONTINUE_ON_FAILURE=${CONTINUE_ON_FAILURE:-false}
 
@@ -186,6 +186,14 @@ run_tests() {
     echo "- Resource preservation on failure: $PRESERVE_ON_FAILURE"
     echo "==============================================================================="
     
+    # Optimize parallel execution based on available nodes
+    local node_count
+    node_count=$(kubectl get nodes --no-headers | wc -l)
+    local optimal_parallel
+    optimal_parallel=$(( node_count > TEST_PARALLEL ? TEST_PARALLEL : node_count ))
+    
+    log_info "Cluster has $node_count nodes, using $optimal_parallel parallel workers (max: $TEST_PARALLEL)"
+    
     # Run tests with verbose and progress output
     local test_result=0
     cd "$(dirname "$0")/.."  # Ensure we're in the project root
@@ -196,7 +204,7 @@ run_tests() {
         ginkgo -r \
             --timeout="$TEST_TIMEOUT" \
             --label-filter="parallel" \
-            --procs="$TEST_PARALLEL" \
+            --procs="$optimal_parallel" \
             -v \
             --show-node-events \
             --json-report=test-results-parallel.json \
@@ -223,7 +231,7 @@ run_tests() {
             -timeout="$TEST_TIMEOUT" \
             -v \
             -ginkgo.label-filter="e2e" \
-            -ginkgo.procs="$TEST_PARALLEL" \
+            -ginkgo.procs="$optimal_parallel" \
             -ginkgo.show-node-events \
             -ginkgo.json-report=test-results.json \
             -ginkgo.junit-report=test-results.xml || test_result=$?

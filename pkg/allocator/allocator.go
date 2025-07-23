@@ -355,21 +355,9 @@ func (a *CPUAllocator) handleAnnotatedContainer(pod *api.PodSandbox, reserved []
 		return nil, fmt.Errorf("missing %s annotation", WekaAnnotation)
 	}
 
-	cpus, err := numa.ParseCPUList(cpuList)
+	cpus, err := a.numa.ParseAndValidateCPUList(cpuList)
 	if err != nil {
 		return nil, fmt.Errorf("invalid CPU list in annotation '%s': %w", cpuList, err)
-	}
-
-	// Validate CPUs are online
-	onlineSet := make(map[int]struct{})
-	for _, cpu := range a.onlineCPUs {
-		onlineSet[cpu] = struct{}{}
-	}
-
-	for _, cpu := range cpus {
-		if _, isOnline := onlineSet[cpu]; !isOnline {
-			return nil, fmt.Errorf("CPU %d is not online", cpu)
-		}
 	}
 
 	// Check for conflicts with reserved CPUs
@@ -411,21 +399,9 @@ func (a *CPUAllocator) HandleAnnotatedContainerWithIntegerConflictCheck(pod *api
 		return nil, fmt.Errorf("missing %s annotation", WekaAnnotation)
 	}
 
-	cpus, err := numa.ParseCPUList(cpuList)
+	cpus, err := a.numa.ParseAndValidateCPUList(cpuList)
 	if err != nil {
 		return nil, fmt.Errorf("invalid CPU list in annotation '%s': %w", cpuList, err)
-	}
-
-	// Validate CPUs are online
-	onlineSet := make(map[int]struct{})
-	for _, cpu := range a.onlineCPUs {
-		onlineSet[cpu] = struct{}{}
-	}
-
-	for _, cpu := range cpus {
-		if _, isOnline := onlineSet[cpu]; !isOnline {
-			return nil, fmt.Errorf("CPU %d is not online", cpu)
-		}
 	}
 
 	// Check for conflicts with integer-reserved CPUs only

@@ -331,11 +331,11 @@ KUBECONFIG=/path/to/kubeconfig kubectl logs -n kube-system -l app=weka-nri-cpuse
 
 ### Automated Test Reporting
 
-E2E tests automatically generate comprehensive failure reports in `.test-reports/` with unique execution IDs for systematic debugging.
+E2E tests automatically generate comprehensive failure reports in `test/e2e/.test-reports/` with unique execution IDs for systematic debugging.
 
 #### Test Execution Structure
 ```
-.test-reports/
+test/e2e/.test-reports/
 └── 20240722-143052-a1b2c3d4/          # Execution ID (timestamp + UUID)
     ├── execution-summary.md            # Main overview and analysis workflow
     ├── test-failures-index.md          # List of all failed tests
@@ -375,16 +375,16 @@ E2E tests automatically generate comprehensive failure reports in `.test-reports
 
 ```bash
 # List all test executions
-ls -la .test-reports/
+ls -la test/e2e/.test-reports/
 
 # Quick failure overview for specific execution
-cat .test-reports/[execution-id]/test-failures-index.md
+cat test/e2e/.test-reports/[execution-id]/test-failures-index.md
 
 # Detailed analysis of specific failure
-cat .test-reports/[execution-id]/failures/[test-name]/summary.md
+cat test/e2e/.test-reports/[execution-id]/failures/[test-name]/summary.md
 
 # Review plugin behavior for failure
-cat .test-reports/[execution-id]/failures/[test-name]/plugin-logs.txt
+cat test/e2e/.test-reports/[execution-id]/failures/[test-name]/plugin-logs.txt
 ```
 
 #### LLM Analysis Patterns
@@ -420,13 +420,13 @@ KUBECONFIG=/path/to/kubeconfig kubectl get events -n wekaplugin-e2e-w1 --sort-by
 ## Troubleshooting Quick Reference
 1. **Build fails**: Check Go version and dependencies with `go mod tidy`
 2. **Deploy fails**: Verify Docker registry access and kubectl connectivity
-3. **Tests fail**: Check cluster has sufficient CPU resources and NRI support; review `.test-reports/` for detailed failure analysis
+3. **Tests fail**: Check cluster has sufficient CPU resources and NRI support; review `test/e2e/.test-reports/` for detailed failure analysis
 4. **Plugin not loading**: Verify containerd NRI configuration and binary placement
 5. **Malformed annotations**: Check CPU list syntax (fixed in recent updates)
 6. **KUBECONFIG issues**: Verify path exists and kubectl can connect to cluster
 7. **Plugin behavior issues**: Use debug logging and plugin logs to diagnose (see debugging commands above)
 8. **Test timing issues**: Clean test namespace between runs and add explicit waits where needed
-9. **Sporadic failures**: Use test artifact reports in `.test-reports/` for systematic analysis
+9. **Sporadic failures**: Use test artifact reports in `test/e2e/.test-reports/` for systematic analysis
 
 ## Implementation Notes
 

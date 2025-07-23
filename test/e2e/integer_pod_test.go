@@ -415,7 +415,7 @@ var _ = Describe("Integer Pod NUMA Memory Placement", Label("e2e", "parallel"), 
 			By("Creating integer pod that should get exclusive CPUs")
 			resources := &corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{
-					corev1.ResourceCPU:    resource.MustParse("4"), // Request multiple CPUs 
+					corev1.ResourceCPU:    resource.MustParse("4"), // Request multiple CPUs
 					corev1.ResourceMemory: resource.MustParse("4Gi"),
 				},
 				Limits: corev1.ResourceList{
@@ -438,7 +438,7 @@ var _ = Describe("Integer Pod NUMA Memory Placement", Label("e2e", "parallel"), 
 					return false
 				}
 
-				// Should have exclusive CPU allocation and flexible memory access 
+				// Should have exclusive CPU allocation and flexible memory access
 				return strings.Contains(output, "Cpus_allowed_list:") &&
 					strings.Contains(output, "Mems_allowed_list:")
 			}, timeout, interval).Should(BeTrue(), "Integer pods should have exclusive CPU allocation with flexible memory access")
