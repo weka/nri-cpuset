@@ -2,12 +2,21 @@ package state
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/containerd/nri/pkg/api"
 	"github.com/weka/nri-cpuset/pkg/allocator"
 	"github.com/weka/nri-cpuset/pkg/numa"
 )
+
+// safeShortID safely truncates a container ID to 12 characters for logging
+func safeShortID(id string) string {
+	if len(id) <= 12 {
+		return id
+	}
+	return id[:12]
+}
 
 const (
 	WekaAnnotation = "weka.io/cores-ids"
@@ -85,7 +94,7 @@ func (m *Manager) AllocateAnnotatedWithReallocation(pod *api.PodSandbox, alloc A
 	fmt.Printf("DEBUG: Current integer containers in state: %d\n", len(m.intOwner))
 	for cpu, containerID := range m.intOwner {
 		if container := m.byCID[containerID]; container != nil {
-			fmt.Printf("DEBUG: Integer container %s owns CPU %d (has CPUs %v)\n", containerID[:12], cpu, container.CPUs)
+			fmt.Printf("DEBUG: Integer container %s owns CPU %d (has CPUs %v)\n", safeShortID(containerID), cpu, container.CPUs)
 		}
 	}
 	result, err := alloc.HandleAnnotatedContainerWithIntegerConflictCheck(pod, integerReserved)
@@ -93,6 +102,15 @@ func (m *Manager) AllocateAnnotatedWithReallocation(pod *api.PodSandbox, alloc A
 		// No conflicts, proceed normally
 		fmt.Printf("DEBUG: No conflicts detected for annotated pod %s/%s\n", pod.Namespace, pod.Name)
 		return m.createAnnotatedAdjustment(result), nil, nil
+	}
+
+	// Check if this is a validation error (invalid CPU annotation) rather than a conflict
+	if strings.Contains(err.Error(), "invalid CPU list") || 
+	   strings.Contains(err.Error(), "not online") ||
+	   strings.Contains(err.Error(), "missing") {
+		// Invalid annotation - cannot be fixed with reallocation, fail immediately
+		fmt.Printf("DEBUG: Invalid CPU annotation for annotated pod %s/%s: %v\n", pod.Namespace, pod.Name, err)
+		return nil, nil, err
 	}
 
 	// Conflicts detected, attempt live reallocation
@@ -334,6 +352,12 @@ func (m *Manager) Synchronize(pods []*api.PodSandbox, containers []*api.Containe
 	var sharedContainers []*api.Container
 
 	for _, container := range containers {
+		// Add safety checks to prevent panics
+		if container == nil || container.PodSandboxId == "" {
+			fmt.Printf("Warning: Skipping nil container or container with empty PodSandboxId\n")
+			continue
+		}
+		
 		pod := m.findPod(pods, container.PodSandboxId)
 		if pod == nil {
 			continue
@@ -347,6 +371,8 @@ func (m *Manager) Synchronize(pods []*api.PodSandbox, containers []*api.Containe
 			integerContainers = append(integerContainers, container)
 		case "shared":
 			sharedContainers = append(sharedContainers, container)
+		default:
+			fmt.Printf("Warning: Unknown container mode '%s' for container %s\n", mode, safeShortID(container.Id))
 		}
 	}
 
@@ -431,11 +457,7 @@ func (m *Manager) Synchronize(pods []*api.PodSandbox, containers []*api.Containe
 			}
 
 			updates = append(updates, update)
-			containerShortID := container.Id
-			if len(containerShortID) > 12 {
-				containerShortID = containerShortID[:12]
-			}
-			fmt.Printf("DEBUG: Adding CPU restriction update for annotated container %s: %v\n", containerShortID, result.CPUs)
+			fmt.Printf("DEBUG: Adding CPU restriction update for annotated container %s: %v\n", safeShortID(container.Id), result.CPUs)
 		}
 	}
 
@@ -618,11 +640,7 @@ func (m *Manager) Synchronize(pods []*api.PodSandbox, containers []*api.Containe
 				},
 			}
 			updates = append(updates, update)
-			containerShortID := container.Id
-			if len(containerShortID) > 12 {
-				containerShortID = containerShortID[:12]
-			}
-			fmt.Printf("DEBUG: Adding CPU restriction update for integer container %s: %v\n", containerShortID, currentCPUs)
+			fmt.Printf("DEBUG: Adding CPU restriction update for integer container %s: %v\n", safeShortID(container.Id), currentCPUs)
 		}
 	}
 

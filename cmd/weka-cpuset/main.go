@@ -138,10 +138,18 @@ func (p *plugin) Configure(ctx context.Context, config, runtime, version string)
 	return p.mask, nil
 }
 
-func (p *plugin) Synchronize(ctx context.Context, pods []*api.PodSandbox, containers []*api.Container) ([]*api.ContainerUpdate, error) {
+func (p *plugin) Synchronize(ctx context.Context, pods []*api.PodSandbox, containers []*api.Container) (updates []*api.ContainerUpdate, err error) {
+	// Add panic recovery to prevent plugin crashes
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic during synchronization: %v", r)
+			fmt.Printf("ERROR: Plugin panic caught during synchronization: %v\n", r)
+		}
+	}()
+
 	fmt.Printf("Synchronizing state with %d pods and %d containers\n", len(pods), len(containers))
 
-	updates, err := p.state.Synchronize(pods, containers, p.allocator)
+	updates, err = p.state.Synchronize(pods, containers, p.allocator)
 	if err != nil {
 		return nil, fmt.Errorf("synchronization failed: %w", err)
 	}
@@ -154,7 +162,17 @@ func (p *plugin) RunPodSandbox(ctx context.Context, pod *api.PodSandbox) error {
 	return nil
 }
 
-func (p *plugin) CreateContainer(ctx context.Context, pod *api.PodSandbox, container *api.Container) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
+func (p *plugin) CreateContainer(ctx context.Context, pod *api.PodSandbox, container *api.Container) (adjustment *api.ContainerAdjustment, updates []*api.ContainerUpdate, err error) {
+	// Add panic recovery to prevent plugin crashes
+	defer func() {
+		if r := recover(); r != nil {
+			adjustment = nil
+			updates = nil
+			err = fmt.Errorf("panic during container creation: %v", r)
+			fmt.Printf("ERROR: Plugin panic caught during container creation for %s/%s: %v\n", pod.Namespace, pod.Name, r)
+		}
+	}()
+
 	modeStr := p.determineContainerMode(pod, container)
 
 	switch modeStr {
@@ -169,12 +187,29 @@ func (p *plugin) CreateContainer(ctx context.Context, pod *api.PodSandbox, conta
 	}
 }
 
-func (p *plugin) UpdateContainer(ctx context.Context, pod *api.PodSandbox, container *api.Container, r *api.LinuxResources) ([]*api.ContainerUpdate, error) {
+func (p *plugin) UpdateContainer(ctx context.Context, pod *api.PodSandbox, container *api.Container, r *api.LinuxResources) (updates []*api.ContainerUpdate, err error) {
+	// Add panic recovery to prevent plugin crashes
+	defer func() {
+		if r := recover(); r != nil {
+			updates = nil
+			err = fmt.Errorf("panic during container update: %v", r)
+			fmt.Printf("ERROR: Plugin panic caught during container update for %s/%s: %v\n", pod.Namespace, pod.Name, r)
+		}
+	}()
+
 	fmt.Printf("Updating container %s in pod %s/%s\n", container.Name, pod.Namespace, pod.Name)
 	return nil, nil
 }
 
-func (p *plugin) RemoveContainer(ctx context.Context, pod *api.PodSandbox, container *api.Container) error {
+func (p *plugin) RemoveContainer(ctx context.Context, pod *api.PodSandbox, container *api.Container) (err error) {
+	// Add panic recovery to prevent plugin crashes
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic during container removal: %v", r)
+			fmt.Printf("ERROR: Plugin panic caught during container removal for %s/%s: %v\n", pod.Namespace, pod.Name, r)
+		}
+	}()
+
 	fmt.Printf("Removing container %s from pod %s/%s\n", container.Name, pod.Namespace, pod.Name)
 
 	// Release resources and trigger shared pool update
@@ -357,7 +392,15 @@ func isConnectionError(err error) bool {
 }
 
 // updateContainersWithRetry attempts to update containers with exponential backoff retry
-func (p *plugin) updateContainersWithRetry(updates []*api.ContainerUpdate, operation string) error {
+func (p *plugin) updateContainersWithRetry(updates []*api.ContainerUpdate, operation string) (err error) {
+	// Add panic recovery to prevent plugin crashes
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic during %s: %v", operation, r)
+			fmt.Printf("ERROR: Plugin panic caught during %s: %v\n", operation, r)
+		}
+	}()
+
 	if len(updates) == 0 {
 		return nil
 	}
@@ -367,6 +410,11 @@ func (p *plugin) updateContainersWithRetry(updates []*api.ContainerUpdate, opera
 	
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		fmt.Printf("Attempting to apply %d %s updates (attempt %d/%d)\n", len(updates), operation, attempt+1, maxRetries)
+		
+		// Add additional safety check for stub
+		if p.stub == nil {
+			return fmt.Errorf("%s update failed: NRI stub is nil", operation)
+		}
 		
 		_, err := p.stub.UpdateContainers(updates)
 		if err == nil {
