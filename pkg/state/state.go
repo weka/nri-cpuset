@@ -548,26 +548,61 @@ func (m *Manager) Synchronize(pods []*api.PodSandbox, containers []*api.Containe
 
 		m.byCID[container.Id] = info
 
-		// Update integer ownership - resolve conflicts with annotated containers
+		// Check for conflicts with annotated containers and reallocate if needed
 		var conflictFreeCPUs []int
+		var hasConflicts bool
+		
 		for _, cpu := range currentCPUs {
 			if _, hasAnnotated := m.annotRef[cpu]; hasAnnotated {
-				fmt.Printf("WARNING: CPU %d conflict detected - assigned to both integer container %s and annotated containers during sync\n", cpu, container.Id)
-				// Per PRD: annotated containers have priority, integer containers should be reallocated
-				// During sync, we'll exclude this CPU from integer container assignment
+				hasConflicts = true
+				fmt.Printf("WARNING: CPU %d conflict detected - integer container %s conflicts with annotated containers during sync\n", cpu, container.Id)
 			} else {
-				m.intOwner[cpu] = container.Id
 				conflictFreeCPUs = append(conflictFreeCPUs, cpu)
 			}
 		}
 
-		// If we have conflicts, update the container info to reflect only non-conflicting CPUs
-		if len(conflictFreeCPUs) != len(currentCPUs) {
-			fmt.Printf("DEBUG: Integer container %s had %d CPU conflicts, now assigned %d CPUs: %v\n", 
-				container.Id, len(currentCPUs)-len(conflictFreeCPUs), len(conflictFreeCPUs), conflictFreeCPUs)
-			info.CPUs = conflictFreeCPUs
-			currentCPUs = conflictFreeCPUs // Update for the container update below
+		// If we have conflicts, REALLOCATE the integer container to available CPUs
+		var finalCPUs []int
+		if hasConflicts {
+			fmt.Printf("DEBUG: Integer container %s has %d CPU conflicts, attempting reallocation during sync\n", 
+				container.Id, len(currentCPUs)-len(conflictFreeCPUs))
+			
+			// Build reserved CPU list for reallocation (annotated + other integer containers)
+			reserved := make([]int, 0)
+			for cpu := range m.annotRef {
+				reserved = append(reserved, cpu)
+			}
+			for cpu := range m.intOwner {
+				if m.intOwner[cpu] != container.Id { // Don't count our own CPUs as reserved
+					reserved = append(reserved, cpu)
+				}
+			}
+			
+			// Attempt reallocation using the allocator
+			newCPUs, _, err := alloc.AllocateContainerCPUs(pod, container, reserved)
+			if err != nil {
+				// Reallocation failed - this is a critical error during sync
+				fmt.Printf("ERROR: Failed to reallocate integer container %s during sync: %v\n", container.Id, err)
+				// Use only non-conflicting CPUs as fallback (may be empty)
+				finalCPUs = conflictFreeCPUs
+			} else {
+				finalCPUs = newCPUs
+				fmt.Printf("DEBUG: Successfully reallocated integer container %s from %v to %v during sync\n", 
+					container.Id, currentCPUs, finalCPUs)
+			}
+		} else {
+			// No conflicts, use original CPUs
+			finalCPUs = currentCPUs
 		}
+
+		// Update integer ownership mapping for the final CPU assignment
+		for _, cpu := range finalCPUs {
+			m.intOwner[cpu] = container.Id
+		}
+
+		// Update container info with final CPU assignment
+		info.CPUs = finalCPUs
+		currentCPUs = finalCPUs // Update for the container update below
 
 		// Create container update to apply CPU restrictions during synchronization
 		// This ensures containers discovered during sync get proper CPU assignments

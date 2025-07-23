@@ -7,6 +7,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/containerd/nri/pkg/api"
 	"github.com/containerd/nri/pkg/stub"
@@ -182,21 +183,12 @@ func (p *plugin) RemoveContainer(ctx context.Context, pod *api.PodSandbox, conta
 		return fmt.Errorf("container removal failed: %w", err)
 	}
 
-	// Apply updates to shared containers via UpdateContainers call
+	// Apply updates to shared containers via UpdateContainers call with retry
 	if len(updates) > 0 {
-		fmt.Printf("Applying %d updates to shared containers\n", len(updates))
-		_, err := p.stub.UpdateContainers(updates)
+		err := p.updateContainersWithRetry(updates, "container removal")
 		if err != nil {
-			// Check if this is a critical ttrpc connection error
-			errStr := err.Error()
-			if strings.Contains(errStr, "ttrpc: closed") ||
-				strings.Contains(errStr, "connection") ||
-				strings.Contains(errStr, "broken pipe") {
-				// Critical connection error - plugin should restart
-				return fmt.Errorf("critical NRI connection error during container updates: %w", err)
-			}
-			// Non-critical error, log warning and continue
-			fmt.Printf("Warning: Failed to update containers: %v\n", err)
+			// Log warning but continue - don't crash the plugin
+			fmt.Printf("Warning: Failed to update containers after removal: %v\n", err)
 		}
 	}
 
@@ -303,7 +295,7 @@ func (p *plugin) handleAnnotatedContainer(pod *api.PodSandbox, container *api.Co
 	// Apply live reallocation updates immediately if any were generated
 	if len(updates) > 0 {
 		fmt.Printf("Applying %d live reallocation updates for annotated container %s\n", len(updates), container.Name)
-		_, err := p.stub.UpdateContainers(updates)
+		err := p.updateContainersWithRetry(updates, "live reallocation")
 		if err != nil {
 			// Rollback the pending reallocation plan on failure
 			fmt.Printf("ERROR: Failed to apply live reallocation updates, rolling back: %v\n", err)
@@ -350,4 +342,56 @@ func (p *plugin) handleSharedContainer(pod *api.PodSandbox, container *api.Conta
 	// For shared containers, get all reserved CPUs (both annotated and integer)
 	reserved := p.state.GetReservedCPUs()
 	return p.allocator.AllocateContainer(pod, container, reserved)
+}
+
+// isConnectionError checks if the error is a connection-related error that might be temporary
+func isConnectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "ttrpc: closed") ||
+		strings.Contains(errStr, "connection") ||
+		strings.Contains(errStr, "broken pipe") ||
+		strings.Contains(errStr, "EOF")
+}
+
+// updateContainersWithRetry attempts to update containers with exponential backoff retry
+func (p *plugin) updateContainersWithRetry(updates []*api.ContainerUpdate, operation string) error {
+	if len(updates) == 0 {
+		return nil
+	}
+
+	maxRetries := 3
+	baseDelay := 50 * time.Millisecond
+	
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		fmt.Printf("Attempting to apply %d %s updates (attempt %d/%d)\n", len(updates), operation, attempt+1, maxRetries)
+		
+		_, err := p.stub.UpdateContainers(updates)
+		if err == nil {
+			if attempt > 0 {
+				fmt.Printf("Successfully applied %s updates after %d retries\n", operation, attempt)
+			}
+			return nil
+		}
+
+		if !isConnectionError(err) {
+			// Non-connection error, don't retry
+			return fmt.Errorf("%s update failed: %w", operation, err)
+		}
+
+		if attempt == maxRetries-1 {
+			// Last attempt failed
+			fmt.Printf("ERROR: Failed to apply %s updates after %d attempts: %v\n", operation, maxRetries, err)
+			return fmt.Errorf("%s update failed after %d retries: %w", operation, maxRetries, err)
+		}
+
+		// Wait before retrying with exponential backoff
+		delay := time.Duration(float64(baseDelay) * (1.5 * float64(attempt+1)))
+		fmt.Printf("Connection error during %s updates, retrying in %v: %v\n", operation, delay, err)
+		time.Sleep(delay)
+	}
+
+	return nil // Should never reach here
 }
