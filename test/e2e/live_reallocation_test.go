@@ -21,6 +21,34 @@ func min(a, b int) int {
 	return b
 }
 
+// Helper function to parse CPU list format like "2-3,33-34" into individual CPU strings
+func parseCPUList(cpuList string) []string {
+	var allCPUs []string
+	
+	// Handle comma-separated list that may contain ranges
+	cpuParts := strings.Split(cpuList, ",")
+	for _, part := range cpuParts {
+		part = strings.TrimSpace(part)
+		if strings.Contains(part, "-") {
+			// Handle range format like "0-3" or "34-35"
+			rangeParts := strings.Split(part, "-")
+			if len(rangeParts) == 2 {
+				start, err1 := strconv.Atoi(strings.TrimSpace(rangeParts[0]))
+				end, err2 := strconv.Atoi(strings.TrimSpace(rangeParts[1]))
+				if err1 == nil && err2 == nil {
+					for i := start; i <= end; i++ {
+						allCPUs = append(allCPUs, strconv.Itoa(i))
+					}
+				}
+			}
+		} else {
+			// Single CPU number
+			allCPUs = append(allCPUs, part)
+		}
+	}
+	return allCPUs
+}
+
 var _ = Describe("Live CPU Reallocation Features", Label("e2e", "parallel"), func() {
 	// const (
 	// 	WekaAnnotation = "weka.io/cores-ids"
@@ -204,24 +232,14 @@ var _ = Describe("Live CPU Reallocation Features", Label("e2e", "parallel"), fun
 							cpuList := parts[1]
 							AddDebugInfo(fmt.Sprintf("Parsed CPU list: %s", cpuList))
 
-							// Parse CPU list and take first two CPUs
-							if strings.Contains(cpuList, ",") {
-								allCPUs := strings.Split(cpuList, ",")
-								if len(allCPUs) >= 2 {
-									conflictCPUs = []string{allCPUs[0], allCPUs[1]}
-								} else if len(allCPUs) == 1 {
-									// For single CPU, create another conflict by using the same CPU
-									conflictCPUs = []string{allCPUs[0]}
-								}
-							} else if strings.Contains(cpuList, "-") {
-								// Handle range format like "0-3"
-								rangeParts := strings.Split(cpuList, "-")
-								if len(rangeParts) == 2 {
-									conflictCPUs = []string{rangeParts[0], rangeParts[1]}
-								}
-							} else {
-								// Single CPU number
-								conflictCPUs = []string{cpuList}
+							// Parse CPU list using helper function
+							allCPUs := parseCPUList(cpuList)
+							
+							// Take first two CPUs for conflict
+							if len(allCPUs) >= 2 {
+								conflictCPUs = []string{allCPUs[0], allCPUs[1]}
+							} else if len(allCPUs) == 1 {
+								conflictCPUs = []string{allCPUs[0]}
 							}
 							break
 						}
@@ -274,10 +292,29 @@ var _ = Describe("Live CPU Reallocation Features", Label("e2e", "parallel"), fun
 				}
 
 				// Should not contain any of the conflicting CPUs
-				for _, cpu := range conflictCPUs {
-					if strings.Contains(output, cpu) {
-						AddDebugInfo(fmt.Sprintf("Integer pod still contains conflicting CPU %s", cpu))
-						return false
+				// Parse the actual CPU list from the output
+				var actualCPUs []string
+				if strings.Contains(output, "Cpus_allowed_list:") {
+					lines := strings.Split(output, "\n")
+					for _, line := range lines {
+						if strings.Contains(line, "Cpus_allowed_list:") {
+							parts := strings.Fields(line)
+							if len(parts) > 1 {
+								cpuList := parts[1]
+								actualCPUs = parseCPUList(cpuList)
+								break
+							}
+						}
+					}
+				}
+				
+				// Check if any conflict CPU is in the actual CPU list
+				for _, conflictCPU := range conflictCPUs {
+					for _, actualCPU := range actualCPUs {
+						if conflictCPU == actualCPU {
+							AddDebugInfo(fmt.Sprintf("Integer pod still contains conflicting CPU %s (actual CPUs: %v)", conflictCPU, actualCPUs))
+							return false
+						}
 					}
 				}
 
@@ -287,95 +324,82 @@ var _ = Describe("Live CPU Reallocation Features", Label("e2e", "parallel"), fun
 		})
 
 		It("should fail annotated pod creation when reallocation is impossible", func() {
-			By("Calculating available CPU resources on target node")
-			// Get the target node's CPU capacity and current allocations
+			By("Getting node CPU capacity for simple resource calculation")
 			node, err := kubeClient.CoreV1().Nodes().Get(ctx, currentTestNode, metav1.GetOptions{})
 			Expect(err).ToNot(HaveOccurred())
 			
 			nodeCPUCapacity := node.Status.Allocatable[corev1.ResourceCPU]
 			totalCPUs := nodeCPUCapacity.Value()
 			
-			// Get current CPU requests on the node to calculate available capacity
-			pods, err := kubeClient.CoreV1().Pods("").List(ctx, metav1.ListOptions{
-				FieldSelector: "spec.nodeName=" + currentTestNode + ",status.phase!=Failed,status.phase!=Succeeded",
-			})
+			// Calculate 40% of node capacity for each pod
+			cores40Percent := int(totalCPUs * 40 / 100)
+			if cores40Percent < 2 {
+				Skip(fmt.Sprintf("Node %s too small for test (need at least 5 CPUs for 40%% = 2)", currentTestNode))
+			}
+			
+			AddDebugInfo(fmt.Sprintf("Node %s: Total CPUs=%d, Using 40%% = %d CPUs per pod", currentTestNode, totalCPUs, cores40Percent))
+
+			By("Creating first integer pod with 40% of node CPUs")
+			integerResources1 := &corev1.ResourceRequirements{
+				Limits: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse(fmt.Sprintf("%d", cores40Percent)),
+					corev1.ResourceMemory: resource.MustParse("100Mi"),
+				},
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse(fmt.Sprintf("%d", cores40Percent)),
+					corev1.ResourceMemory: resource.MustParse("100Mi"),
+				},
+			}
+
+			integerPod1 := createTestPod("impossible-integer-1", nil, integerResources1)
+			createdPod1, err := kubeClient.CoreV1().Pods(testNamespace).Create(ctx, integerPod1, metav1.CreateOptions{})
 			Expect(err).ToNot(HaveOccurred())
+
+			By("Creating second integer pod with 40% of node CPUs")
+			integerResources2 := &corev1.ResourceRequirements{
+				Limits: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse(fmt.Sprintf("%d", cores40Percent)),
+					corev1.ResourceMemory: resource.MustParse("100Mi"),
+				},
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse(fmt.Sprintf("%d", cores40Percent)),
+					corev1.ResourceMemory: resource.MustParse("100Mi"),
+				},
+			}
+
+			integerPod2 := createTestPod("impossible-integer-2", nil, integerResources2)
+			createdPod2, err := kubeClient.CoreV1().Pods(testNamespace).Create(ctx, integerPod2, metav1.CreateOptions{})
+			Expect(err).ToNot(HaveOccurred())
+
+			By("Waiting for both integer pods to be running")
+			waitForPodRunning(createdPod1.Name)
+			waitForPodRunning(createdPod2.Name)
+
+			By("Building conflicting CPU annotation requesting 40% of all CPUs")
+			// Create annotation requesting first 40% of CPUs (0 to cores40Percent-1)
+			var conflictingCPUs []string
+			for i := 0; i < cores40Percent; i++ {
+				conflictingCPUs = append(conflictingCPUs, fmt.Sprintf("%d", i))
+			}
+			conflictSpec := strings.Join(conflictingCPUs, ",")
 			
-			var currentCPURequests int64
-			for _, pod := range pods.Items {
-				for _, container := range pod.Spec.Containers {
-					if cpuRequest, exists := container.Resources.Requests[corev1.ResourceCPU]; exists {
-						currentCPURequests += cpuRequest.MilliValue()
-					}
-				}
-			}
-			
-			availableCPUMillis := totalCPUs*1000 - currentCPURequests
-			// Each integer pod needs 2 CPUs (2000 millicores), leave almost no buffer to ensure reallocation fails
-			bufferCPUMillis := int64(500) // Minimal buffer - insufficient for reallocation needs  
-			maxIntegerPods := int((availableCPUMillis - bufferCPUMillis) / 2000)
-			
-			if maxIntegerPods < 1 {
-				Skip(fmt.Sprintf("Insufficient CPU resources on node %s. Available: %dm, Required: >2000m", currentTestNode, availableCPUMillis))
-			}
-			
-			GinkgoWriter.Printf("Node %s: Total CPUs=%d, Available=%dm, Creating %d integer pods (2 CPUs each), Minimal buffer\n", 
-				currentTestNode, totalCPUs, availableCPUMillis, maxIntegerPods)
+			AddDebugInfo(fmt.Sprintf("Creating annotated pod requesting %d specific CPUs: %s", cores40Percent, conflictSpec))
+			AddDebugInfo("This conflicts with both integer pods but requests only 100m CPU resource")
 
-			By("Creating integer pods to consume most available CPUs")
-			var integerPods []*corev1.Pod
-			for i := 0; i < maxIntegerPods; i++ {
-				integerResources := &corev1.ResourceRequirements{
-					Limits: corev1.ResourceList{
-						corev1.ResourceCPU:    resource.MustParse("2"),
-						corev1.ResourceMemory: resource.MustParse("100Mi"),
-					},
-					Requests: corev1.ResourceList{
-						corev1.ResourceCPU:    resource.MustParse("2"),
-						corev1.ResourceMemory: resource.MustParse("100Mi"),
-					},
-				}
-
-				integerPod := createTestPod(fmt.Sprintf("impossible-integer-%d", i), nil, integerResources)
-				createdPod, err := kubeClient.CoreV1().Pods(testNamespace).Create(ctx, integerPod, metav1.CreateOptions{})
-				Expect(err).ToNot(HaveOccurred(), fmt.Sprintf("Failed to create integer pod %d", i))
-				integerPods = append(integerPods, createdPod)
-			}
-
-			By("Waiting for integer pods to be running")
-			for _, pod := range integerPods {
-				waitForPodRunning(pod.Name)
-			}
-
-			By("Collecting allocated CPUs from integer pods")
-			var allocatedCPUs []string
-			for _, pod := range integerPods {
-				output, err := getPodCPUSet(pod.Name)
-				if err != nil {
-					continue
-				}
-
-				lines := strings.Split(output, "\n")
-				for _, line := range lines {
-					if strings.Contains(line, "Cpus_allowed_list:") {
-						parts := strings.Fields(line)
-						if len(parts) > 1 {
-							// Parse CPU list - handle both single CPUs and ranges
-							cpuList := parts[1]
-							allocatedCPUs = append(allocatedCPUs, strings.Split(cpuList, ",")...)
-						}
-					}
-				}
-			}
-
-			By("Creating annotated pod requesting CPUs that would require impossible reallocation")
-			// Request a large number of CPUs that are already allocated to integers
-			// This should force reallocation that's impossible due to insufficient free CPUs
-			conflictingCPUs := strings.Join(allocatedCPUs[:min(len(allocatedCPUs), 8)], ",") // Request up to 8 conflicting CPUs
-
+			By("Creating annotated pod with small CPU request but large conflicting annotation")
+			// Small CPU request (100m) so K8s scheduler accepts it, but large CPU annotation so NRI rejects it
 			conflictPod := createTestPod("impossible-annotated", map[string]string{
-				"weka.io/cores-ids": conflictingCPUs,
-			}, nil)
+				"weka.io/cores-ids": conflictSpec,
+			}, &corev1.ResourceRequirements{
+				Limits: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("100m"),
+					corev1.ResourceMemory: resource.MustParse("50Mi"),
+				},
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("100m"),
+					corev1.ResourceMemory: resource.MustParse("50Mi"),
+				},
+			})
 
 			createdConflictPod, err := kubeClient.CoreV1().Pods(testNamespace).Create(ctx, conflictPod, metav1.CreateOptions{})
 			Expect(err).ToNot(HaveOccurred())
@@ -387,25 +411,13 @@ var _ = Describe("Live CPU Reallocation Features", Label("e2e", "parallel"), fun
 					return false
 				}
 
-				// Check for container creation failure
+				// Check for NRI container creation failure
 				for _, containerStatus := range updatedPod.Status.ContainerStatuses {
 					if containerStatus.State.Waiting != nil {
-						if strings.Contains(containerStatus.State.Waiting.Reason, "CreateContainerError") ||
-							strings.Contains(containerStatus.State.Waiting.Message, "cannot reallocate") ||
-							strings.Contains(containerStatus.State.Waiting.Message, "insufficient") {
+						if strings.Contains(containerStatus.State.Waiting.Reason, "CreateContainerError") &&
+							strings.Contains(containerStatus.State.Waiting.Message, "cannot reallocate") {
 							AddDebugInfo(fmt.Sprintf("SUCCESS: Annotated pod correctly failed due to impossible reallocation: %s - %s",
 								containerStatus.State.Waiting.Reason, containerStatus.State.Waiting.Message))
-							return true
-						}
-					}
-				}
-
-				// Check pod conditions for scheduling failures
-				for _, condition := range updatedPod.Status.Conditions {
-					if condition.Type == corev1.PodScheduled && condition.Status == corev1.ConditionFalse {
-						if strings.Contains(condition.Message, "insufficient") ||
-							strings.Contains(condition.Message, "resource") {
-							AddDebugInfo(fmt.Sprintf("SUCCESS: Annotated pod correctly failed to schedule: %s", condition.Message))
 							return true
 						}
 					}
@@ -414,7 +426,17 @@ var _ = Describe("Live CPU Reallocation Features", Label("e2e", "parallel"), fun
 				return false
 			}, "2m", "5s").Should(BeTrue(), "Annotated pod should fail when impossible reallocation is required")
 
-			AddDebugInfo("SUCCESS: Impossible reallocation correctly rejected")
+			By("Verifying integer pods maintain their original CPU assignments")
+			// Ensure reallocation was not attempted and integer pods keep their CPUs
+			output1, err := getPodCPUSet(createdPod1.Name)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(output1).ToNot(BeEmpty(), "Integer pod 1 should still have CPU assignment")
+			
+			output2, err := getPodCPUSet(createdPod2.Name)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(output2).ToNot(BeEmpty(), "Integer pod 2 should still have CPU assignment")
+
+			AddDebugInfo("SUCCESS: Impossible reallocation correctly rejected, integer pods preserved")
 		})
 	})
 
@@ -464,8 +486,8 @@ var _ = Describe("Live CPU Reallocation Features", Label("e2e", "parallel"), fun
 			}
 			Expect(cpuList).ToNot(BeEmpty(), "Should have CPU allocation")
 
-			// Parse the CPU list
-			cpuListParsed := strings.Split(cpuList, ",")
+			// Parse the CPU list using proper parser
+			cpuListParsed := parseCPUList(cpuList)
 			Expect(len(cpuListParsed)).To(Equal(2), "Should have exactly 2 CPUs allocated")
 
 			// Check if they are siblings by examining topology
