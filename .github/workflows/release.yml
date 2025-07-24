@@ -33,7 +33,8 @@ jobs:
           npm install -g semantic-release@22 \
             @semantic-release/commit-analyzer@11 \
             @semantic-release/release-notes-generator@12 \
-            @semantic-release/github@9
+            @semantic-release/github@9 \
+            conventional-changelog-conventionalcommits@7
 
       - name: Create semantic-release config
         run: |
