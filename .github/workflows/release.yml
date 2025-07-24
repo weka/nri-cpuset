@@ -123,20 +123,6 @@ jobs:
           # Add image information to release body
           NEW_BODY="$CURRENT_BODY
 
-## Docker Image
-
-🐳 **Container Image:** \`$IMAGE_URL\`
-
-### Pull the image:
-\`\`\`bash
-docker pull $IMAGE_URL
-\`\`\`
-
-### Deploy to Kubernetes:
-\`\`\`bash
-kubectl set image daemonset/weka-nri-cpuset weka-nri-cpuset=$IMAGE_URL -n kube-system
-\`\`\`"
-
           # Update the release
           gh api repos/${{ github.repository }}/releases/$RELEASE_ID \
             --method PATCH \
