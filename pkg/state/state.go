@@ -461,6 +461,17 @@ func (m *Manager) GetContainerInfo(containerID string) *ContainerInfo {
 func (m *Manager) Synchronize(pods []*api.PodSandbox, containers []*api.Container, alloc Allocator) ([]*api.ContainerUpdate, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	
+	// Count containers by state for debugging phantom container issues
+	stoppedCount := 0
+	for _, container := range containers {
+		if container != nil && container.GetState() == api.ContainerState_CONTAINER_STOPPED {
+			stoppedCount++
+		}
+	}
+	if stoppedCount > 0 {
+		fmt.Printf("Synchronizing: filtering out %d stopped containers from %d total\n", stoppedCount, len(containers))
+	}
 
 	// Clear existing state (including any invalid containers from previous runs)
 	m.annotRef = make(map[int]int)
@@ -478,6 +489,12 @@ func (m *Manager) Synchronize(pods []*api.PodSandbox, containers []*api.Containe
 		// Add safety checks to prevent panics
 		if container == nil || container.PodSandboxId == "" {
 			fmt.Printf("Warning: Skipping nil container or container with empty PodSandboxId\n")
+			continue
+		}
+		
+		// Filter out terminated containers to avoid managing phantom containers
+		if container.GetState() == api.ContainerState_CONTAINER_STOPPED {
+			fmt.Printf("Skipping stopped container %s\n", safeShortID(container.Id))
 			continue
 		}
 		

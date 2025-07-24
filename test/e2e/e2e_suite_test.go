@@ -438,20 +438,24 @@ func cleanupAllPodsAndWait() {
 		// First try graceful termination with 30s timeout
 		success := false
 		func() {
+			defer GinkgoRecover()
 			defer func() {
 				if r := recover(); r != nil {
 					// Timeout occurred, success remains false
 					fmt.Printf("Timeout during pod termination check: %v\n", r)
 				}
 			}()
-			Eventually(func() bool {
+			
+			// Use a non-failing check instead of Should(BeTrue())
+			startTime := time.Now()
+			for time.Since(startTime) < 60*time.Second {
 				_, err := kubeClient.CoreV1().Pods(testNamespace).Get(ctx, podName, metav1.GetOptions{})
 				if err != nil {
 					success = true
-					return true
+					return
 				}
-				return false
-			}, 60*time.Second, interval).Should(BeTrue())
+				time.Sleep(2 * time.Second)
+			}
 		}()
 
 		// If graceful termination failed, force delete
@@ -465,15 +469,22 @@ func cleanupAllPodsAndWait() {
 
 			// Wait a bit more for force delete (don't fail if still stuck)
 			func() {
+				defer GinkgoRecover()
 				defer func() {
 					if r := recover(); r != nil {
 						fmt.Printf("Timeout during force delete: %v\n", r)
 					}
 				}()
-				Eventually(func() bool {
+				
+				// Use a non-failing check instead of Should(BeTrue())
+				startTime := time.Now()
+				for time.Since(startTime) < 10*time.Second {
 					_, err := kubeClient.CoreV1().Pods(testNamespace).Get(ctx, podName, metav1.GetOptions{})
-					return err != nil
-				}, 10*time.Second, interval).Should(BeTrue())
+					if err != nil {
+						return
+					}
+					time.Sleep(time.Second)
+				}
 			}()
 		}
 	}
