@@ -305,17 +305,25 @@ func (m *Manager) validateReallocationFeasibility(conflictingContainers map[stri
 		reserved = append(reserved, cpu)
 	}
 
-	// Check if we can allocate the required CPUs
-	_, err := alloc.AllocateExclusiveCPUs(totalCPUsNeeded, reserved)
-	if err != nil {
-		fmt.Printf("DEBUG: Reallocation feasibility check failed: need %d CPUs, freed %d CPUs, but allocation failed: %v\n", 
-			totalCPUsNeeded, freedCPUs, err)
-		return fmt.Errorf("insufficient free CPUs for reallocation: need %d CPUs for %d containers, but allocation failed: %w", 
-			totalCPUsNeeded, len(conflictingContainers), err)
+	// Check if we have enough free CPUs for reallocation
+	// We need at least as many CPUs as we're trying to reallocate
+	// The freed CPUs (from conflicts) should cover the reallocation needs
+	if totalCPUsNeeded > freedCPUs {
+		// Check if allocator can provide the additional CPUs needed
+		additionalCPUsNeeded := totalCPUsNeeded - freedCPUs
+		_, err := alloc.AllocateExclusiveCPUs(additionalCPUsNeeded, reserved)
+		if err != nil {
+			fmt.Printf("DEBUG: Reallocation feasibility check failed: need %d CPUs, freed %d CPUs, additional %d CPUs unavailable: %v\n", 
+				totalCPUsNeeded, freedCPUs, additionalCPUsNeeded, err)
+			return fmt.Errorf("insufficient free CPUs for reallocation: need %d CPUs for %d containers but only %d CPUs freed by conflicts, and %d additional CPUs unavailable: %w", 
+				totalCPUsNeeded, len(conflictingContainers), freedCPUs, additionalCPUsNeeded, err)
+		}
+		fmt.Printf("DEBUG: Reallocation feasibility check passed: need %d CPUs, freed %d CPUs, additional %d CPUs available\n", 
+			totalCPUsNeeded, freedCPUs, additionalCPUsNeeded)
+	} else {
+		fmt.Printf("DEBUG: Reallocation feasibility check passed: need %d CPUs, freed %d CPUs (sufficient)\n", 
+			totalCPUsNeeded, freedCPUs)
 	}
-
-	fmt.Printf("DEBUG: Reallocation feasibility check passed: need %d CPUs, freed %d CPUs\n", 
-		totalCPUsNeeded, freedCPUs)
 	return nil
 }
 

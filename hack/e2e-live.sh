@@ -8,7 +8,6 @@ TEST_NS=${TEST_NS:-wekaplugin-e2e}
 PLUGIN_IMAGE=${PLUGIN_IMAGE:-""}  # Empty by default - will use build-and-deploy.sh to build if not specified
 PLUGIN_REGISTRY=${PLUGIN_REGISTRY:-"images.scalar.dev.weka.io:5002"}
 PLUGIN_NAME=${PLUGIN_NAME:-"weka-nri-cpuset"}
-SKIP_BUILD=${SKIP_BUILD:-false}
 TEST_TIMEOUT=${TEST_TIMEOUT:-30m}
 TEST_PARALLEL=${TEST_PARALLEL:-8}
 PRESERVE_ON_FAILURE=${PRESERVE_ON_FAILURE:-true}
@@ -114,12 +113,8 @@ deploy_plugin() {
             deploy_args+=("--image-name" "$image_name")
         fi
         
-        # If we have a specific image, skip building
-        deploy_args+=("--skip-build")
+        # If we have a specific image, use it directly
         log_info "Using existing plugin image: $PLUGIN_IMAGE"
-    elif [[ "$SKIP_BUILD" == "true" ]]; then
-        deploy_args+=("--skip-build")
-        log_info "Skipping build, using existing image: ${PLUGIN_REGISTRY}/${PLUGIN_NAME}:latest"
     else
         log_info "Building and deploying new plugin image with registry: $PLUGIN_REGISTRY"
     fi
@@ -443,7 +438,6 @@ Environment Variables:
   PLUGIN_IMAGE    Plugin container image - if specified, will use existing image and skip build
   PLUGIN_REGISTRY Docker registry for building images (default: images.scalar.dev.weka.io:5002)
   PLUGIN_NAME     Plugin image name (default: weka-nri-cpuset)
-  SKIP_BUILD      Skip building and use existing image at registry (default: false)
   TEST_TIMEOUT    Test timeout (default: 30m)
   TEST_PARALLEL   Number of parallel workers (default: 8)
   PRESERVE_ON_FAILURE Preserve failed test resources for debugging (default: true)
@@ -465,8 +459,6 @@ Examples:
   # Use existing image (skip building)
   PLUGIN_IMAGE=my-registry/nri-cpuset:v1.2.3 $0
   
-  # Skip build and use latest at default registry  
-  SKIP_BUILD=true $0
 
   # Force plugin redeployment (will rebuild if no PLUGIN_IMAGE specified)
   FORCE_DEPLOY=true $0

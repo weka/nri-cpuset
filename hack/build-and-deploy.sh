@@ -10,7 +10,6 @@ REGISTRY="images.scalar.dev.weka.io:5002"
 IMAGE_NAME="weka-nri-cpuset"
 DEBUG=false
 DRY_RUN=false
-SKIP_BUILD=false
 
 usage() {
     cat << EOF
@@ -25,7 +24,6 @@ Options:
   --image-name NAME    Image name (default: weka-nri-cpuset)
   --debug             Enable debug output
   --dry-run           Show what would be done without executing
-  --skip-build        Skip building Docker image (use existing)
   --help              Show this help
 
 Description:
@@ -79,10 +77,6 @@ parse_args() {
                 ;;
             --dry-run)
                 DRY_RUN=true
-                shift
-                ;;
-            --skip-build)
-                SKIP_BUILD=true
                 shift
                 ;;
             --help)
@@ -252,7 +246,6 @@ main() {
     log "Registry: $REGISTRY"
     log "Image name: $IMAGE_NAME"
     log "Dry run: $DRY_RUN"
-    log "Skip build: $SKIP_BUILD"
     
     # Ensure cleanup happens even if script fails
     trap cleanup_temp_files EXIT
@@ -260,12 +253,6 @@ main() {
     check_dependencies
     
     image_tag=""
-    if [[ "$SKIP_BUILD" == "true" ]]; then
-        log "Skipping Docker build (--skip-build specified)"
-        # Use latest tag or ask user to specify
-        image_tag="${REGISTRY}/${IMAGE_NAME}:latest"
-        log "Using existing image: $image_tag"
-        else
         # Build and push image using Makefile
         local timestamp=$(date +%s)
         local full_image_tag="${REGISTRY}/${IMAGE_NAME}:${timestamp}"

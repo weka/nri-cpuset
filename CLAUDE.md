@@ -63,8 +63,6 @@ Prefer using this scripts instead of `make image` and patching
 # Dry run (see what would happen)
 ./hack/build-and-deploy.sh --kubeconfig /path/to/kubeconfig --dry-run --debug
 
-# Skip Docker build (use existing image)
-./hack/build-and-deploy.sh --kubeconfig /path/to/kubeconfig --skip-build
 
 # Alternative: Use Makefile directly for just building/pushing
 make image-push REGISTRY=my-registry.com:5000 IMAGE_NAME=weka-nri-cpuset
@@ -187,8 +185,6 @@ KUBECONFIG=/path/to/kubeconfig PLUGIN_REGISTRY=my-registry.com:5000 ./hack/e2e-l
 # Run E2E with existing image (skips building)
 KUBECONFIG=/path/to/kubeconfig PLUGIN_IMAGE=my-registry.com/weka-nri-cpuset:v1.2.3 ./hack/e2e-live.sh
 
-# Skip build and use existing image at default registry
-KUBECONFIG=/path/to/kubeconfig SKIP_BUILD=true ./hack/e2e-live.sh
 
 # Force plugin redeployment before testing
 KUBECONFIG=/path/to/kubeconfig FORCE_DEPLOY=true ./hack/e2e-live.sh
