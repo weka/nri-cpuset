@@ -253,18 +253,17 @@ main() {
     check_dependencies
     
     image_tag=""
-        # Build and push image using Makefile
-        local timestamp=$(date +%s)
-        local full_image_tag="${REGISTRY}/${IMAGE_NAME}:${timestamp}"
-        
-        log "Building Docker image using existing Dockerfile: $full_image_tag"
-        
-        # Use the existing Makefile to build and push the image
-        run_command "cd '$PROJECT_ROOT' && make image-push REGISTRY='$REGISTRY' IMAGE_NAME='$IMAGE_NAME' IMAGE_TAG='$timestamp'" \
-            "Building and pushing Docker image via Makefile"
-        
-        image_tag="$full_image_tag"
-    fi
+    # Build and push image using Makefile
+    local timestamp=$(date +%s)
+    local full_image_tag="${REGISTRY}/${IMAGE_NAME}:${timestamp}"
+    
+    log "Building Docker image using existing Dockerfile: $full_image_tag"
+    
+    # Use the existing Makefile to build and push the image
+    run_command "cd '$PROJECT_ROOT' && make image-push REGISTRY='$REGISTRY' IMAGE_NAME='$IMAGE_NAME' IMAGE_TAG='$timestamp'" \
+        "Building and pushing Docker image via Makefile"
+    
+    image_tag="$full_image_tag"
     
     # Update manifest with new image tag
     temp_manifest=$(update_daemonset_manifest "$image_tag")

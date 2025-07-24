@@ -14,6 +14,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/weka/nri-cpuset/pkg/allocator"
+	containerPkg "github.com/weka/nri-cpuset/pkg/container"
 	"github.com/weka/nri-cpuset/pkg/numa"
 	"github.com/weka/nri-cpuset/pkg/state"
 )
@@ -224,7 +225,7 @@ func (p *plugin) RunPodSandbox(ctx context.Context, pod *api.PodSandbox) error {
 
 func (p *plugin) CreateContainer(ctx context.Context, pod *api.PodSandbox, container *api.Container) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
 
-	modeStr := p.determineContainerMode(pod, container)
+	modeStr := containerPkg.DetermineContainerMode(pod, container)
 
 	switch modeStr {
 	case "annotated":
@@ -320,93 +321,7 @@ func (p *plugin) RemoveContainer(ctx context.Context, pod *api.PodSandbox, conta
 
 // Helper methods for container mode determination and handling
 
-func (p *plugin) determineContainerMode(pod *api.PodSandbox, container *api.Container) string {
-	// Check for annotation first
-	if pod.Annotations != nil {
-		if _, hasAnnotation := pod.Annotations["weka.io/cores-ids"]; hasAnnotation {
-			return "annotated"
-		}
-	}
 
-	// Check for integer semantics
-	if p.hasIntegerSemantics(container) {
-		return "integer"
-	}
-
-	return "shared"
-}
-
-func (p *plugin) hasIntegerSemantics(container *api.Container) bool {
-	if container.Linux == nil || container.Linux.Resources == nil {
-		return false
-	}
-
-	cpu := container.Linux.Resources.Cpu
-	memory := container.Linux.Resources.Memory
-
-	if cpu == nil || memory == nil {
-		return false
-	}
-
-	// Check CPU quota and period are set for limits
-	if cpu.Quota == nil || cpu.Period == nil || cpu.Quota.GetValue() <= 0 || cpu.Period.GetValue() <= 0 {
-		return false
-	}
-
-	// Check memory limit is set
-	if memory.Limit == nil || memory.Limit.GetValue() <= 0 {
-		return false
-	}
-
-	// Check that limits.cpu is an integer
-	quota := cpu.Quota.GetValue()
-	period := int64(cpu.Period.GetValue())
-	if quota%period != 0 {
-		return false
-	}
-
-	cpuCores := quota / period
-	if cpuCores <= 0 {
-		return false
-	}
-
-	// CRITICAL: Check that requests == limits for both CPU and memory
-	// This is required by the PRD for integer pod classification
-
-	// Check CPU: requests == limits
-	if cpu.Shares == nil {
-		// If no shares (requests) are set but quota/period (limits) are set,
-		// then requests != limits, so this is not an integer container
-		return false
-	}
-
-	// Convert shares to CPU value: shares / 1024 should equal quota/period
-	// Kubernetes uses 1024 shares per CPU core
-	requestedCPUs := float64(cpu.Shares.GetValue()) / 1024.0
-	limitCPUs := float64(quota) / float64(period)
-
-	// Allow larger floating point tolerance for test environments and resource conversions
-	// Kubernetes resource conversion can introduce small variations
-	if abs(requestedCPUs-limitCPUs) > 0.01 {
-		return false
-	}
-
-	// Check Memory: requests == limits
-	// Note: Memory requests are not directly available in the NRI Container object
-	// In practice, Kubernetes QoS class "Guaranteed" requires requests == limits
-	// For now, we'll accept any memory configuration since we can't easily verify
-	// the memory request from the NRI interface. The CPU check is the main criterion.
-
-	return true
-}
-
-// Helper function for floating point comparison
-func abs(x float64) float64 {
-	if x < 0 {
-		return -x
-	}
-	return x
-}
 
 func (p *plugin) handleAnnotatedContainer(pod *api.PodSandbox, container *api.Container) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
 	// For annotated containers, try allocation with potential live reallocation

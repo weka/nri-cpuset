@@ -8,6 +8,7 @@ import (
 	"github.com/containerd/nri/pkg/api"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	containerutil "github.com/weka/nri-cpuset/pkg/container"
 	"github.com/weka/nri-cpuset/pkg/numa"
 )
 
@@ -276,8 +277,9 @@ var _ = Describe("CPUAllocator", func() {
 				Linux: &api.LinuxContainer{
 					Resources: &api.LinuxResources{
 						Cpu: &api.LinuxCPU{
-							Quota:  &api.OptionalInt64{Value: 200000}, // 2 CPUs
+							Quota:  &api.OptionalInt64{Value: 200000}, // 2 CPUs limit
 							Period: &api.OptionalUInt64{Value: 100000},
+							Shares: &api.OptionalUInt64{Value: 2048}, // 2 CPUs request (2 * 1024)
 						},
 						Memory: &api.LinuxMemory{
 							Limit: &api.OptionalInt64{Value: 1024 * 1024 * 1024}, // 1GB
@@ -287,6 +289,26 @@ var _ = Describe("CPUAllocator", func() {
 			}
 			mode := allocator.determineContainerMode(pod, container)
 			Expect(mode).To(Equal("integer"))
+		})
+
+		It("should detect shared containers with mismatched requests and limits", func() {
+			pod := &api.PodSandbox{}
+			container := &api.Container{
+				Linux: &api.LinuxContainer{
+					Resources: &api.LinuxResources{
+						Cpu: &api.LinuxCPU{
+							Quota:  &api.OptionalInt64{Value: 200000}, // 2 CPUs limit
+							Period: &api.OptionalUInt64{Value: 100000},
+							Shares: &api.OptionalUInt64{Value: 1024}, // 1 CPU request (mismatched!)
+						},
+						Memory: &api.LinuxMemory{
+							Limit: &api.OptionalInt64{Value: 1024 * 1024 * 1024}, // 1GB
+						},
+					},
+				},
+			}
+			mode := allocator.determineContainerMode(pod, container)
+			Expect(mode).To(Equal("shared"))
 		})
 
 		It("should default to shared containers", func() {
@@ -303,8 +325,9 @@ var _ = Describe("CPUAllocator", func() {
 				Linux: &api.LinuxContainer{
 					Resources: &api.LinuxResources{
 						Cpu: &api.LinuxCPU{
-							Quota:  &api.OptionalInt64{Value: 200000}, // 2 CPUs
+							Quota:  &api.OptionalInt64{Value: 200000}, // 2 CPUs limit
 							Period: &api.OptionalUInt64{Value: 100000},
+							Shares: &api.OptionalUInt64{Value: 2048}, // 2 CPUs request (2 * 1024)
 						},
 						Memory: &api.LinuxMemory{
 							Limit: &api.OptionalInt64{Value: 1024 * 1024 * 1024},
@@ -312,7 +335,7 @@ var _ = Describe("CPUAllocator", func() {
 					},
 				},
 			}
-			Expect(allocator.hasIntegerSemantics(container)).To(BeTrue())
+			Expect(containerutil.HasIntegerSemantics(container)).To(BeTrue())
 		})
 
 		It("should return false for fractional CPU requirements", func() {
@@ -329,12 +352,12 @@ var _ = Describe("CPUAllocator", func() {
 					},
 				},
 			}
-			Expect(allocator.hasIntegerSemantics(container)).To(BeFalse())
+			Expect(containerutil.HasIntegerSemantics(container)).To(BeFalse())
 		})
 
 		It("should return false for containers without resources", func() {
 			container := &api.Container{}
-			Expect(allocator.hasIntegerSemantics(container)).To(BeFalse())
+			Expect(containerutil.HasIntegerSemantics(container)).To(BeFalse())
 		})
 
 		It("should return false for containers without memory limits", func() {
@@ -348,7 +371,7 @@ var _ = Describe("CPUAllocator", func() {
 					},
 				},
 			}
-			Expect(allocator.hasIntegerSemantics(container)).To(BeFalse())
+			Expect(containerutil.HasIntegerSemantics(container)).To(BeFalse())
 		})
 	})
 })
@@ -660,7 +683,7 @@ var _ = Describe("Advanced Allocation Scenarios", func() {
 					},
 				},
 			}
-			Expect(allocator.hasIntegerSemantics(container)).To(BeFalse())
+			Expect(containerutil.HasIntegerSemantics(container)).To(BeFalse())
 		})
 
 		It("should handle zero quota", func() {
@@ -677,7 +700,7 @@ var _ = Describe("Advanced Allocation Scenarios", func() {
 					},
 				},
 			}
-			Expect(allocator.hasIntegerSemantics(container)).To(BeFalse())
+			Expect(containerutil.HasIntegerSemantics(container)).To(BeFalse())
 		})
 
 		It("should handle zero period", func() {
@@ -694,7 +717,7 @@ var _ = Describe("Advanced Allocation Scenarios", func() {
 					},
 				},
 			}
-			Expect(allocator.hasIntegerSemantics(container)).To(BeFalse())
+			Expect(containerutil.HasIntegerSemantics(container)).To(BeFalse())
 		})
 
 		It("should handle zero memory limit", func() {
@@ -711,7 +734,7 @@ var _ = Describe("Advanced Allocation Scenarios", func() {
 					},
 				},
 			}
-			Expect(allocator.hasIntegerSemantics(container)).To(BeFalse())
+			Expect(containerutil.HasIntegerSemantics(container)).To(BeFalse())
 		})
 	})
 

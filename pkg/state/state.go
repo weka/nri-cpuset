@@ -8,6 +8,7 @@ import (
 
 	"github.com/containerd/nri/pkg/api"
 	"github.com/weka/nri-cpuset/pkg/allocator"
+	containerutil "github.com/weka/nri-cpuset/pkg/container"
 	"github.com/weka/nri-cpuset/pkg/numa"
 )
 
@@ -1014,50 +1015,13 @@ func (m *Manager) determineContainerMode(pod *api.PodSandbox, container *api.Con
 	}
 
 	// Check for integer semantics
-	if m.hasIntegerSemantics(container) {
+	if containerutil.HasIntegerSemantics(container) {
 		return "integer"
 	}
 
 	return "shared"
 }
 
-func (m *Manager) hasIntegerSemantics(container *api.Container) bool {
-	if container.Linux == nil || container.Linux.Resources == nil {
-		return false
-	}
-
-	cpu := container.Linux.Resources.Cpu
-	memory := container.Linux.Resources.Memory
-
-	if cpu == nil || memory == nil {
-		return false
-	}
-
-	// Check CPU requirements
-	if cpu.Quota == nil || cpu.Period == nil || cpu.Quota.GetValue() <= 0 || cpu.Period.GetValue() <= 0 {
-		return false
-	}
-
-	// Check if CPU limit is an integer
-	if cpu.Quota.GetValue()%int64(cpu.Period.GetValue()) != 0 {
-		return false
-	}
-
-	// Check memory requirements
-	if memory.Limit == nil || memory.Limit.GetValue() <= 0 {
-		return false
-	}
-
-	return true
-}
-
-// Helper function for floating point comparison
-func abs(x float64) float64 {
-	if x < 0 {
-		return -x
-	}
-	return x
-}
 
 func (m *Manager) IsReserved(cpu int) bool {
 	m.mu.RLock()

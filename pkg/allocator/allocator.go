@@ -5,6 +5,7 @@ import (
 	"sort"
 
 	"github.com/containerd/nri/pkg/api"
+	containerutil "github.com/weka/nri-cpuset/pkg/container"
 	"github.com/weka/nri-cpuset/pkg/numa"
 )
 
@@ -306,44 +307,13 @@ func (a *CPUAllocator) determineContainerMode(pod *api.PodSandbox, container *ap
 	}
 
 	// Check for integer semantics
-	if a.hasIntegerSemantics(container) {
+	if containerutil.HasIntegerSemantics(container) {
 		return "integer"
 	}
 
 	return "shared"
 }
 
-func (a *CPUAllocator) hasIntegerSemantics(container *api.Container) bool {
-	if container.Linux == nil || container.Linux.Resources == nil {
-		return false
-	}
-
-	cpu := container.Linux.Resources.Cpu
-	memory := container.Linux.Resources.Memory
-
-	if cpu == nil || memory == nil {
-		return false
-	}
-
-	// Check CPU requirements
-	if cpu.Quota == nil || cpu.Period == nil || cpu.Quota.GetValue() <= 0 || cpu.Period.GetValue() <= 0 {
-		return false
-	}
-
-	// Check if CPU limit is an integer
-	if cpu.Quota.GetValue()%int64(cpu.Period.GetValue()) != 0 {
-		return false
-	}
-
-	// Check memory requirements
-	if memory.Limit == nil || memory.Limit.GetValue() <= 0 {
-		return false
-	}
-
-	// In real scenarios, we would also check that requests == limits
-	// This is simplified for the implementation
-	return true
-}
 
 func (a *CPUAllocator) handleAnnotatedContainer(pod *api.PodSandbox, reserved []int) (*AllocationResult, error) {
 	if pod.Annotations == nil {

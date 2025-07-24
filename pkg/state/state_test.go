@@ -10,6 +10,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/weka/nri-cpuset/pkg/allocator"
+	containerutil "github.com/weka/nri-cpuset/pkg/container"
 )
 
 func TestState(t *testing.T) {
@@ -82,7 +83,7 @@ func (t *TestAllocator) AllocateContainerCPUs(pod *api.PodSandbox, container *ap
 		if _, hasAnnotation := pod.Annotations[WekaAnnotation]; hasAnnotation {
 			mode = "annotated"
 		}
-	} else if t.hasIntegerSemantics(container) {
+	} else if containerutil.HasIntegerSemantics(container) {
 		mode = "integer"
 	}
 
@@ -221,6 +222,14 @@ func (t *TestAllocator) hasIntegerSemantics(container *api.Container) bool {
 	// the memory request from the NRI interface. The CPU check is the main criterion.
 
 	return true
+}
+
+// Helper function for floating point comparison in tests
+func abs(x float64) float64 {
+	if x < 0 {
+		return -x
+	}
+	return x
 }
 
 func (t *TestAllocator) HandleAnnotatedContainerWithIntegerConflictCheck(pod *api.PodSandbox, integerReserved []int) (*allocator.AllocationResult, error) {
