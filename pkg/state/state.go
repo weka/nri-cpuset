@@ -115,9 +115,9 @@ func (m *Manager) AllocateAnnotatedWithReallocation(pod *api.PodSandbox, alloc A
 	}
 
 	// Check if this is a validation error (invalid CPU annotation) rather than a conflict
-	if strings.Contains(err.Error(), "invalid CPU list") || 
-	   strings.Contains(err.Error(), "not online") ||
-	   strings.Contains(err.Error(), "missing") {
+	if strings.Contains(err.Error(), "invalid CPU list") ||
+		strings.Contains(err.Error(), "not online") ||
+		strings.Contains(err.Error(), "missing") {
 		// Invalid annotation - cannot be fixed with reallocation, fail immediately
 		fmt.Printf("DEBUG: Invalid CPU annotation for annotated pod %s/%s: %v\n", pod.Namespace, pod.Name, err)
 		return nil, nil, err
@@ -314,15 +314,15 @@ func (m *Manager) validateReallocationFeasibility(conflictingContainers map[stri
 		additionalCPUsNeeded := totalCPUsNeeded - freedCPUs
 		_, err := alloc.AllocateExclusiveCPUs(additionalCPUsNeeded, reserved)
 		if err != nil {
-			fmt.Printf("DEBUG: Reallocation feasibility check failed: need %d CPUs, freed %d CPUs, additional %d CPUs unavailable: %v\n", 
+			fmt.Printf("DEBUG: Reallocation feasibility check failed: need %d CPUs, freed %d CPUs, additional %d CPUs unavailable: %v\n",
 				totalCPUsNeeded, freedCPUs, additionalCPUsNeeded, err)
-			return fmt.Errorf("insufficient free CPUs for reallocation: need %d CPUs for %d containers but only %d CPUs freed by conflicts, and %d additional CPUs unavailable: %w", 
+			return fmt.Errorf("insufficient free CPUs for reallocation: need %d CPUs for %d containers but only %d CPUs freed by conflicts, and %d additional CPUs unavailable: %w",
 				totalCPUsNeeded, len(conflictingContainers), freedCPUs, additionalCPUsNeeded, err)
 		}
-		fmt.Printf("DEBUG: Reallocation feasibility check passed: need %d CPUs, freed %d CPUs, additional %d CPUs available\n", 
+		fmt.Printf("DEBUG: Reallocation feasibility check passed: need %d CPUs, freed %d CPUs, additional %d CPUs available\n",
 			totalCPUsNeeded, freedCPUs, additionalCPUsNeeded)
 	} else {
-		fmt.Printf("DEBUG: Reallocation feasibility check passed: need %d CPUs, freed %d CPUs (sufficient)\n", 
+		fmt.Printf("DEBUG: Reallocation feasibility check passed: need %d CPUs, freed %d CPUs (sufficient)\n",
 			totalCPUsNeeded, freedCPUs)
 	}
 	return nil
@@ -441,7 +441,7 @@ func formatCPUListCommaSeparated(cpus []int) string {
 	if len(cpus) == 0 {
 		return ""
 	}
-	
+
 	sort.Ints(cpus)
 	strs := make([]string, len(cpus))
 	for i, cpu := range cpus {
@@ -454,14 +454,14 @@ func formatCPUListCommaSeparated(cpus []int) string {
 func (m *Manager) GetContainerInfo(containerID string) *ContainerInfo {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	
+
 	return m.byCID[containerID]
 }
 
 func (m *Manager) Synchronize(pods []*api.PodSandbox, containers []*api.Container, alloc Allocator) ([]*api.ContainerUpdate, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	
+
 	// Count containers by state for debugging phantom container issues
 	stoppedCount := 0
 	for _, container := range containers {
@@ -491,13 +491,13 @@ func (m *Manager) Synchronize(pods []*api.PodSandbox, containers []*api.Containe
 			fmt.Printf("Warning: Skipping nil container or container with empty PodSandboxId\n")
 			continue
 		}
-		
+
 		// Filter out terminated containers to avoid managing phantom containers
 		if container.GetState() == api.ContainerState_CONTAINER_STOPPED {
 			fmt.Printf("Skipping stopped container %s\n", safeShortID(container.Id))
 			continue
 		}
-		
+
 		pod := m.findPod(pods, container.PodSandboxId)
 		if pod == nil {
 			continue
@@ -619,7 +619,7 @@ func (m *Manager) Synchronize(pods []*api.PodSandbox, containers []*api.Containe
 
 		// Get current CPU assignment from container's Linux resources
 		var currentCPUs []int
-		
+
 		// DEBUG: Log what NRI data is available for this container
 		if container.Linux != nil && container.Linux.Resources != nil && container.Linux.Resources.Cpu != nil {
 			fmt.Printf("DEBUG: Container %s NRI CPU data - Cpus: '%s', Quota: %v, Period: %v\n",
@@ -630,7 +630,7 @@ func (m *Manager) Synchronize(pods []*api.PodSandbox, containers []*api.Containe
 		} else {
 			fmt.Printf("DEBUG: Container %s has no NRI CPU resource data\n", safeShortID(container.Id))
 		}
-		
+
 		if container.Linux != nil && container.Linux.Resources != nil &&
 			container.Linux.Resources.Cpu != nil && container.Linux.Resources.Cpu.Cpus != "" {
 			var err error
@@ -725,7 +725,7 @@ func (m *Manager) Synchronize(pods []*api.PodSandbox, containers []*api.Containe
 		// Check for conflicts with annotated containers and reallocate if needed
 		var conflictFreeCPUs []int
 		var hasConflicts bool
-		
+
 		for _, cpu := range currentCPUs {
 			if _, hasAnnotated := m.annotRef[cpu]; hasAnnotated {
 				hasConflicts = true
@@ -738,9 +738,9 @@ func (m *Manager) Synchronize(pods []*api.PodSandbox, containers []*api.Containe
 		// If we have conflicts, REALLOCATE the integer container to available CPUs
 		var finalCPUs []int
 		if hasConflicts {
-			fmt.Printf("DEBUG: Integer container %s has %d CPU conflicts, attempting reallocation during sync\n", 
+			fmt.Printf("DEBUG: Integer container %s has %d CPU conflicts, attempting reallocation during sync\n",
 				container.Id, len(currentCPUs)-len(conflictFreeCPUs))
-			
+
 			// Build reserved CPU list for reallocation (annotated + other integer containers)
 			reserved := make([]int, 0)
 			for cpu := range m.annotRef {
@@ -751,7 +751,7 @@ func (m *Manager) Synchronize(pods []*api.PodSandbox, containers []*api.Containe
 					reserved = append(reserved, cpu)
 				}
 			}
-			
+
 			// Attempt reallocation using the allocator
 			newCPUs, _, err := alloc.AllocateContainerCPUs(pod, container, reserved)
 			if err != nil {
@@ -761,7 +761,7 @@ func (m *Manager) Synchronize(pods []*api.PodSandbox, containers []*api.Containe
 				finalCPUs = conflictFreeCPUs
 			} else {
 				finalCPUs = newCPUs
-				fmt.Printf("DEBUG: Successfully reallocated integer container %s from %v to %v during sync\n", 
+				fmt.Printf("DEBUG: Successfully reallocated integer container %s from %v to %v during sync\n",
 					container.Id, currentCPUs, finalCPUs)
 			}
 		} else {
@@ -1038,7 +1038,6 @@ func (m *Manager) determineContainerMode(pod *api.PodSandbox, container *api.Con
 
 	return "shared"
 }
-
 
 func (m *Manager) IsReserved(cpu int) bool {
 	m.mu.RLock()

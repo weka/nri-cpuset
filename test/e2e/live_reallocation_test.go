@@ -24,7 +24,7 @@ func min(a, b int) int {
 // Helper function to parse CPU list format like "2-3,33-34" into individual CPU strings
 func parseCPUList(cpuList string) []string {
 	var allCPUs []string
-	
+
 	// Handle comma-separated list that may contain ranges
 	cpuParts := strings.Split(cpuList, ",")
 	for _, part := range cpuParts {
@@ -235,7 +235,7 @@ var _ = Describe("Live CPU Reallocation Features", Label("e2e", "parallel"), fun
 
 							// Parse CPU list using helper function
 							allCPUs := parseCPUList(cpuList)
-							
+
 							// Take first two CPUs for conflict
 							if len(allCPUs) >= 2 {
 								conflictCPUs = []string{allCPUs[0], allCPUs[1]}
@@ -308,7 +308,7 @@ var _ = Describe("Live CPU Reallocation Features", Label("e2e", "parallel"), fun
 						}
 					}
 				}
-				
+
 				// Check if any conflict CPU is in the actual CPU list
 				for _, conflictCPU := range conflictCPUs {
 					for _, actualCPU := range actualCPUs {
@@ -328,16 +328,16 @@ var _ = Describe("Live CPU Reallocation Features", Label("e2e", "parallel"), fun
 			By("Getting node CPU capacity for simple resource calculation")
 			node, err := kubeClient.CoreV1().Nodes().Get(ctx, currentTestNode, metav1.GetOptions{})
 			Expect(err).ToNot(HaveOccurred())
-			
+
 			nodeCPUCapacity := node.Status.Allocatable[corev1.ResourceCPU]
 			totalCPUs := nodeCPUCapacity.Value()
-			
+
 			// Calculate 40% of node capacity for each pod
 			cores40Percent := int(totalCPUs * 40 / 100)
 			if cores40Percent < 2 {
 				Skip(fmt.Sprintf("Node %s too small for test (need at least 5 CPUs for 40%% = 2)", currentTestNode))
 			}
-			
+
 			AddDebugInfo(fmt.Sprintf("Node %s: Total CPUs=%d, Using 40%% = %d CPUs per pod", currentTestNode, totalCPUs, cores40Percent))
 
 			By("Creating first integer pod with 40% of node CPUs")
@@ -383,7 +383,7 @@ var _ = Describe("Live CPU Reallocation Features", Label("e2e", "parallel"), fun
 				conflictingCPUs = append(conflictingCPUs, fmt.Sprintf("%d", i))
 			}
 			conflictSpec := strings.Join(conflictingCPUs, ",")
-			
+
 			AddDebugInfo(fmt.Sprintf("Creating annotated pod requesting %d specific CPUs: %s", cores40Percent, conflictSpec))
 			AddDebugInfo("This conflicts with both integer pods but requests only 100m CPU resource")
 
@@ -432,7 +432,7 @@ var _ = Describe("Live CPU Reallocation Features", Label("e2e", "parallel"), fun
 			output1, err := getPodCPUSet(createdPod1.Name)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(output1).ToNot(BeEmpty(), "Integer pod 1 should still have CPU assignment")
-			
+
 			output2, err := getPodCPUSet(createdPod2.Name)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(output2).ToNot(BeEmpty(), "Integer pod 2 should still have CPU assignment")
@@ -679,19 +679,19 @@ var _ = Describe("Live CPU Reallocation Features", Label("e2e", "parallel"), fun
 			// Get the target node's actual CPU core count
 			node, err := kubeClient.CoreV1().Nodes().Get(ctx, currentTestNode, metav1.GetOptions{})
 			Expect(err).ToNot(HaveOccurred())
-			
+
 			nodeCPUCapacity := node.Status.Allocatable[corev1.ResourceCPU]
 			totalCPUs := int(nodeCPUCapacity.Value())
-			
+
 			// Create some integer pods, leaving sufficient cores for reallocation
 			// Each integer pod gets 2 cores. We'll create enough to force conflicts but leave space for reallocation
 			maxIntegerPods := min(15, (totalCPUs-8)/2) // Leave at least 8 cores free for reallocation
-			
+
 			if maxIntegerPods < 2 {
 				Skip(fmt.Sprintf("Node %s has insufficient CPUs (%d total). Need at least 12 CPUs for this test", currentTestNode, totalCPUs))
 			}
-			
-			GinkgoWriter.Printf("Node %s: Total CPUs=%d, Creating %d integer pods (2 CPUs each), Leaving %d free cores (sufficient for reallocation)\n", 
+
+			GinkgoWriter.Printf("Node %s: Total CPUs=%d, Creating %d integer pods (2 CPUs each), Leaving %d free cores (sufficient for reallocation)\n",
 				currentTestNode, totalCPUs, maxIntegerPods, totalCPUs-maxIntegerPods*2)
 
 			By("Creating integer pods to consume most available CPUs")

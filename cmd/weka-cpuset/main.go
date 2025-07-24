@@ -40,10 +40,10 @@ type plugin struct {
 	state     *state.Manager
 	allocator *allocator.CPUAllocator
 	numa      *numa.Manager
-	
+
 	// Background update system
-	updateQueue chan updateRequest
-	updateCtx   context.Context
+	updateQueue  chan updateRequest
+	updateCtx    context.Context
 	updateCancel context.CancelFunc
 }
 
@@ -199,7 +199,6 @@ func (p *plugin) queueBackgroundUpdate(updates []*api.ContainerUpdate, operation
 	}
 }
 
-
 // NRI plugin interface implementations
 
 func (p *plugin) Configure(ctx context.Context, config, runtime, version string) (stub.EventMask, error) {
@@ -224,7 +223,6 @@ func (p *plugin) RunPodSandbox(ctx context.Context, pod *api.PodSandbox) error {
 }
 
 func (p *plugin) CreateContainer(ctx context.Context, pod *api.PodSandbox, container *api.Container) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
-
 	modeStr := containerPkg.DetermineContainerMode(pod, container)
 
 	switch modeStr {
@@ -241,20 +239,20 @@ func (p *plugin) CreateContainer(ctx context.Context, pod *api.PodSandbox, conta
 
 func (p *plugin) UpdateContainer(ctx context.Context, pod *api.PodSandbox, container *api.Container, r *api.LinuxResources) ([]*api.ContainerUpdate, error) {
 	fmt.Printf("Updating container %s in pod %s/%s\n", container.Name, pod.Namespace, pod.Name)
-	
+
 	// CRITICAL FIX: When NRI calls UpdateContainer, we need to return the proper CPU assignment
 	// for containers we're managing. Returning nil,nil might cause NRI to apply default/shared CPUs.
-	
+
 	// Get the container's current CPU assignment from our state
 	containerInfo := p.state.GetContainerInfo(container.Id)
 	if containerInfo == nil {
 		// Container not managed by us, let NRI handle it
 		return nil, nil
 	}
-	
-	fmt.Printf("DEBUG: UpdateContainer called for managed container %s (mode: %s, CPUs: %v)\n", 
+
+	fmt.Printf("DEBUG: UpdateContainer called for managed container %s (mode: %s, CPUs: %v)\n",
 		safeShortID(container.Id), containerInfo.Mode, containerInfo.CPUs)
-	
+
 	// Return the current CPU assignment to prevent NRI from overriding it
 	update := &api.ContainerUpdate{
 		ContainerId: container.Id,
@@ -266,10 +264,10 @@ func (p *plugin) UpdateContainer(ctx context.Context, pod *api.PodSandbox, conta
 			},
 		},
 	}
-	
-	fmt.Printf("DEBUG: Returning CPU assignment %s for container %s in UpdateContainer\n", 
+
+	fmt.Printf("DEBUG: Returning CPU assignment %s for container %s in UpdateContainer\n",
 		update.Linux.Resources.Cpu.Cpus, safeShortID(container.Id))
-	
+
 	return []*api.ContainerUpdate{update}, nil
 }
 
@@ -278,7 +276,7 @@ func formatCPUListForUpdate(cpus []int, mode string) string {
 	if len(cpus) == 0 {
 		return ""
 	}
-	
+
 	// For annotated containers, use comma-separated format to ensure NRI compatibility
 	if mode == "annotated" {
 		sort.Ints(cpus)
@@ -288,7 +286,7 @@ func formatCPUListForUpdate(cpus []int, mode string) string {
 		}
 		return strings.Join(strs, ",")
 	}
-	
+
 	// For other containers, use the standard format from numa package
 	return numa.FormatCPUList(cpus)
 }
@@ -318,10 +316,7 @@ func (p *plugin) RemoveContainer(ctx context.Context, pod *api.PodSandbox, conta
 	return nil
 }
 
-
 // Helper methods for container mode determination and handling
-
-
 
 func (p *plugin) handleAnnotatedContainer(pod *api.PodSandbox, container *api.Container) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
 	// For annotated containers, try allocation with potential live reallocation
@@ -376,4 +371,3 @@ func (p *plugin) handleSharedContainer(pod *api.PodSandbox, container *api.Conta
 	reserved := p.state.GetReservedCPUs()
 	return p.allocator.AllocateContainer(pod, container, reserved)
 }
-

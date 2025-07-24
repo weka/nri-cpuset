@@ -314,7 +314,6 @@ func (a *CPUAllocator) determineContainerMode(pod *api.PodSandbox, container *ap
 	return "shared"
 }
 
-
 func (a *CPUAllocator) handleAnnotatedContainer(pod *api.PodSandbox, reserved []int) (*AllocationResult, error) {
 	if pod.Annotations == nil {
 		return nil, fmt.Errorf("missing annotations for annotated container")

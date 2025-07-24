@@ -7,7 +7,7 @@ import (
 // HasIntegerSemantics determines if a container meets the criteria for integer pod classification.
 // According to the PRD, integer pods must have:
 // - CPU requests == CPU limits
-// - Memory requests == Memory limits  
+// - Memory requests == Memory limits
 // - CPU limits must be integer values
 func HasIntegerSemantics(container *api.Container) bool {
 	if container.Linux == nil || container.Linux.Resources == nil {

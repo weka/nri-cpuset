@@ -30,32 +30,36 @@ const (
 // logNodeAcquisition logs node acquisition/release events to a unified tracking file
 func logNodeAcquisition(workerID int, nodeName, namespace, action string) {
 	logFile := filepath.Join("test", "e2e", "node-acquisition.log")
-	
+
 	// Ensure the directory exists
-	if err := os.MkdirAll(filepath.Dir(logFile), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(logFile), 0o755); err != nil {
 		log.Printf("Failed to create log directory: %v", err)
 		return
 	}
-	
+
 	// Open log file in append mode
-	file, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	file, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		log.Printf("Failed to open node acquisition log: %v", err)
 		return
 	}
-	defer file.Close()
-	
+	defer func() {
+		if err := file.Close(); err != nil {
+			log.Printf("Failed to close node acquisition log file: %v", err)
+		}
+	}()
+
 	// Get current test name if available
 	testName := "unknown"
 	if CurrentSpecReport().FullText() != "" {
 		testName = CurrentSpecReport().FullText()
 	}
-	
+
 	// Write log entry
 	timestamp := time.Now().Format("2006-01-02 15:04:05.000")
-	logEntry := fmt.Sprintf("[%s] Worker-%d %s node=%s namespace=%s test=\"%s\"\n", 
+	logEntry := fmt.Sprintf("[%s] Worker-%d %s node=%s namespace=%s test=\"%s\"\n",
 		timestamp, workerID, action, nodeName, namespace, testName)
-	
+
 	if _, err := file.WriteString(logEntry); err != nil {
 		log.Printf("Failed to write to node acquisition log: %v", err)
 	}
@@ -150,7 +154,7 @@ var _ = AfterSuite(func() {
 	// With dynamic node acquisition, each test handles its own namespace cleanup
 	// AfterSuite doesn't need to clean specific namespaces
 	fmt.Printf("Dynamic node acquisition active - per-test cleanup handled individually\n")
-	fmt.Printf("Test outcomes: failures=%v, preserve_on_failure=%v, skip_cleanup=%v\n", 
+	fmt.Printf("Test outcomes: failures=%v, preserve_on_failure=%v, skip_cleanup=%v\n",
 		hasFailedTests, preserveOnFailure, skipCleanup)
 
 	// Always show test artifacts execution ID for debugging
@@ -177,34 +181,34 @@ var _ = BeforeEach(func() {
 	// Use deterministic node assignment based on Ginkgo worker ID and available nodes
 	// This ensures proper distribution across parallel processes without locking conflicts
 	workerID := GinkgoParallelProcess()
-	
+
 	if len(availableNodes) == 0 {
 		Fail("No available nodes for test execution")
 	}
-	
+
 	// Assign node deterministically but cycle through all available nodes
 	nodeIndex := (workerID - 1) % len(availableNodes) // Ginkgo workers are 1-based
 	currentTestNode = availableNodes[nodeIndex]
-	
+
 	// Create unique namespace per node (simplified from worker-based approach)
 	// Each node gets one namespace shared by all workers assigned to it
 	// This makes cleanup much easier: kubectl delete ns wekaplugin-e2e-<node-name>
 	sanitizedNodeName := strings.ToLower(strings.ReplaceAll(currentTestNode, ".", "-"))
 	currentTestNamespace = fmt.Sprintf("%s-%s", baseTestNamespace, sanitizedNodeName)
-	
+
 	// Set the global testNamespace for this test
 	testNamespace = currentTestNamespace
-	
+
 	// Create the namespace
 	err := createTestNamespaceWithRetry(currentTestNamespace, 2*time.Minute)
 	Expect(err).ToNot(HaveOccurred(), fmt.Sprintf("Failed to create namespace %s", currentTestNamespace))
-	
+
 	// Log node acquisition to unified tracking file
 	logNodeAcquisition(workerID, currentTestNode, currentTestNamespace, "ACQUIRED")
-	
-	fmt.Printf("Worker %d assigned to node %s with namespace %s (available nodes: %d)\n", 
+
+	fmt.Printf("Worker %d assigned to node %s with namespace %s (available nodes: %d)\n",
 		workerID, currentTestNode, currentTestNamespace, len(availableNodes))
-	
+
 	// Log test start
 	logNodeAcquisition(workerID, currentTestNode, currentTestNamespace, "TEST_START")
 })
@@ -217,13 +221,13 @@ var _ = AfterEach(func() {
 		status = "FAILED"
 	}
 	logNodeAcquisition(workerID, currentTestNode, currentTestNamespace, fmt.Sprintf("TEST_%s", status))
-	
+
 	// Determine if current test failed
 	currentTestFailed = CurrentSpecReport().Failed()
 	if currentTestFailed {
 		hasFailedTests = true
 	}
-	
+
 	// Handle namespace cleanup based on failure status
 	preserveOnFailure := os.Getenv("PRESERVE_ON_FAILURE") == "true"
 	skipCleanup := os.Getenv("SKIP_CLEANUP") == "true"
@@ -240,21 +244,20 @@ var _ = AfterEach(func() {
 			logNodeAcquisition(GinkgoParallelProcess(), currentTestNode, currentTestNamespace, "RELEASED")
 		}
 	} else {
-		fmt.Printf("Preserving namespace %s on node %s for debugging (test_failed=%v, preserve_on_failure=%v)\n", 
+		fmt.Printf("Preserving namespace %s on node %s for debugging (test_failed=%v, preserve_on_failure=%v)\n",
 			currentTestNamespace, currentTestNode, currentTestFailed, preserveOnFailure)
 		fmt.Printf("Debug commands:\n")
 		fmt.Printf("  kubectl get pods -n %s -o wide\n", currentTestNamespace)
-		fmt.Printf("  kubectl describe pods -n %s\n", currentTestNamespace) 
+		fmt.Printf("  kubectl describe pods -n %s\n", currentTestNamespace)
 		fmt.Printf("  kubectl logs -n kube-system -l app=weka-nri-cpuset --since=5m\n")
 		fmt.Printf("Manual cleanup: kubectl delete namespace %s\n", currentTestNamespace)
 	}
-	
+
 	// Reset globals
 	testNamespace = ""
 	currentTestNode = ""
 	currentTestNamespace = ""
 })
-
 
 // Namespace lifecycle management functions
 
@@ -445,7 +448,7 @@ func cleanupAllPodsAndWait() {
 					fmt.Printf("Timeout during pod termination check: %v\n", r)
 				}
 			}()
-			
+
 			// Use a non-failing check instead of Should(BeTrue())
 			startTime := time.Now()
 			for time.Since(startTime) < 60*time.Second {
@@ -475,7 +478,7 @@ func cleanupAllPodsAndWait() {
 						fmt.Printf("Timeout during force delete: %v\n", r)
 					}
 				}()
-				
+
 				// Use a non-failing check instead of Should(BeTrue())
 				startTime := time.Now()
 				for time.Since(startTime) < 10*time.Second {
@@ -557,11 +560,11 @@ func waitForPluginStateSync() {
 	//
 	// In parallel execution, multiple workers may be creating/deleting pods rapidly
 	// so we need to ensure all events are fully processed before next test starts
-	
+
 	// Increased wait time for better reliability in parallel execution
 	// Previous 5s was insufficient when multiple workers compete for resources
 	time.Sleep(15 * time.Second)
-	
+
 	// Additional verification: ensure no pods are in terminating state
 	// This helps prevent race conditions where new tests start before cleanup completes
 	Eventually(func() bool {
@@ -569,7 +572,7 @@ func waitForPluginStateSync() {
 		if err != nil {
 			return false // Continue waiting if we can't check
 		}
-		
+
 		// Check if any pods are still terminating
 		for _, pod := range pods.Items {
 			if pod.DeletionTimestamp != nil {
@@ -578,7 +581,7 @@ func waitForPluginStateSync() {
 			}
 		}
 		return true
-	}, 30 * time.Second, 2 * time.Second).Should(BeTrue(), "All pods should finish terminating before next test")
+	}, 30*time.Second, 2*time.Second).Should(BeTrue(), "All pods should finish terminating before next test")
 }
 
 // createDistributedTestPod creates a pod on the dynamically assigned node
