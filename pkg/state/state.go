@@ -202,6 +202,11 @@ func (m *Manager) findConflictingIntegerContainers(requestedCPUs []int) map[stri
 
 // planReallocation creates a reallocation plan for conflicting containers
 func (m *Manager) planReallocation(conflictingContainers map[string]*ContainerInfo, annotatedCPUs []int, alloc Allocator) ([]ReallocationPlan, error) {
+	// Pre-validate: Check if there are sufficient free CPUs for all reallocations
+	if err := m.validateReallocationFeasibility(conflictingContainers, annotatedCPUs, alloc); err != nil {
+		return nil, err
+	}
+
 	var plans []ReallocationPlan
 	allReserved := m.getReservedCPUsUnsafe()
 
@@ -251,6 +256,66 @@ func (m *Manager) updateReservedSetForPlan(reserved []int, oldCPUs []int, newCPU
 	}
 
 	return result
+}
+
+// validateReallocationFeasibility checks if there are enough free CPUs to reallocate all conflicting containers
+func (m *Manager) validateReallocationFeasibility(conflictingContainers map[string]*ContainerInfo, annotatedCPUs []int, alloc Allocator) error {
+	// Calculate total CPUs needed for reallocation
+	totalCPUsNeeded := 0
+	for _, container := range conflictingContainers {
+		totalCPUsNeeded += len(container.CPUs)
+	}
+
+	// Calculate CPUs that will be freed by removing conflicts
+	conflictCPUSet := make(map[int]struct{})
+	for _, container := range conflictingContainers {
+		for _, cpu := range container.CPUs {
+			// Only count CPUs that are actually requested by annotated pod
+			for _, annotatedCPU := range annotatedCPUs {
+				if cpu == annotatedCPU {
+					conflictCPUSet[cpu] = struct{}{}
+					break
+				}
+			}
+		}
+	}
+	freedCPUs := len(conflictCPUSet)
+
+	// Get current reserved CPUs (excluding the conflicting ones)
+	allReserved := m.getReservedCPUsUnsafe()
+	effectiveReserved := make(map[int]struct{})
+	for _, cpu := range allReserved {
+		effectiveReserved[cpu] = struct{}{}
+	}
+	// Remove the CPUs that will be freed by reallocation
+	for _, container := range conflictingContainers {
+		for _, cpu := range container.CPUs {
+			delete(effectiveReserved, cpu)
+		}
+	}
+	// Add the CPUs that will be taken by the annotated pod
+	for _, cpu := range annotatedCPUs {
+		effectiveReserved[cpu] = struct{}{}
+	}
+
+	// Convert back to slice for allocator
+	var reserved []int
+	for cpu := range effectiveReserved {
+		reserved = append(reserved, cpu)
+	}
+
+	// Check if we can allocate the required CPUs
+	_, err := alloc.AllocateExclusiveCPUs(totalCPUsNeeded, reserved)
+	if err != nil {
+		fmt.Printf("DEBUG: Reallocation feasibility check failed: need %d CPUs, freed %d CPUs, but allocation failed: %v\n", 
+			totalCPUsNeeded, freedCPUs, err)
+		return fmt.Errorf("insufficient free CPUs for reallocation: need %d CPUs for %d containers, but allocation failed: %w", 
+			totalCPUsNeeded, len(conflictingContainers), err)
+	}
+
+	fmt.Printf("DEBUG: Reallocation feasibility check passed: need %d CPUs, freed %d CPUs\n", 
+		totalCPUsNeeded, freedCPUs)
+	return nil
 }
 
 // executeReallocationPlan creates the update requests but defers state changes

@@ -290,8 +290,10 @@ var _ = Describe("Live CPU Reallocation Features", Label("e2e", "parallel"), fun
 			By("Creating many integer pods to consume most available CPUs")
 			var integerPods []*corev1.Pod
 			// Create enough integer pods to leave insufficient CPUs for reallocation
-			// Each pod gets 2 CPUs, create 10 pods = 20 CPUs used
-			for i := 0; i < 10; i++ {
+			// Each pod gets 2 CPUs, create enough to consume most available CPUs
+			// We'll create pods until we can't anymore, then try to force impossible reallocation
+			maxPods := 50 // Safety limit to prevent infinite loops
+			for i := 0; i < maxPods; i++ {
 				integerResources := &corev1.ResourceRequirements{
 					Limits: corev1.ResourceList{
 						corev1.ResourceCPU:    resource.MustParse("2"),
@@ -626,7 +628,8 @@ var _ = Describe("Live CPU Reallocation Features", Label("e2e", "parallel"), fun
 			By("Creating integer pods to consume most available CPUs")
 			// Create multiple integer pods to consume most CPUs, leaving few available
 			var integerPods []*corev1.Pod
-			for i := 0; i < 3; i++ { // Create 3 integer pods with 2 CPUs each
+			maxPods := 50 // Safety limit to prevent infinite loops
+			for i := 0; i < maxPods; i++ { // Create enough pods to exhaust most CPUs
 				integerResources := &corev1.ResourceRequirements{
 					Limits: corev1.ResourceList{
 						corev1.ResourceCPU:    resource.MustParse("2"),
@@ -640,7 +643,11 @@ var _ = Describe("Live CPU Reallocation Features", Label("e2e", "parallel"), fun
 
 				integerPod := createTestPod(fmt.Sprintf("conflict-integer-%d", i), nil, integerResources)
 				createdPod, err := kubeClient.CoreV1().Pods(testNamespace).Create(ctx, integerPod, metav1.CreateOptions{})
-				Expect(err).ToNot(HaveOccurred())
+				if err != nil {
+					// If we can't create more integer pods, we've hit resource limits - that's expected
+					GinkgoWriter.Printf("Created %d integer pods before hitting limits\n", len(integerPods))
+					break
+				}
 				integerPods = append(integerPods, createdPod)
 			}
 
