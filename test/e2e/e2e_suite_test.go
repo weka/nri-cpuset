@@ -3,8 +3,10 @@ package e2e
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -25,6 +27,39 @@ const (
 	interval          = 2 * time.Second // Reduced from 10 seconds
 )
 
+// logNodeAcquisition logs node acquisition/release events to a unified tracking file
+func logNodeAcquisition(workerID int, nodeName, namespace, action string) {
+	logFile := filepath.Join("test", "e2e", "node-acquisition.log")
+	
+	// Ensure the directory exists
+	if err := os.MkdirAll(filepath.Dir(logFile), 0755); err != nil {
+		log.Printf("Failed to create log directory: %v", err)
+		return
+	}
+	
+	// Open log file in append mode
+	file, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		log.Printf("Failed to open node acquisition log: %v", err)
+		return
+	}
+	defer file.Close()
+	
+	// Get current test name if available
+	testName := "unknown"
+	if CurrentSpecReport().FullText() != "" {
+		testName = CurrentSpecReport().FullText()
+	}
+	
+	// Write log entry
+	timestamp := time.Now().Format("2006-01-02 15:04:05.000")
+	logEntry := fmt.Sprintf("[%s] Worker-%d %s node=%s namespace=%s test=\"%s\"\n", 
+		timestamp, workerID, action, nodeName, namespace, testName)
+	
+	if _, err := file.WriteString(logEntry); err != nil {
+		log.Printf("Failed to write to node acquisition log: %v", err)
+	}
+}
 
 var (
 	kubeClient        kubernetes.Interface
@@ -151,9 +186,11 @@ var _ = BeforeEach(func() {
 	nodeIndex := (workerID - 1) % len(availableNodes) // Ginkgo workers are 1-based
 	currentTestNode = availableNodes[nodeIndex]
 	
-	// Create unique namespace for this worker/node combination
+	// Create unique namespace per node (simplified from worker-based approach)
+	// Each node gets one namespace shared by all workers assigned to it
+	// This makes cleanup much easier: kubectl delete ns wekaplugin-e2e-<node-name>
 	sanitizedNodeName := strings.ToLower(strings.ReplaceAll(currentTestNode, ".", "-"))
-	currentTestNamespace = fmt.Sprintf("%s-%s-w%d", baseTestNamespace, sanitizedNodeName, workerID)
+	currentTestNamespace = fmt.Sprintf("%s-%s", baseTestNamespace, sanitizedNodeName)
 	
 	// Set the global testNamespace for this test
 	testNamespace = currentTestNamespace
@@ -162,11 +199,25 @@ var _ = BeforeEach(func() {
 	err := createTestNamespaceWithRetry(currentTestNamespace, 2*time.Minute)
 	Expect(err).ToNot(HaveOccurred(), fmt.Sprintf("Failed to create namespace %s", currentTestNamespace))
 	
+	// Log node acquisition to unified tracking file
+	logNodeAcquisition(workerID, currentTestNode, currentTestNamespace, "ACQUIRED")
+	
 	fmt.Printf("Worker %d assigned to node %s with namespace %s (available nodes: %d)\n", 
 		workerID, currentTestNode, currentTestNamespace, len(availableNodes))
+	
+	// Log test start
+	logNodeAcquisition(workerID, currentTestNode, currentTestNamespace, "TEST_START")
 })
 
 var _ = AfterEach(func() {
+	// Log test completion
+	workerID := GinkgoParallelProcess()
+	status := "PASSED"
+	if CurrentSpecReport().Failed() {
+		status = "FAILED"
+	}
+	logNodeAcquisition(workerID, currentTestNode, currentTestNamespace, fmt.Sprintf("TEST_%s", status))
+	
 	// Determine if current test failed
 	currentTestFailed = CurrentSpecReport().Failed()
 	if currentTestFailed {
@@ -185,6 +236,8 @@ var _ = AfterEach(func() {
 			fmt.Printf("Warning: Failed to cleanup namespace %s: %v\n", currentTestNamespace, err)
 		} else {
 			fmt.Printf("Successfully cleaned up namespace %s\n", currentTestNamespace)
+			// Log node release to unified tracking file
+			logNodeAcquisition(GinkgoParallelProcess(), currentTestNode, currentTestNamespace, "RELEASED")
 		}
 	} else {
 		fmt.Printf("Preserving namespace %s on node %s for debugging (test_failed=%v, preserve_on_failure=%v)\n", 
@@ -540,5 +593,5 @@ func createDistributedTestPod(name string, annotations map[string]string, resour
 // Benefits:
 // 1. No ConfigMap-based locks needed (eliminates race conditions)
 // 2. Predictable resource allocation (no "all nodes busy" scenarios)
-// 3. Simplified debugging (worker ID -> node name -> namespace mapping)
+// 3. Simplified debugging (node name -> namespace mapping, easy cleanup)
 // 4. Better test isolation (each worker has dedicated resources)

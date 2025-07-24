@@ -247,6 +247,11 @@ var _ = Describe("Shared Pod Tests", Label("e2e", "parallel"), func() {
 
 var _ = Describe("Mixed Workload Scenarios", Label("e2e", "parallel"), func() {
 	Context("When running mixed workloads", func() {
+		BeforeEach(func() {
+			// Ensure clean state before mixed workload tests to avoid interference from previous tests
+			cleanupAllPodsAndWait()
+		})
+
 		AfterEach(func() {
 			// Clean up any pods created in tests (conditional on failure)
 			cleanupAllPodsConditional()

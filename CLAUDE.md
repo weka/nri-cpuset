@@ -222,6 +222,32 @@ KUBECONFIG=/path/to/kubeconfig kubectl get pods -n kube-system -l app=weka-nri-c
 KUBECONFIG=/path/to/kubeconfig kubectl describe pods -n kube-system -l app=weka-nri-cpuset
 ```
 
+##### Node Acquisition Tracking
+```bash
+# View node acquisition/release log for test execution tracking
+cat test/e2e/node-acquisition.log
+
+# Monitor node acquisition in real-time during test execution
+tail -f test/e2e/node-acquisition.log
+
+# Filter for specific worker or node activity
+grep "Worker-1" test/e2e/node-acquisition.log
+grep "node=worker-node-1" test/e2e/node-acquisition.log
+
+# View recent node activity (last 20 entries)
+tail -20 test/e2e/node-acquisition.log
+```
+
+**Key Debugging Resource**: The `test/e2e/node-acquisition.log` file tracks all node acquisition and release events during parallel test execution. This log is essential for understanding:
+- Which worker acquired which node and when
+- Test execution timeline and node conflicts
+- Node release patterns and cleanup verification
+- Namespace-to-node mapping for debugging failed tests
+
+Log format: `[timestamp] Worker-ID ACTION node=node-name namespace=namespace-name test="test-description"`
+
+Actions tracked: `ACQUIRED`, `TEST_START`, `TEST_PASSED`/`TEST_FAILED`, `RELEASED`
+
 ##### Test Environment Management
 ```bash
 # Clean up leftover test pods (important for test reliability)

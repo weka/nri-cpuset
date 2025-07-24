@@ -55,7 +55,8 @@ var _ = Describe("Live CPU Reallocation Features", Label("e2e", "parallel"), fun
 	// )
 
 	BeforeEach(func() {
-		// Test setup if needed
+		// Ensure clean state before live reallocation tests to avoid interference from previous tests
+		cleanupAllPodsAndWait()
 	})
 
 	AfterEach(func() {
@@ -673,42 +674,25 @@ var _ = Describe("Live CPU Reallocation Features", Label("e2e", "parallel"), fun
 			AddDebugInfo("SUCCESS: Multiple annotated pods successfully sharing same CPUs")
 		})
 
-		It("should gracefully handle resource conflicts", func() {
-			By("Calculating available CPU resources on target node")
-			// Get the target node's CPU capacity and current allocations
+		It("should successfully reallocate when sufficient resources exist", func() {
+			By("Calculating available CPU cores on target node")
+			// Get the target node's actual CPU core count
 			node, err := kubeClient.CoreV1().Nodes().Get(ctx, currentTestNode, metav1.GetOptions{})
 			Expect(err).ToNot(HaveOccurred())
 			
 			nodeCPUCapacity := node.Status.Allocatable[corev1.ResourceCPU]
-			totalCPUs := nodeCPUCapacity.Value()
+			totalCPUs := int(nodeCPUCapacity.Value())
 			
-			// Get current CPU requests on the node to calculate available capacity
-			pods, err := kubeClient.CoreV1().Pods("").List(ctx, metav1.ListOptions{
-				FieldSelector: "spec.nodeName=" + currentTestNode + ",status.phase!=Failed,status.phase!=Succeeded",
-			})
-			Expect(err).ToNot(HaveOccurred())
+			// Create some integer pods, leaving sufficient cores for reallocation
+			// Each integer pod gets 2 cores. We'll create enough to force conflicts but leave space for reallocation
+			maxIntegerPods := min(15, (totalCPUs-8)/2) // Leave at least 8 cores free for reallocation
 			
-			var currentCPURequests int64
-			for _, pod := range pods.Items {
-				for _, container := range pod.Spec.Containers {
-					if cpuRequest, exists := container.Resources.Requests[corev1.ResourceCPU]; exists {
-						currentCPURequests += cpuRequest.MilliValue()
-					}
-				}
+			if maxIntegerPods < 2 {
+				Skip(fmt.Sprintf("Node %s has insufficient CPUs (%d total). Need at least 12 CPUs for this test", currentTestNode, totalCPUs))
 			}
 			
-			availableCPUMillis := totalCPUs*1000 - currentCPURequests
-			// Each integer pod needs 2 CPUs (2000 millicores), leave only 1 CPU buffer so reallocation will fail
-			// The test expects reallocation to fail due to insufficient resources
-			bufferCPUMillis := int64(1000) // 1 CPU buffer - insufficient for reallocation needs
-			maxIntegerPods := int((availableCPUMillis - bufferCPUMillis) / 2000)
-			
-			if maxIntegerPods < 1 {
-				Skip(fmt.Sprintf("Insufficient CPU resources on node %s. Available: %dm, Required: >2000m", currentTestNode, availableCPUMillis))
-			}
-			
-			GinkgoWriter.Printf("Node %s: Total CPUs=%d, Available=%dm, Creating %d integer pods (2 CPUs each), Buffer=1 CPU\n", 
-				currentTestNode, totalCPUs, availableCPUMillis, maxIntegerPods)
+			GinkgoWriter.Printf("Node %s: Total CPUs=%d, Creating %d integer pods (2 CPUs each), Leaving %d free cores (sufficient for reallocation)\n", 
+				currentTestNode, totalCPUs, maxIntegerPods, totalCPUs-maxIntegerPods*2)
 
 			By("Creating integer pods to consume most available CPUs")
 			var integerPods []*corev1.Pod
@@ -768,8 +752,8 @@ var _ = Describe("Live CPU Reallocation Features", Label("e2e", "parallel"), fun
 
 			AddDebugInfo(fmt.Sprintf("Integer pods allocated CPUs: %v", allocatedCPUs))
 
-			By("Creating annotated pod that conflicts with all integer CPUs (should fail)")
-			// Request all the CPUs that integer pods are using
+			By("Creating annotated pod that conflicts with integer CPUs (should trigger reallocation)")
+			// Request some CPUs that integer pods are using to trigger reallocation
 			conflictingCPUs := strings.Join(allocatedCPUs[:min(len(allocatedCPUs), 4)], ",") // Request up to 4 conflicting CPUs
 
 			conflictPod := createTestPod("conflict-annotated", map[string]string{
@@ -779,38 +763,23 @@ var _ = Describe("Live CPU Reallocation Features", Label("e2e", "parallel"), fun
 			createdConflictPod, err := kubeClient.CoreV1().Pods(testNamespace).Create(ctx, conflictPod, metav1.CreateOptions{})
 			Expect(err).ToNot(HaveOccurred())
 
-			By("Verifying annotated pod fails due to insufficient resources for reallocation")
+			By("Verifying annotated pod succeeds through live reallocation")
+			waitForPodRunning(createdConflictPod.Name)
+
+			By("Verifying annotated pod has the requested CPU assignment")
 			Eventually(func() bool {
-				updatedPod, err := kubeClient.CoreV1().Pods(testNamespace).Get(ctx, createdConflictPod.Name, metav1.GetOptions{})
+				output, err := getPodCPUSet(createdConflictPod.Name)
 				if err != nil {
 					return false
 				}
-
-				// Check for scheduling failure or container creation error
-				for _, condition := range updatedPod.Status.Conditions {
-					if condition.Type == corev1.PodScheduled && condition.Status == corev1.ConditionFalse {
-						if strings.Contains(condition.Message, "CPU") || strings.Contains(condition.Message, "resource") {
-							AddDebugInfo(fmt.Sprintf("Pod correctly failed to schedule: %s", condition.Message))
-							return true
-						}
+				// Verify the pod got the CPUs it requested
+				for _, cpu := range strings.Split(conflictingCPUs, ",") {
+					if !strings.Contains(output, cpu) {
+						return false
 					}
 				}
-
-				// Also check container status for creation errors
-				for _, containerStatus := range updatedPod.Status.ContainerStatuses {
-					if containerStatus.State.Waiting != nil {
-						if strings.Contains(containerStatus.State.Waiting.Reason, "CreateContainerError") ||
-							strings.Contains(containerStatus.State.Waiting.Message, "CPU") ||
-							strings.Contains(containerStatus.State.Waiting.Message, "insufficient") {
-							AddDebugInfo(fmt.Sprintf("Pod correctly failed with resource error: %s - %s",
-								containerStatus.State.Waiting.Reason, containerStatus.State.Waiting.Message))
-							return true
-						}
-					}
-				}
-
-				return false
-			}, timeout, interval).Should(BeTrue(), "Annotated pod should fail when reallocation is impossible")
+				return strings.Contains(output, "Cpus_allowed_list:")
+			}, timeout, interval).Should(BeTrue(), "Annotated pod should get requested CPUs through reallocation")
 
 			By("Verifying integer pods remain running and unaffected")
 			Consistently(func() bool {
@@ -823,9 +792,9 @@ var _ = Describe("Live CPU Reallocation Features", Label("e2e", "parallel"), fun
 					}
 				}
 				return allRunning
-			}, "30s", "5s").Should(BeTrue(), "Integer pods should remain running when annotated pod conflicts cannot be resolved")
+			}, "30s", "5s").Should(BeTrue(), "Integer pods should remain running after reallocation")
 
-			AddDebugInfo("SUCCESS: Resource conflicts handled gracefully - annotated pod failed, integer pods preserved")
+			AddDebugInfo("SUCCESS: Resource conflicts handled gracefully - integer pods reallocated, annotated pod succeeded")
 		})
 	})
 

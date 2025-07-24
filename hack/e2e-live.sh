@@ -330,15 +330,15 @@ cleanup() {
 reset_test_environment() {
     log_info "Resetting test environment to clean state..."
     
-    # Clean up any existing test namespaces (including per-worker namespaces)
+    # Clean up any existing test namespaces (node-based namespaces)
     log_info "Cleaning up existing test namespaces..."
     kubectl delete namespace "$TEST_NS" --ignore-not-found=true --timeout=60s
-    # Clean up any worker-specific namespaces from previous runs
-    kubectl get namespaces -o name | grep "namespace/${TEST_NS}-w" | xargs -r kubectl delete --timeout=60s
+    # Clean up any node-specific namespaces from previous runs (simplified from worker-based)
+    kubectl get namespaces -o name | grep "namespace/${TEST_NS}-" | xargs -r kubectl delete --timeout=60s
     
     # Wait for namespaces to be fully deleted
     log_info "Waiting for namespace deletion to complete..."
-    while kubectl get namespace "$TEST_NS" &> /dev/null || kubectl get namespaces -o name | grep -q "namespace/${TEST_NS}-w"; do
+    while kubectl get namespace "$TEST_NS" &> /dev/null || kubectl get namespaces -o name | grep -q "namespace/${TEST_NS}-"; do
         sleep 2
     done
     
