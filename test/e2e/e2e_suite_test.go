@@ -25,6 +25,7 @@ const (
 	interval          = 2 * time.Second // Reduced from 10 seconds
 )
 
+
 var (
 	kubeClient        kubernetes.Interface
 	kubeConfig        *rest.Config
@@ -33,8 +34,6 @@ var (
 	preserveOnFailure bool
 	testNamespace     string
 	hasFailedTests    bool
-	nodeAssignments   map[int]string // worker_id -> node_name
-	exclusiveNode     string         // Node assigned exclusively to this worker
 )
 
 func TestE2E(t *testing.T) {
@@ -64,41 +63,21 @@ var _ = BeforeSuite(func() {
 	kubeClient, err = kubernetes.NewForConfig(kubeConfig)
 	Expect(err).ToNot(HaveOccurred(), "Failed to create Kubernetes client")
 
-	// Get list of available nodes for distribution
+	// Get list of available nodes for deterministic assignment
 	nodes, err := kubeClient.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	Expect(err).ToNot(HaveOccurred(), "Failed to list nodes")
 	for _, node := range nodes.Items {
 		availableNodes = append(availableNodes, node.Name)
 	}
-	fmt.Printf("Found %d available nodes for test distribution: %v\n", len(availableNodes), availableNodes)
+	fmt.Printf("Found %d available nodes for deterministic assignment: %v\n", len(availableNodes), availableNodes)
 
-	// Initialize node assignments for parallel workers
-	nodeAssignments = make(map[int]string)
+	// No pre-assignment of nodes - tests will get nodes assigned per-test deterministically
+	// This allows for proper parallelization across multiple workers
+	testNamespace = "" // Will be set per test in BeforeEach
 
-	// Get deterministic node assignment based on worker ID
-	workerID := GinkgoParallelProcess()
-	if len(availableNodes) > 0 {
-		// Assign nodes deterministically: worker 1 gets node 0, worker 2 gets node 1, etc.
-		// This eliminates race conditions in node acquisition
-		nodeIndex := (workerID - 1) % len(availableNodes) // Ginkgo workers are 1-based
-		exclusiveNode = availableNodes[nodeIndex]
-		nodeAssignments[workerID] = exclusiveNode
-		fmt.Printf("Worker %d assigned to node: %s (index %d of %d nodes)\n", workerID, exclusiveNode, nodeIndex, len(availableNodes))
-	}
-
-	// Create node-based namespace for predictable resource isolation
-	// Use sanitized node name to ensure valid K8s namespace name
-	sanitizedNodeName := strings.ToLower(strings.ReplaceAll(exclusiveNode, ".", "-"))
-	testNamespace = fmt.Sprintf("%s-%s", baseTestNamespace, sanitizedNodeName)
-	fmt.Printf("Using node-based test namespace: %s\n", testNamespace)
-
-	// Create test namespace with proper lifecycle management
-	err = createTestNamespaceWithRetry(testNamespace, 5*time.Minute)
-	Expect(err).ToNot(HaveOccurred(), fmt.Sprintf("Failed to create test namespace %s", testNamespace))
-
-	// Initialize test artifact collection system after kubeClient and testNamespace are ready
+	// Initialize test artifact collection system - namespace will be set per test
 	if globalArtifacts == nil {
-		globalArtifacts = InitializeTestArtifacts(kubeClient, testNamespace)
+		globalArtifacts = InitializeTestArtifacts(kubeClient, "")
 		fmt.Printf("Initialized test artifacts collection - Execution ID: %s\n", globalArtifacts.ExecutionID)
 	} else {
 		fmt.Printf("Using existing test artifacts collection - Execution ID: %s\n", globalArtifacts.ExecutionID)
@@ -125,39 +104,19 @@ var _ = BeforeSuite(func() {
 })
 
 var _ = AfterSuite(func() {
-	// No need to release node lock since we use deterministic assignment
-	// Node assignment is based on worker ID, not competitive acquisition
+	// Dynamic node acquisition system - nodes are acquired/released per test
 	workerID := GinkgoParallelProcess()
-	fmt.Printf("Worker %d (node %s) completing test suite\n", workerID, exclusiveNode)
+	fmt.Printf("Worker %d completing test suite\n", workerID)
 
 	// Check environment settings and test outcomes
 	preserveOnFailure := os.Getenv("PRESERVE_ON_FAILURE") == "true"
 	skipCleanup := os.Getenv("SKIP_CLEANUP") == "true"
 
-	// Decide whether to clean up namespace
-	shouldCleanupNamespace := !skipCleanup && (!hasFailedTests || !preserveOnFailure)
-
-	if shouldCleanupNamespace {
-		fmt.Printf("Cleaning up test namespace %s (no failures in this worker)\n", testNamespace)
-		if kubeClient != nil {
-			err := deleteTestNamespaceWithWait(testNamespace, 2*time.Minute)
-			if err != nil {
-				fmt.Printf("Warning: Failed to cleanup namespace %s: %v\n", testNamespace, err)
-			} else {
-				fmt.Printf("Successfully cleaned up namespace %s\n", testNamespace)
-			}
-		}
-	} else {
-		if kubeClient != nil {
-			fmt.Printf("Preserving namespace %s for debugging (failures: %v, preserve on failure: %v, skip cleanup: %v)\n",
-				testNamespace, hasFailedTests, preserveOnFailure, skipCleanup)
-			fmt.Printf("Debug commands:\n")
-			fmt.Printf("  kubectl get pods -n %s -o wide\n", testNamespace)
-			fmt.Printf("  kubectl describe pods -n %s\n", testNamespace)
-			fmt.Printf("  kubectl logs -n kube-system -l app=weka-nri-cpuset --since=5m\n")
-			fmt.Printf("Manual cleanup: kubectl delete namespace %s\n", testNamespace)
-		}
-	}
+	// With dynamic node acquisition, each test handles its own namespace cleanup
+	// AfterSuite doesn't need to clean specific namespaces
+	fmt.Printf("Dynamic node acquisition active - per-test cleanup handled individually\n")
+	fmt.Printf("Test outcomes: failures=%v, preserve_on_failure=%v, skip_cleanup=%v\n", 
+		hasFailedTests, preserveOnFailure, skipCleanup)
 
 	// Always show test artifacts execution ID for debugging
 	if globalArtifacts != nil {
@@ -171,6 +130,78 @@ var _ = AfterSuite(func() {
 		fmt.Printf("=====================================\n")
 	}
 })
+
+// Dynamic node acquisition for each test
+var (
+	currentTestNode      string
+	currentTestNamespace string
+	currentTestFailed    bool
+)
+
+var _ = BeforeEach(func() {
+	// Use deterministic node assignment based on Ginkgo worker ID and available nodes
+	// This ensures proper distribution across parallel processes without locking conflicts
+	workerID := GinkgoParallelProcess()
+	
+	if len(availableNodes) == 0 {
+		Fail("No available nodes for test execution")
+	}
+	
+	// Assign node deterministically but cycle through all available nodes
+	nodeIndex := (workerID - 1) % len(availableNodes) // Ginkgo workers are 1-based
+	currentTestNode = availableNodes[nodeIndex]
+	
+	// Create unique namespace for this worker/node combination
+	sanitizedNodeName := strings.ToLower(strings.ReplaceAll(currentTestNode, ".", "-"))
+	currentTestNamespace = fmt.Sprintf("%s-%s-w%d", baseTestNamespace, sanitizedNodeName, workerID)
+	
+	// Set the global testNamespace for this test
+	testNamespace = currentTestNamespace
+	
+	// Create the namespace
+	err := createTestNamespaceWithRetry(currentTestNamespace, 2*time.Minute)
+	Expect(err).ToNot(HaveOccurred(), fmt.Sprintf("Failed to create namespace %s", currentTestNamespace))
+	
+	fmt.Printf("Worker %d assigned to node %s with namespace %s (available nodes: %d)\n", 
+		workerID, currentTestNode, currentTestNamespace, len(availableNodes))
+})
+
+var _ = AfterEach(func() {
+	// Determine if current test failed
+	currentTestFailed = CurrentSpecReport().Failed()
+	if currentTestFailed {
+		hasFailedTests = true
+	}
+	
+	// Handle namespace cleanup based on failure status
+	preserveOnFailure := os.Getenv("PRESERVE_ON_FAILURE") == "true"
+	skipCleanup := os.Getenv("SKIP_CLEANUP") == "true"
+	shouldCleanup := !skipCleanup && (!currentTestFailed || !preserveOnFailure)
+
+	if shouldCleanup {
+		fmt.Printf("Cleaning up namespace %s for node %s\n", currentTestNamespace, currentTestNode)
+		err := deleteTestNamespaceWithWait(currentTestNamespace, 2*time.Minute)
+		if err != nil {
+			fmt.Printf("Warning: Failed to cleanup namespace %s: %v\n", currentTestNamespace, err)
+		} else {
+			fmt.Printf("Successfully cleaned up namespace %s\n", currentTestNamespace)
+		}
+	} else {
+		fmt.Printf("Preserving namespace %s on node %s for debugging (test_failed=%v, preserve_on_failure=%v)\n", 
+			currentTestNamespace, currentTestNode, currentTestFailed, preserveOnFailure)
+		fmt.Printf("Debug commands:\n")
+		fmt.Printf("  kubectl get pods -n %s -o wide\n", currentTestNamespace)
+		fmt.Printf("  kubectl describe pods -n %s\n", currentTestNamespace) 
+		fmt.Printf("  kubectl logs -n kube-system -l app=weka-nri-cpuset --since=5m\n")
+		fmt.Printf("Manual cleanup: kubectl delete namespace %s\n", currentTestNamespace)
+	}
+	
+	// Reset globals
+	testNamespace = ""
+	currentTestNode = ""
+	currentTestNamespace = ""
+})
+
 
 // Namespace lifecycle management functions
 
@@ -486,15 +517,14 @@ func waitForPluginStateSync() {
 	}, 30 * time.Second, 2 * time.Second).Should(BeTrue(), "All pods should finish terminating before next test")
 }
 
-// createDistributedTestPod creates a pod on the deterministically assigned node
+// createDistributedTestPod creates a pod on the dynamically assigned node
 func createDistributedTestPod(name string, annotations map[string]string, resources *corev1.ResourceRequirements) *corev1.Pod {
-	// Make pod names unique per node and timestamp to prevent name collisions
-	// Use node name in pod name for better traceability
+	// Use the node acquired by BeforeEach for this test
 	timestamp := time.Now().Unix()
-	sanitizedNodeName := strings.ToLower(strings.ReplaceAll(exclusiveNode, ".", "-"))
+	sanitizedNodeName := strings.ToLower(strings.ReplaceAll(currentTestNode, ".", "-"))
 	uniquePodName := fmt.Sprintf("%s-%s-%d", name, sanitizedNodeName, timestamp)
 
-	return createTestPodWithNode(uniquePodName, exclusiveNode, annotations, resources)
+	return createTestPodWithNode(uniquePodName, currentTestNode, annotations, resources)
 }
 
 // createTestPodOnWorkerNode function removed as unused

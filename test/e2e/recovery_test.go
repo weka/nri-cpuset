@@ -69,10 +69,10 @@ var _ = Describe("Plugin Recovery and Synchronization", Label("e2e", "parallel")
 			// Find the plugin pod running on our exclusive test node
 			pods, err := kubeClient.CoreV1().Pods("kube-system").List(ctx, metav1.ListOptions{
 				LabelSelector: "app=" + pluginName,
-				FieldSelector: "spec.nodeName=" + exclusiveNode,
+				FieldSelector: "spec.nodeName=" + currentTestNode,
 			})
 			Expect(err).ToNot(HaveOccurred())
-			Expect(len(pods.Items)).To(BeNumerically(">", 0), fmt.Sprintf("Plugin pod should exist on node %s", exclusiveNode))
+			Expect(len(pods.Items)).To(BeNumerically(">", 0), fmt.Sprintf("Plugin pod should exist on node %s", currentTestNode))
 
 			pluginPod := &pods.Items[0]
 			oldPodUID := pluginPod.UID
@@ -86,7 +86,7 @@ var _ = Describe("Plugin Recovery and Synchronization", Label("e2e", "parallel")
 			Eventually(func() bool {
 				newPods, err := kubeClient.CoreV1().Pods("kube-system").List(ctx, metav1.ListOptions{
 					LabelSelector: "app=" + pluginName,
-					FieldSelector: "spec.nodeName=" + exclusiveNode,
+					FieldSelector: "spec.nodeName=" + currentTestNode,
 				})
 				if err != nil || len(newPods.Items) == 0 {
 					return false
@@ -95,7 +95,7 @@ var _ = Describe("Plugin Recovery and Synchronization", Label("e2e", "parallel")
 				// Check if it's a different pod (new UID) and it's running
 				newPod := &newPods.Items[0]
 				return newPod.UID != oldPodUID && newPod.Status.Phase == corev1.PodRunning
-			}, timeout*2, interval).Should(BeTrue(), fmt.Sprintf("Plugin pod should be recreated and running on node %s", exclusiveNode))
+			}, timeout*2, interval).Should(BeTrue(), fmt.Sprintf("Plugin pod should be recreated and running on node %s", currentTestNode))
 
 			By("Verifying CPU assignments are maintained after plugin restart")
 			Eventually(func() bool {

@@ -2,17 +2,6 @@
 
 set -euo pipefail
 
-# Configuration
-KUBECONFIG=${KUBECONFIG:-"$HOME/.kube/config"}
-TEST_NS=${TEST_NS:-wekaplugin-e2e}
-PLUGIN_IMAGE=${PLUGIN_IMAGE:-""}  # Empty by default - will use build-and-deploy.sh to build if not specified
-PLUGIN_REGISTRY=${PLUGIN_REGISTRY:-"images.scalar.dev.weka.io:5002"}
-PLUGIN_NAME=${PLUGIN_NAME:-"weka-nri-cpuset"}
-TEST_TIMEOUT=${TEST_TIMEOUT:-30m}
-TEST_PARALLEL=${TEST_PARALLEL:-8}
-PRESERVE_ON_FAILURE=${PRESERVE_ON_FAILURE:-true}
-CONTINUE_ON_FAILURE=${CONTINUE_ON_FAILURE:-false}
-
 # Color codes for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -30,6 +19,25 @@ log_warn() {
 log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
+
+# Configuration
+KUBECONFIG=${KUBECONFIG:-"$HOME/.kube/config"}
+TEST_NS=${TEST_NS:-wekaplugin-e2e}
+PLUGIN_IMAGE=${PLUGIN_IMAGE:-""}  # Empty by default - will use build-and-deploy.sh to build if not specified
+PLUGIN_REGISTRY=${PLUGIN_REGISTRY:-"images.scalar.dev.weka.io:5002"}
+PLUGIN_NAME=${PLUGIN_NAME:-"weka-nri-cpuset"}
+TEST_TIMEOUT=${TEST_TIMEOUT:-30m}
+# Detect cluster size for default parallelism
+if [[ -z "${TEST_PARALLEL:-}" ]]; then
+    # Dynamically set default to cluster size for full parallelization
+    DEFAULT_PARALLEL=$(kubectl get nodes --no-headers 2>/dev/null | wc -l || echo "8")
+    TEST_PARALLEL=${DEFAULT_PARALLEL}
+    log_info "Auto-detected cluster size: ${TEST_PARALLEL} nodes, setting TEST_PARALLEL=${TEST_PARALLEL}"
+else
+    TEST_PARALLEL=${TEST_PARALLEL}
+fi
+PRESERVE_ON_FAILURE=${PRESERVE_ON_FAILURE:-true}
+CONTINUE_ON_FAILURE=${CONTINUE_ON_FAILURE:-false}
 
 # Verify prerequisites
 check_prerequisites() {
@@ -216,7 +224,7 @@ run_tests() {
     echo "- Use Ctrl+C to interrupt if needed"
     echo "- Test pod status will be shown periodically"
     echo "- Individual test progress will be displayed below"
-    echo "- Using Ginkgo v2 with parallel execution (${TEST_PARALLEL} workers - default: 8)"
+    echo "- Using Ginkgo v2 with parallel execution (${TEST_PARALLEL} workers - default: cluster size)"
     echo "- Parallel tests: annotated pods, integer pods, shared pods"
     echo "- Sequential tests: recovery, live reallocation, conflict resolution"
     echo "- Resource preservation on failure: $PRESERVE_ON_FAILURE"
@@ -439,7 +447,7 @@ Environment Variables:
   PLUGIN_REGISTRY Docker registry for building images (default: images.scalar.dev.weka.io:5002)
   PLUGIN_NAME     Plugin image name (default: weka-nri-cpuset)
   TEST_TIMEOUT    Test timeout (default: 30m)
-  TEST_PARALLEL   Number of parallel workers (default: 8)
+  TEST_PARALLEL   Number of parallel workers (default: cluster size)
   PRESERVE_ON_FAILURE Preserve failed test resources for debugging (default: true)
   CONTINUE_ON_FAILURE Continue with sequential tests even if parallel tests fail (default: false)
   FORCE_DEPLOY    Force plugin redeployment (default: false)
