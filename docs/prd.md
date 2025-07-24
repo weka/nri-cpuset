@@ -84,10 +84,12 @@ For live reassignment operations, maintain transactional integrity by tracking p
 
 When allocating CPUs for integer containers, prefer sibling cores (hyperthreads) to optimize cache locality and minimize fragmentation:
 
-1. **Two cores requested**: Prefer two sibling cores from the same physical core
-2. **Three cores requested**: Prefer one complete physical core (2 siblings) plus one additional core
-3. **Additional cores**: Prefer completing partially allocated physical cores before fragmenting new cores
+1. **Complete partial cores first**: Prefer orphan cores where the sibling is already allocated to the same container purpose
+2. **For each pair of cores**: Select full physical cores (both siblings) when possible  
+3. **For the last partial core**: When requesting odd number of cores, prefer orphan cores where the sibling is already allocated
 4. **Fallback**: If optimal sibling allocation is not possible, fall back to any available cores while maintaining exclusivity
+
+This best-effort strategy optimizes for completing physical cores rather than fragmenting new ones.
 
 This strategy optimizes for:
 - Better cache locality between related threads
