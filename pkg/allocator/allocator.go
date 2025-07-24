@@ -422,6 +422,7 @@ func (a *CPUAllocator) HandleAnnotatedContainerWithIntegerConflictCheck(pod *api
 		memNodes = []int{singleNode}
 	}
 
+	fmt.Printf("DEBUG: HandleAnnotatedContainerWithIntegerConflictCheck returning CPUs: %v for annotation: %s\n", cpus, cpuList)
 	return &AllocationResult{
 		CPUs:     cpus,
 		MemNodes: memNodes,

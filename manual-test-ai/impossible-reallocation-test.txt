@@ -1,0 +1,257 @@
+# Impossible Reallocation Test
+
+Tests the "should fail annotated pod creation when reallocation is impossible" scenario that's timing out after 120s instead of failing properly.
+
+## Test Scenario
+1. Create multiple integer pods to exhaust most available CPUs
+2. Try to create an annotated pod that conflicts with existing allocations
+3. Verify the annotated pod fails to be created (doesn't timeout)
+4. Confirm plugin handles the impossible reallocation gracefully
+
+## Prerequisites
+- KUBECONFIG set to cluster with NRI-enabled containerd  
+- Weka NRI CPUSet plugin deployed and running
+- Multi-core node (at least 8+ CPUs recommended)
+
+## Test Steps
+
+### 1. Environment Setup
+```bash
+kubectl create namespace manual-impossible --dry-run=client -o yaml | kubectl apply -f -
+export TEST_NS=manual-impossible
+
+# Determine target node and CPU capacity
+NODE_NAME=$(kubectl get nodes --no-headers -o custom-columns="NAME:.metadata.name" | grep -v master | head -1)
+NODE_CPU_CAPACITY=$(kubectl get node $NODE_NAME -o jsonpath='{.status.capacity.cpu}')
+echo "Testing on node $NODE_NAME with $NODE_CPU_CAPACITY CPUs"
+```
+
+### 2. Calculate Resource Exhaustion Strategy
+```bash
+# Plan: Create integer pods consuming most CPUs, leave 2-4 CPUs free
+# Each integer pod takes 2 CPUs
+MAX_INTEGER_PODS=$(((NODE_CPU_CAPACITY - 4) / 2))
+echo "Will create $MAX_INTEGER_PODS integer pods (leaving ~4 CPUs free)"
+```
+
+### 3. Create Multiple Integer Pods to Exhaust Resources
+```yaml
+# integer-exhaust-template.yaml (create multiple pods from this template)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: integer-exhaust-{ID}
+  namespace: manual-impossible
+spec:
+  containers:
+  - name: test-container
+    image: busybox:latest
+    command: ["sleep", "600"] 
+    resources:
+      requests:
+        cpu: "2"
+        memory: "100Mi"
+      limits:
+        cpu: "2"        # Integer classification
+        memory: "100Mi"
+  restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/hostname: {NODE_NAME}
+```
+
+**Creation Pattern**:
+```bash
+# Create pods 1 through MAX_INTEGER_PODS
+for i in $(seq 1 $MAX_INTEGER_PODS); do
+  sed "s/{ID}/$i/g; s/{NODE_NAME}/$NODE_NAME/g" integer-exhaust-template.yaml | kubectl apply -f -
+  
+  # Brief wait to avoid overwhelming scheduler
+  sleep 2
+  
+  # Check if pod was scheduled successfully
+  if ! kubectl wait --for=condition=PodScheduled pod/integer-exhaust-$i -n $TEST_NS --timeout=30s; then
+    echo "Pod integer-exhaust-$i failed to schedule - likely hit resource limits"
+    ACTUAL_PODS=$((i-1))
+    break
+  fi
+done
+
+echo "Successfully scheduled $ACTUAL_PODS integer pods"
+```
+
+### 4. Wait for Integer Pods to be Ready
+```bash
+echo "Waiting for integer pods to be ready..."
+kubectl wait --for=condition=Ready pods -l "metadata.namespace=$TEST_NS" -n $TEST_NS --timeout=120s || {
+  echo "Some integer pods not ready - checking which ones..."
+  kubectl get pods -n $TEST_NS --no-headers | grep -v Running
+}
+
+echo "=== Current Resource Usage ==="
+kubectl get pods -n $TEST_NS -o wide | head -5
+```
+
+### 5. Identify CPU Assignment for Conflict Creation
+```bash
+# Get CPU assignment from first integer pod
+SAMPLE_CPUS=$(kubectl exec -n $TEST_NS integer-exhaust-1 -- cat /proc/1/status | grep Cpus_allowed_list | cut -d: -f2 | tr -d ' ')
+echo "Sample integer pod has CPUs: $SAMPLE_CPUS"
+
+# Extract CPUs for conflict (take first 2 CPUs)
+if echo "$SAMPLE_CPUS" | grep -q ","; then
+    CONFLICT_CPUS=$(echo "$SAMPLE_CPUS" | cut -d, -f1,2)
+else
+    CONFLICT_CPUS="$SAMPLE_CPUS"
+fi
+
+echo "Will request conflicting CPUs: $CONFLICT_CPUS"
+```
+
+### 6. Create Annotated Pod That Should Fail
+```yaml
+# impossible-annotated-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: impossible-annotated-test
+  namespace: manual-impossible
+  annotations:
+    weka.io/cores-ids: "{CONFLICT_CPUS}"
+spec:
+  containers:
+  - name: test-container
+    image: busybox:latest
+    command: ["sleep", "600"]
+    resources:
+      requests:
+        cpu: "100m"     # Fractional - shared classification
+        memory: "128Mi"
+      limits:
+        cpu: "200m"     # Different from requests
+        memory: "256Mi" 
+  restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/hostname: {NODE_NAME}
+```
+
+```bash
+# Create the annotated pod
+sed "s/{CONFLICT_CPUS}/$CONFLICT_CPUS/g; s/{NODE_NAME}/$NODE_NAME/g" impossible-annotated-pod.yaml | kubectl apply -f -
+```
+
+### 7. Monitor Annotated Pod Behavior (Key Test)
+```bash
+echo "=== Monitoring Annotated Pod Creation ==="
+echo "Expected behavior: Pod should fail to be created due to impossible reallocation"
+
+# Start plugin log monitoring
+kubectl logs -n kube-system -l app=weka-nri-cpuset -f --since=10s &
+LOG_PID=$!
+
+# Test the timeout behavior
+START_TIME=$(date +%s)
+echo "Waiting for annotated pod (should NOT become ready)..."
+
+if kubectl wait --for=condition=Ready pod/impossible-annotated-test -n $TEST_NS --timeout=120s; then
+    # This is unexpected - pod became ready
+    END_TIME=$(date +%s)
+    ELAPSED=$((END_TIME - START_TIME))
+    
+    echo "✗ UNEXPECTED: Annotated pod became ready in ${ELAPSED}s"
+    echo "This suggests reallocation was possible (test scenario may need adjustment)"
+    
+    FINAL_CPUS=$(kubectl exec -n $TEST_NS impossible-annotated-test -- cat /proc/1/status | grep Cpus_allowed_list | cut -d: -f2 | tr -d ' ')
+    echo "Annotated pod got CPUs: $FINAL_CPUS"
+    
+else
+    # This is the expected behavior
+    END_TIME=$(date +%s)
+    ELAPSED=$((END_TIME - START_TIME))
+    
+    echo "✓ EXPECTED: Annotated pod failed to become ready within 120s (elapsed: ${ELAPSED}s)"
+    echo "This indicates impossible reallocation was correctly detected"
+fi
+
+# Stop log monitoring
+kill $LOG_PID 2>/dev/null || true
+```
+
+### 8. Analyze Pod Status and Plugin Behavior
+```bash
+echo "=== Annotated Pod Status Analysis ==="
+kubectl describe pod impossible-annotated-test -n $TEST_NS | grep -A10 -B5 "Events:"
+
+echo "=== Plugin Logs Analysis ==="
+kubectl logs -n kube-system -l app=weka-nri-cpuset --since=3m | \
+  grep -E "(impossible|insufficient|exhaust|reallocation.*fail|conflict.*unable)" -i | \
+  head -10
+
+echo "=== Resource Verification ==="
+echo "Integer pods running: $(kubectl get pods -n $TEST_NS --no-headers | grep Running | wc -l)"
+echo "Total pods: $(kubectl get pods -n $TEST_NS --no-headers | wc -l)"
+```
+
+### 9. Verify Plugin Health
+```bash
+echo "=== Plugin Health Check ==="
+kubectl get pods -n kube-system -l app=weka-nri-cpuset -o wide
+
+# Check for plugin crashes or restarts
+kubectl get pods -n kube-system -l app=weka-nri-cpuset --no-headers | \
+  awk '{print $4}' | \
+  xargs -I {} echo "Plugin restart count: {}"
+```
+
+## Success Criteria
+
+1. **Resource Exhaustion**: Successfully create enough integer pods to exhaust most CPUs
+2. **Impossible Scenario**: Annotated pod creation should detect impossible reallocation  
+3. **Proper Failure**: Pod should fail gracefully, not timeout indefinitely
+4. **Plugin Stability**: Plugin should remain healthy throughout the test
+5. **Clear Error Messages**: Plugin logs should indicate why reallocation is impossible
+
+## Expected vs Actual Behavior
+
+**Expected**: 
+- Annotated pod creation fails quickly with clear error message
+- Plugin logs show "impossible reallocation" or similar message
+
+**Current E2E Failure**:
+- Annotated pod times out after 120s
+- No clear failure indication
+
+## Troubleshooting
+
+### If annotated pod becomes ready unexpectedly:
+```bash
+# Check if we actually exhausted resources
+kubectl top nodes
+kubectl describe node $NODE_NAME | grep -A5 "Allocated resources:"
+
+# Verify integer pod CPU assignments don't leave room for reallocation
+kubectl get pods -n $TEST_NS --no-headers | head -3 | \
+  awk '{print $1}' | \
+  xargs -I {} kubectl exec -n $TEST_NS {} -- cat /proc/1/status | grep Cpus_allowed_list
+```
+
+### If plugin shows errors:
+```bash
+# Detailed plugin logs
+kubectl logs -n kube-system -l app=weka-nri-cpuset --since=5m
+
+# Check for OOM or resource issues
+kubectl describe pods -n kube-system -l app=weka-nri-cpuset
+```
+
+## Cleanup
+```bash
+kubectl delete namespace manual-impossible
+rm -f integer-exhaust-template.yaml impossible-annotated-pod.yaml
+```
+
+## Notes
+
+- This test validates the plugin's ability to detect and handle impossible reallocation scenarios
+- The key insight is that the current E2E test times out instead of failing properly
+- Plugin should provide clear feedback when reallocation cannot be performed
+- Resource exhaustion strategy may need adjustment based on actual cluster topology

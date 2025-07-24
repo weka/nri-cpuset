@@ -2,6 +2,7 @@ package state
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 
@@ -403,11 +404,15 @@ func (m *Manager) ClearPendingReallocation() {
 
 // createAnnotatedAdjustment creates a container adjustment for an annotated container
 func (m *Manager) createAnnotatedAdjustment(result *allocator.AllocationResult) *api.ContainerAdjustment {
+	// Use comma-separated format instead of range format for annotated containers
+	// This might fix NRI/containerd compatibility issues
+	cpuList := formatCPUListCommaSeparated(result.CPUs)
+	fmt.Printf("DEBUG: createAnnotatedAdjustment received CPUs: %v, formatted as: %s (comma-separated)\n", result.CPUs, cpuList)
 	adjustment := &api.ContainerAdjustment{
 		Linux: &api.LinuxContainerAdjustment{
 			Resources: &api.LinuxResources{
 				Cpu: &api.LinuxCPU{
-					Cpus: numa.FormatCPUList(result.CPUs),
+					Cpus: cpuList,
 				},
 			},
 		},
@@ -419,6 +424,29 @@ func (m *Manager) createAnnotatedAdjustment(result *allocator.AllocationResult) 
 	}
 
 	return adjustment
+}
+
+// formatCPUListCommaSeparated formats a CPU list as comma-separated values (e.g., "0,1,2")
+// instead of using range notation (e.g., "0-2")
+func formatCPUListCommaSeparated(cpus []int) string {
+	if len(cpus) == 0 {
+		return ""
+	}
+	
+	sort.Ints(cpus)
+	strs := make([]string, len(cpus))
+	for i, cpu := range cpus {
+		strs[i] = fmt.Sprintf("%d", cpu)
+	}
+	return strings.Join(strs, ",")
+}
+
+// GetContainerInfo returns container information by container ID
+func (m *Manager) GetContainerInfo(containerID string) *ContainerInfo {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	
+	return m.byCID[containerID]
 }
 
 func (m *Manager) Synchronize(pods []*api.PodSandbox, containers []*api.Container, alloc Allocator) ([]*api.ContainerUpdate, error) {

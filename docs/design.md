@@ -356,6 +356,78 @@ return fmt.Errorf("failed to allocate CPUs for container %s in pod %s/%s: %w",
     container.Name, pod.Namespace, pod.Name, err)
 ```
 
+## Critical Design Patterns
+
+### UpdateContainer CPU Assignment Protection
+
+**Critical Issue Discovered**: NRI's `UpdateContainer` callbacks can override CPU assignments set during `CreateContainer` if not handled properly.
+
+**Problem**: When NRI calls `UpdateContainer` after container creation, returning `nil, nil` (no updates) causes NRI to apply **default CPU assignments** (often the shared pool), which **overrides** the specific CPU assignments set during `CreateContainer`.
+
+**Solution Pattern**:
+```go
+func (p *plugin) UpdateContainer(ctx context.Context, pod *api.PodSandbox, 
+    container *api.Container, r *api.LinuxResources) ([]*api.ContainerUpdate, error) {
+    
+    // CRITICAL: Get container's current CPU assignment from our state
+    containerInfo := p.state.GetContainerInfo(container.Id)
+    if containerInfo == nil {
+        return nil, nil // Not managed by us
+    }
+    
+    // Return current CPU assignment to prevent NRI from overriding it
+    update := &api.ContainerUpdate{
+        ContainerId: container.Id,
+        Linux: &api.LinuxContainerUpdate{
+            Resources: &api.LinuxResources{
+                Cpu: &api.LinuxCPU{
+                    Cpus: formatCPUListForUpdate(containerInfo.CPUs, containerInfo.Mode),
+                },
+            },
+        },
+    }
+    
+    return []*api.ContainerUpdate{update}, nil
+}
+```
+
+**Key Design Principles**:
+
+1. **State Authority**: Plugin state is authoritative for managed containers
+2. **Defensive Updates**: Always return current assignments in `UpdateContainer`
+3. **Format Consistency**: Use comma-separated format for annotated containers (`"0,1"` vs `"0-1"`)
+4. **NRI Compliance**: Never return `nil, nil` for containers we manage
+
+**CPU Format Considerations**:
+```go
+func formatCPUListForUpdate(cpus []int, mode string) string {
+    // For annotated containers, use comma-separated format for NRI compatibility
+    if mode == "annotated" {
+        return strings.Join(cpuStrings, ",") // "0,1" 
+    }
+    // For other containers, use standard range format
+    return numa.FormatCPUList(cpus) // "0-1"
+}
+```
+
+**Impact**: This pattern prevents a class of bugs where:
+- Annotated containers get shared pool CPUs instead of specific assignments
+- Live reallocation appears to work but containers get wrong final CPUs
+- E2E tests fail due to CPU assignment inconsistencies
+
+**Testing Verification**:
+```bash
+# Before fix: Container gets all CPUs (0-63)
+kubectl exec pod -- cat /proc/1/status | grep Cpus_allowed_list
+# Cpus_allowed_list: 0-63
+
+# After fix: Container gets correct CPUs
+kubectl exec pod -- cat /proc/1/status | grep Cpus_allowed_list  
+# Cpus_allowed_list: 0-1
+```
+
+This pattern is **essential** for any NRI plugin that manages CPU assignments and must be implemented correctly to prevent silent CPU assignment corruption.
+
 ## Future Enhancements
 
 ### Potential Improvements

@@ -1,0 +1,174 @@
+# Sibling Core Allocation Test
+
+Tests the "should prefer allocating sibling cores for integer containers" scenario that's failing with "Expected 2 CPUs but got 1".
+
+## Test Scenario
+1. Create a simple integer pod requesting 2 CPUs  
+2. Verify it gets exactly 2 CPUs allocated
+3. Check if allocated CPUs are sibling cores (hyperthreads)
+
+## Prerequisites
+- KUBECONFIG set to cluster with NRI-enabled containerd
+- Weka NRI CPUSet plugin deployed and running
+- At least 2 CPU cores available on target node
+
+## Test Steps
+
+### 1. Environment Setup
+```bash
+kubectl create namespace manual-sibling --dry-run=client -o yaml | kubectl apply -f -
+export TEST_NS=manual-sibling
+```
+
+### 2. Create Integer Pod Requesting 2 CPUs
+```yaml
+# integer-2cpu-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: integer-sibling-test
+  namespace: manual-sibling
+spec:
+  containers:
+  - name: test-container
+    image: busybox:latest
+    command: ["sleep", "3600"]
+    resources:
+      requests:
+        cpu: "2"        # Integer value - requires exclusive CPUs
+        memory: "100Mi"
+      limits:
+        cpu: "2"        # Must equal requests for integer classification
+        memory: "100Mi"
+  restartPolicy: Never
+```
+
+```bash
+kubectl apply -f integer-2cpu-pod.yaml
+kubectl wait --for=condition=Ready pod/integer-sibling-test -n $TEST_NS --timeout=60s
+```
+
+**Expected**: Pod gets 2 exclusive CPUs
+
+### 3. Verify CPU Count
+```bash
+echo "=== CPU Assignment Verification ==="
+kubectl exec -n $TEST_NS integer-sibling-test -- cat /proc/1/status | grep Cpus_allowed_list
+```
+
+**Expected Output**: Should show 2 CPUs, like `Cpus_allowed_list: 0,32` or `Cpus_allowed_list: 2,3`
+
+### 4. Parse and Count CPUs
+```bash
+# Extract CPU assignment
+CPUS=$(kubectl exec -n $TEST_NS integer-sibling-test -- cat /proc/1/status | grep Cpus_allowed_list | cut -d: -f2 | tr -d ' ')
+echo "Raw CPU assignment: $CPUS"
+
+# Count CPUs
+if echo "$CPUS" | grep -q ","; then
+    CPU_COUNT=$(echo "$CPUS" | tr ',' '\n' | wc -l)
+    CPU1=$(echo "$CPUS" | cut -d, -f1)
+    CPU2=$(echo "$CPUS" | cut -d, -f2)
+    echo "CPU1: $CPU1, CPU2: $CPU2"
+elif echo "$CPUS" | grep -q "-"; then
+    # Range format like "0-1" 
+    START=$(echo "$CPUS" | cut -d- -f1)
+    END=$(echo "$CPUS" | cut -d- -f2)
+    CPU_COUNT=$((END - START + 1))
+    echo "CPU range: $START-$END (count: $CPU_COUNT)"
+else
+    CPU_COUNT=1
+    echo "Single CPU: $CPUS"
+fi
+
+echo "Total CPU count: $CPU_COUNT (expected: 2)"
+```
+
+### 5. Verify Sibling Core Relationship
+```bash
+if [ "$CPU_COUNT" -eq 2 ] && [ ! -z "$CPU1" ] && [ ! -z "$CPU2" ]; then
+    echo "=== Sibling Core Analysis ==="
+    echo "Checking if CPUs $CPU1 and $CPU2 are siblings..."
+    
+    # Common sibling patterns in typical clusters:
+    # Pattern 1: Adjacent CPUs (0,1), (2,3), (4,5), etc.
+    # Pattern 2: Hyperthread pairs (0,32), (1,33), (2,34), etc.
+    
+    DIFF=$((CPU2 - CPU1))
+    echo "CPU difference: $DIFF"
+    
+    if [ "$DIFF" -eq 1 ]; then
+        echo "✓ LIKELY SIBLINGS: Adjacent CPUs suggest sibling cores"
+    elif [ "$DIFF" -eq 32 ] || [ "$DIFF" -eq 16 ] || [ "$DIFF" -eq 64 ]; then
+        echo "✓ LIKELY SIBLINGS: Hyperthread pattern detected"
+    else
+        echo "? UNCERTAIN: CPUs may not be siblings (uncommon pattern)"
+    fi
+else
+    echo "✗ FAIL: Cannot analyze sibling relationship - incorrect CPU count"
+fi
+```
+
+### 6. Plugin Logs Analysis
+```bash
+echo "=== Plugin Allocation Logs ==="
+kubectl logs -n kube-system -l app=weka-nri-cpuset --since=2m | \
+  grep -E "(sibling|integer|exclusive|allocation)" | \
+  grep -v "shared" | \
+  head -10
+```
+
+### 7. Success Criteria Validation
+```bash
+echo "=== Test Results Summary ==="
+if [ "$CPU_COUNT" -eq 2 ]; then
+    echo "✓ PASS: Integer pod allocated exactly 2 CPUs"
+else
+    echo "✗ FAIL: Integer pod allocated $CPU_COUNT CPUs (expected: 2)"
+    echo "This matches the E2E test failure pattern"
+fi
+```
+
+## Success Criteria
+
+1. **Correct CPU Count**: Pod gets exactly 2 CPUs (not 1 as in failing test)
+2. **Integer Classification**: Plugin recognizes pod as integer type requiring exclusive CPUs
+3. **Sibling Preference**: Allocated CPUs should be sibling cores when possible
+4. **Plugin Stability**: No errors in plugin logs during allocation
+
+## Common Failure Modes
+
+1. **Single CPU allocation**: Plugin not recognizing integer requirement (matches current failure)
+2. **No CPU allocation**: Pod scheduling or plugin communication issues
+3. **Non-sibling allocation**: Plugin allocating random CPUs instead of sibling pairs
+4. **Plugin errors**: Allocation logic crashes or throws errors
+
+## Troubleshooting
+
+If test fails with single CPU allocation:
+```bash
+# Check pod resource specification
+kubectl describe pod integer-sibling-test -n $TEST_NS | grep -A10 -B5 "Requests:"
+
+# Check plugin logs for errors
+kubectl logs -n kube-system -l app=weka-nri-cpuset --since=5m | grep -E "(error|fail)" -i
+
+# Verify plugin is running
+kubectl get pods -n kube-system -l app=weka-nri-cpuset -o wide
+
+# Check node CPU capacity
+kubectl describe nodes | grep -E "(Name:|cpu:|Capacity:|Allocatable:)" -A1
+```
+
+## Cleanup
+```bash
+kubectl delete namespace manual-sibling
+rm -f integer-2cpu-pod.yaml
+```
+
+## Notes
+
+- This test focuses specifically on the CPU count issue seen in the E2E failure
+- The test is simpler than the E2E version to isolate the allocation problem
+- If this test passes but E2E fails, the issue may be in the test environment or timing
+- Plugin should prioritize sibling cores for better performance but correct count is the primary requirement

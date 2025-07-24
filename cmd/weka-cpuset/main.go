@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"sort"
+	"strings"
 	"syscall"
 
 	"github.com/containerd/nri/pkg/api"
@@ -238,7 +240,64 @@ func (p *plugin) CreateContainer(ctx context.Context, pod *api.PodSandbox, conta
 
 func (p *plugin) UpdateContainer(ctx context.Context, pod *api.PodSandbox, container *api.Container, r *api.LinuxResources) ([]*api.ContainerUpdate, error) {
 	fmt.Printf("Updating container %s in pod %s/%s\n", container.Name, pod.Namespace, pod.Name)
-	return nil, nil
+	
+	// CRITICAL FIX: When NRI calls UpdateContainer, we need to return the proper CPU assignment
+	// for containers we're managing. Returning nil,nil might cause NRI to apply default/shared CPUs.
+	
+	// Get the container's current CPU assignment from our state
+	containerInfo := p.state.GetContainerInfo(container.Id)
+	if containerInfo == nil {
+		// Container not managed by us, let NRI handle it
+		return nil, nil
+	}
+	
+	fmt.Printf("DEBUG: UpdateContainer called for managed container %s (mode: %s, CPUs: %v)\n", 
+		safeShortID(container.Id), containerInfo.Mode, containerInfo.CPUs)
+	
+	// Return the current CPU assignment to prevent NRI from overriding it
+	update := &api.ContainerUpdate{
+		ContainerId: container.Id,
+		Linux: &api.LinuxContainerUpdate{
+			Resources: &api.LinuxResources{
+				Cpu: &api.LinuxCPU{
+					Cpus: formatCPUListForUpdate(containerInfo.CPUs, containerInfo.Mode),
+				},
+			},
+		},
+	}
+	
+	fmt.Printf("DEBUG: Returning CPU assignment %s for container %s in UpdateContainer\n", 
+		update.Linux.Resources.Cpu.Cpus, safeShortID(container.Id))
+	
+	return []*api.ContainerUpdate{update}, nil
+}
+
+// formatCPUListForUpdate formats CPU list based on container mode
+func formatCPUListForUpdate(cpus []int, mode string) string {
+	if len(cpus) == 0 {
+		return ""
+	}
+	
+	// For annotated containers, use comma-separated format to ensure NRI compatibility
+	if mode == "annotated" {
+		sort.Ints(cpus)
+		strs := make([]string, len(cpus))
+		for i, cpu := range cpus {
+			strs[i] = fmt.Sprintf("%d", cpu)
+		}
+		return strings.Join(strs, ",")
+	}
+	
+	// For other containers, use the standard format from numa package
+	return numa.FormatCPUList(cpus)
+}
+
+// safeShortID safely truncates a container ID to 12 characters for logging
+func safeShortID(id string) string {
+	if len(id) <= 12 {
+		return id
+	}
+	return id[:12]
 }
 
 func (p *plugin) RemoveContainer(ctx context.Context, pod *api.PodSandbox, container *api.Container) error {
