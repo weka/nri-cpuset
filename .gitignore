@@ -9,3 +9,5 @@ test-results*
 test/e2e/e2e.test
 deploy/manifests/daemonset-temp.yaml
 test/e2e/test/
+.swp
+reports
