@@ -391,12 +391,12 @@ var _ = Describe("AllocationResult", func() {
 	It("should handle integer container results", func() {
 		result := &AllocationResult{
 			CPUs:     []int{0, 1},
-			MemNodes: []int{0}, // Integer containers now get NUMA node restrictions
+			MemNodes: nil, // Integer containers have no NUMA memory binding per PRD 3.3
 			Mode:     "integer",
 		}
 		Expect(result.Mode).To(Equal("integer"))
 		Expect(result.CPUs).To(Equal([]int{0, 1}))
-		Expect(result.MemNodes).To(Equal([]int{0}))
+		Expect(result.MemNodes).To(BeNil()) // Integer pods should have no NUMA memory restrictions
 	})
 
 	It("should handle shared container results", func() {
@@ -818,31 +818,33 @@ var _ = Describe("Advanced Allocation Scenarios", func() {
 			Expect(memNodes).To(Equal([]int{0}))
 		})
 
-		It("should properly handle integer containers with NUMA memory placement", func() {
-			// Simulate integer container allocation with CPUs spanning multiple NUMA nodes
+		It("should properly handle integer containers with no NUMA memory placement", func() {
+			// Per PRD 3.3: Integer pods should not have NUMA memory binding to support live reallocation
+			// Simulate integer container allocation - memory nodes should be nil regardless of CPU allocation
 			cpus := []int{0, 1, 4, 5} // CPUs on both NUMA node 0 and 1
-			memNodes := allocator.mockNuma.GetCPUNodesUnion(cpus)
-			Expect(memNodes).To(Equal([]int{0, 1}))
-
-			// Test our logic for cross-NUMA allocation
-			if singleNode, isSingleNode := allocator.getSingleNUMANode(cpus); isSingleNode {
-				memNodes = []int{singleNode}
+			
+			// Even if CPUs span multiple NUMA nodes, integer containers should not be memory-bound
+			result := &AllocationResult{
+				CPUs:     cpus,
+				MemNodes: nil, // Always nil for integer containers
+				Mode:     "integer",
 			}
-			// Should remain as union since CPUs span multiple nodes
-			Expect(memNodes).To(Equal([]int{0, 1}))
+			
+			Expect(result.MemNodes).To(BeNil(), "Integer containers should have no NUMA memory restrictions")
 		})
 
-		It("should properly handle integer containers with single NUMA memory placement", func() {
-			// Simulate integer container allocation with CPUs on single NUMA node
+		It("should maintain flexibility for integer container live reallocation", func() {
+			// Verify that integer containers remain flexible for reallocation
 			cpus := []int{0, 1, 2} // All CPUs on NUMA node 0
-			memNodes := allocator.mockNuma.GetCPUNodesUnion(cpus)
-			Expect(memNodes).To(Equal([]int{0}))
-
-			// Test our logic for single-NUMA allocation
-			if singleNode, isSingleNode := allocator.getSingleNUMANode(cpus); isSingleNode {
-				memNodes = []int{singleNode}
+			
+			// Integer containers should always have nil MemNodes regardless of CPU NUMA placement
+			result := &AllocationResult{
+				CPUs:     cpus,
+				MemNodes: nil, // No NUMA binding to support live reallocation
+				Mode:     "integer",
 			}
-			Expect(memNodes).To(Equal([]int{0}))
+			
+			Expect(result.MemNodes).To(BeNil(), "Integer containers should support flexible memory access")
 		})
 	})
 })

@@ -417,18 +417,12 @@ func (a *CPUAllocator) handleIntegerContainer(container *api.Container, reserved
 		return nil, fmt.Errorf("failed to allocate exclusive CPUs: %w", err)
 	}
 
-	// Determine NUMA nodes for memory placement
-	// Per PRD 3.3: restrict memory to NUMA nodes containing the assigned CPUs
-	memNodes := a.numa.GetCPUNodesUnion(cpus)
-
-	// Always check if all CPUs belong to the same node for correctness
-	if singleNode, isSingleNode := a.getSingleNUMANode(cpus); isSingleNode {
-		memNodes = []int{singleNode}
-	}
+	// Per PRD 3.3: Integer pods keep flexible NUMA memory (no binding) to support live reallocation
+	// This prevents memory placement conflicts during live reassignment
 
 	return &AllocationResult{
 		CPUs:     cpus,
-		MemNodes: memNodes,
+		MemNodes: nil, // No NUMA memory binding for integer pods
 		Mode:     "integer",
 	}, nil
 }

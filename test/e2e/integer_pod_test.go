@@ -293,7 +293,7 @@ var _ = Describe("Integer Pod Edge Cases", Label("e2e", "parallel"), func() {
 				"Pod should get shared CPU treatment due to request/limit mismatch")
 		})
 
-		It("should set NUMA memory nodes for integer pods based on assigned CPUs", func() {
+		It("should NOT set NUMA memory restrictions for integer pods", func() {
 			By("Creating an integer pod with single CPU")
 			resources := &corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{
@@ -306,26 +306,36 @@ var _ = Describe("Integer Pod Edge Cases", Label("e2e", "parallel"), func() {
 				},
 			}
 
-			pod := createTestPod("numa-integer-single-cpu", nil, resources)
+			pod := createTestPod("numa-integer-no-restriction", nil, resources)
 			createdPod, err := kubeClient.CoreV1().Pods(testNamespace).Create(ctx, pod, metav1.CreateOptions{})
 			Expect(err).ToNot(HaveOccurred())
 
 			By("Waiting for pod to be running")
 			waitForPodRunning(createdPod.Name)
 
-			By("Verifying memory node matches CPU NUMA node")
+			By("Verifying integer pod has flexible NUMA memory access (per PRD 3.3)")
 			Eventually(func() bool {
 				output, err := getPodCPUSet(createdPod.Name)
 				if err != nil {
 					return false
 				}
-				// Should have both CPU and memory node restrictions
-				return strings.Contains(output, "Cpus_allowed_list:") &&
-					strings.Contains(output, "Mems_allowed_list:")
-			}, timeout, interval).Should(BeTrue(), "Integer pod should have NUMA memory restriction matching assigned CPU")
+				// Should have CPU restriction but flexible memory access (multiple NUMA nodes available)
+				lines := strings.Split(output, "\n")
+				var cpuLine, memLine string
+				for _, line := range lines {
+					if strings.Contains(line, "Cpus_allowed_list:") {
+						cpuLine = line
+					}
+					if strings.Contains(line, "Mems_allowed_list:") {
+						memLine = line
+					}
+				}
+				// CPU should be restricted, but memory should allow access to multiple NUMA nodes
+				return cpuLine != "" && memLine != "" && (strings.Contains(memLine, "0-1") || strings.Contains(memLine, "0,1"))
+			}, timeout, interval).Should(BeTrue(), "Integer pod should have flexible NUMA memory access per PRD 3.3")
 		})
 
-		It("should set NUMA memory nodes spanning multiple nodes for multi-CPU integer pods", func() {
+		It("should support live reallocation by avoiding NUMA memory binding", func() {
 			By("Creating an integer pod with multiple CPUs")
 			resources := &corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{
@@ -345,17 +355,26 @@ var _ = Describe("Integer Pod Edge Cases", Label("e2e", "parallel"), func() {
 			By("Waiting for pod to be running")
 			waitForPodRunning(createdPod.Name)
 
-			By("Verifying memory nodes include union of CPU NUMA nodes")
+			By("Verifying integer pod maintains flexible NUMA memory access for live reallocation")
 			Eventually(func() bool {
 				output, err := getPodCPUSet(createdPod.Name)
 				if err != nil {
 					return false
 				}
-				// Should have both CPU and memory node restrictions
-				// Memory nodes should correspond to NUMA nodes of assigned CPUs
-				return strings.Contains(output, "Cpus_allowed_list:") &&
-					strings.Contains(output, "Mems_allowed_list:")
-			}, timeout, interval).Should(BeTrue(), "Integer pod should have NUMA memory restriction spanning assigned CPU nodes")
+				// Parse output to verify CPU allocation is exclusive but memory is flexible
+				lines := strings.Split(output, "\n")
+				var cpuLine, memLine string
+				for _, line := range lines {
+					if strings.Contains(line, "Cpus_allowed_list:") {
+						cpuLine = line
+					}
+					if strings.Contains(line, "Mems_allowed_list:") {
+						memLine = line
+					}
+				}
+				// CPU should be allocated (exclusive) but memory should be flexible (access to multiple NUMA nodes)
+				return cpuLine != "" && memLine != "" && (strings.Contains(memLine, "0-1") || strings.Contains(memLine, "0,1"))
+			}, timeout, interval).Should(BeTrue(), "Integer pod should maintain flexible NUMA memory access to support live reallocation")
 		})
 	})
 })

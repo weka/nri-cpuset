@@ -201,16 +201,26 @@ var _ = Describe("Annotated Pod Tests", Label("e2e", "parallel"), func() {
 			waitForPodRunning(createdInteger.Name)
 			waitForPodRunning(createdShared.Name)
 
-			By("Verifying integer pod has NUMA memory restriction based on assigned CPUs")
+			By("Verifying integer pod has flexible NUMA memory access (per PRD 3.3)")
 			Eventually(func() bool {
 				intOutput, err := getPodCPUSet(createdInteger.Name)
 				if err != nil {
 					return false
 				}
-				// Integer pod should have specific NUMA memory restriction
-				return strings.Contains(intOutput, "Mems_allowed_list:") &&
-					strings.Contains(intOutput, "Cpus_allowed_list:")
-			}, timeout, interval).Should(BeTrue(), "Integer pod should have NUMA memory restriction")
+				// Parse output to verify CPU is allocated but memory remains flexible
+				lines := strings.Split(intOutput, "\n")
+				var cpuLine, memLine string
+				for _, line := range lines {
+					if strings.Contains(line, "Cpus_allowed_list:") {
+						cpuLine = line
+					}
+					if strings.Contains(line, "Mems_allowed_list:") {
+						memLine = line
+					}
+				}
+				// Integer pod should have CPU allocation but flexible memory access (multiple NUMA nodes)
+				return cpuLine != "" && memLine != "" && (strings.Contains(memLine, "0-1") || strings.Contains(memLine, "0,1"))
+			}, timeout, interval).Should(BeTrue(), "Integer pod should have flexible NUMA memory access per PRD 3.3")
 
 			By("Verifying shared pod has unrestricted memory access")
 			Eventually(func() bool {
