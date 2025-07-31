@@ -822,28 +822,28 @@ var _ = Describe("Advanced Allocation Scenarios", func() {
 			// Per PRD 3.3: Integer pods should not have NUMA memory binding to support live reallocation
 			// Simulate integer container allocation - memory nodes should be nil regardless of CPU allocation
 			cpus := []int{0, 1, 4, 5} // CPUs on both NUMA node 0 and 1
-			
+
 			// Even if CPUs span multiple NUMA nodes, integer containers should not be memory-bound
 			result := &AllocationResult{
 				CPUs:     cpus,
 				MemNodes: nil, // Always nil for integer containers
 				Mode:     "integer",
 			}
-			
+
 			Expect(result.MemNodes).To(BeNil(), "Integer containers should have no NUMA memory restrictions")
 		})
 
 		It("should maintain flexibility for integer container live reallocation", func() {
 			// Verify that integer containers remain flexible for reallocation
 			cpus := []int{0, 1, 2} // All CPUs on NUMA node 0
-			
+
 			// Integer containers should always have nil MemNodes regardless of CPU NUMA placement
 			result := &AllocationResult{
 				CPUs:     cpus,
 				MemNodes: nil, // No NUMA binding to support live reallocation
 				Mode:     "integer",
 			}
-			
+
 			Expect(result.MemNodes).To(BeNil(), "Integer containers should support flexible memory access")
 		})
 	})
