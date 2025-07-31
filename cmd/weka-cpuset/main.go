@@ -118,6 +118,11 @@ func runPlugin(cmd *cobra.Command, args []string) error {
 		updateCancel: updateCancel,
 	}
 
+	// Set up the callback for debounced shared pool updates
+	stateManager.SetUpdateCallback(func(updates []*api.ContainerUpdate) {
+		p.queueBackgroundUpdate(updates, "debounced shared pool update")
+	})
+
 	// Create NRI stub options
 	var stubOptions []stub.Option
 

@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/containerd/nri/pkg/api"
 	"github.com/weka/nri-cpuset/pkg/allocator"
@@ -54,6 +55,11 @@ type Manager struct {
 	// pendingReallocationPlan stores the plan that needs to be applied after successful updates
 	// This is now instance-based to prevent race conditions between concurrent allocations
 	pendingReallocationPlan []ReallocationPlan
+
+	// Debouncing for shared pool updates during rapid container removals
+	sharedPoolUpdatePending bool
+	sharedPoolDebounceTimer *time.Timer
+	pendingUpdateCallback   func([]*api.ContainerUpdate)
 }
 
 func NewManager() *Manager {
@@ -62,6 +68,68 @@ func NewManager() *Manager {
 		intOwner: make(map[int]string),
 		byCID:    make(map[string]*ContainerInfo),
 	}
+}
+
+// SetUpdateCallback sets the callback function for debounced shared pool updates
+func (m *Manager) SetUpdateCallback(callback func([]*api.ContainerUpdate)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pendingUpdateCallback = callback
+}
+
+// scheduleSharedPoolUpdate schedules a debounced shared pool update
+func (m *Manager) scheduleSharedPoolUpdate(alloc Allocator) {
+	const debounceDelay = 500 * time.Millisecond
+
+	// Cancel existing timer if any
+	if m.sharedPoolDebounceTimer != nil {
+		m.sharedPoolDebounceTimer.Stop()
+	}
+
+	// Set the update as pending
+	m.sharedPoolUpdatePending = true
+
+	// Schedule new timer
+	m.sharedPoolDebounceTimer = time.AfterFunc(debounceDelay, func() {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+
+		if !m.sharedPoolUpdatePending {
+			return // Update was already processed or cancelled
+		}
+
+		// Generate updates for all shared containers
+		updates := make([]*api.ContainerUpdate, 0)
+		newSharedPool := m.computeSharedPool(alloc.GetOnlineCPUs())
+
+		for _, containerInfo := range m.byCID {
+			if containerInfo.Mode == ModeShared && len(newSharedPool) > 0 {
+				update := &api.ContainerUpdate{
+					ContainerId: containerInfo.ID,
+					Linux: &api.LinuxContainerUpdate{
+						Resources: &api.LinuxResources{
+							Cpu: &api.LinuxCPU{
+								Cpus: numa.FormatCPUList(newSharedPool),
+							},
+						},
+					},
+				}
+				updates = append(updates, update)
+				containerInfo.CPUs = newSharedPool
+			}
+		}
+
+		m.sharedPoolUpdatePending = false
+
+		// Call the callback if we have updates
+		if len(updates) > 0 && m.pendingUpdateCallback != nil {
+			callback := m.pendingUpdateCallback
+			// Release lock before calling callback to prevent deadlock
+			m.mu.Unlock()
+			callback(updates)
+			return // Don't re-lock since defer will unlock
+		}
+	})
 }
 
 // ContainerExists checks if a container exists in the state manager
@@ -892,7 +960,13 @@ func (m *Manager) RemoveContainer(containerID string, alloc Allocator) ([]*api.C
 
 	delete(m.byCID, containerID)
 
-	// Recompute shared pool and update shared containers
+	// If we have a callback set up, use debounced updates to prevent explosion during rapid deletions
+	if m.pendingUpdateCallback != nil {
+		m.scheduleSharedPoolUpdate(alloc)
+		return nil, nil // Updates will be handled by debounced callback
+	}
+
+	// Fallback to immediate updates for backwards compatibility (tests, etc.)
 	updates := make([]*api.ContainerUpdate, 0)
 	newSharedPool := m.computeSharedPool(alloc.GetOnlineCPUs())
 
