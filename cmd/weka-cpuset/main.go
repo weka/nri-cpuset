@@ -118,11 +118,6 @@ func runPlugin(cmd *cobra.Command, args []string) error {
 		updateCancel: updateCancel,
 	}
 
-	// Set up the callback for debounced shared pool updates
-	stateManager.SetUpdateCallback(func(updates []*api.ContainerUpdate) {
-		p.queueBackgroundUpdate(updates, "debounced shared pool update")
-	})
-
 	// Create NRI stub options
 	var stubOptions []stub.Option
 
@@ -144,7 +139,12 @@ func runPlugin(cmd *cobra.Command, args []string) error {
 
 	p.stub = stub
 
-	// Start background update processor
+	// Set up the callback for debounced shared pool updates AFTER stub is initialized
+	stateManager.SetUpdateCallback(func(updates []*api.ContainerUpdate) {
+		p.queueBackgroundUpdate(updates, "debounced shared pool update")
+	})
+
+	// Start background update processor AFTER stub is initialized
 	go p.processBackgroundUpdates()
 
 	// Ensure cleanup on exit
@@ -169,6 +169,12 @@ func (p *plugin) processBackgroundUpdates() {
 			return
 		case req := <-p.updateQueue:
 			if len(req.updates) == 0 {
+				continue
+			}
+
+			// Safety check to prevent nil pointer dereference
+			if p.stub == nil {
+				fmt.Printf("WARNING: Stub not initialized, skipping %d background updates for %s\n", len(req.updates), req.operation)
 				continue
 			}
 
