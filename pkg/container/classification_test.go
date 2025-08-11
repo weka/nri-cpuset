@@ -146,4 +146,72 @@ var _ = Describe("Container Classification", func() {
 			Expect(mode).To(Equal("shared"))
 		})
 	})
+
+	Describe("GetForbiddenCPUs", func() {
+		It("should return empty slice when no annotations", func() {
+			pod := &api.PodSandbox{}
+			forbidden := container.GetForbiddenCPUs(pod)
+			Expect(forbidden).To(BeEmpty())
+		})
+
+		It("should return empty slice when forbid-core-ids annotation is missing", func() {
+			pod := &api.PodSandbox{
+				Annotations: map[string]string{
+					"weka.io/cores-ids": "0,1",
+				},
+			}
+			forbidden := container.GetForbiddenCPUs(pod)
+			Expect(forbidden).To(BeEmpty())
+		})
+
+		It("should return empty slice when forbid-core-ids annotation is empty", func() {
+			pod := &api.PodSandbox{
+				Annotations: map[string]string{
+					"weka.io/forbid-core-ids": "",
+				},
+			}
+			forbidden := container.GetForbiddenCPUs(pod)
+			Expect(forbidden).To(BeEmpty())
+		})
+
+		It("should parse simple CPU list", func() {
+			pod := &api.PodSandbox{
+				Annotations: map[string]string{
+					"weka.io/forbid-core-ids": "1,3,5",
+				},
+			}
+			forbidden := container.GetForbiddenCPUs(pod)
+			Expect(forbidden).To(Equal([]int{1, 3, 5}))
+		})
+
+		It("should parse CPU ranges", func() {
+			pod := &api.PodSandbox{
+				Annotations: map[string]string{
+					"weka.io/forbid-core-ids": "0-2,6",
+				},
+			}
+			forbidden := container.GetForbiddenCPUs(pod)
+			Expect(forbidden).To(Equal([]int{0, 1, 2, 6}))
+		})
+
+		It("should return empty slice for invalid CPU list format", func() {
+			pod := &api.PodSandbox{
+				Annotations: map[string]string{
+					"weka.io/forbid-core-ids": "invalid-format",
+				},
+			}
+			forbidden := container.GetForbiddenCPUs(pod)
+			Expect(forbidden).To(BeEmpty())
+		})
+
+		It("should handle complex CPU ranges and lists", func() {
+			pod := &api.PodSandbox{
+				Annotations: map[string]string{
+					"weka.io/forbid-core-ids": "0,2-4,7",
+				},
+			}
+			forbidden := container.GetForbiddenCPUs(pod)
+			Expect(forbidden).To(Equal([]int{0, 2, 3, 4, 7}))
+		})
+	})
 })

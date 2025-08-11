@@ -77,7 +77,7 @@ make image-push REGISTRY=my-registry.com:5000 IMAGE_NAME=weka-nri-cpuset
 
 ##### Running All E2E Tests (Optimized for Parallel Execution)
 ```bash
-# Run all E2E tests with optimized defaults (8 parallel workers, preserve failures)
+# Run all E2E tests with optimized defaults (excludes stress/chaos tests)
 KUBECONFIG=/path/to/kubeconfig make test-e2e-live
 
 # Direct script execution with optimized defaults
@@ -87,6 +87,8 @@ KUBECONFIG=/path/to/kubeconfig ./hack/e2e-live.sh
 # - TEST_PARALLEL=8 (8 parallel workers for faster execution)
 # - PRESERVE_ON_FAILURE=true (preserve failed pods for debugging)
 # - CONTINUE_ON_FAILURE=false (stop on parallel test failures)
+# - Node isolation: failed test nodes are preserved and not reused
+# - Excludes stress/chaos tests for focused e2e testing
 
 # Customization examples:
 KUBECONFIG=/path/to/kubeconfig TEST_PARALLEL=4 ./hack/e2e-live.sh  # Fewer workers
@@ -367,6 +369,37 @@ KUBECONFIG=/path/to/kubeconfig ginkgo -v --focus="test pattern" ./test/e2e/
 
 # 3. Check for errors or unexpected behavior
 KUBECONFIG=/path/to/kubeconfig kubectl logs -n kube-system -l app=weka-nri-cpuset --since=5m | grep -E "(error|fail)" -i
+```
+
+### Stress/Chaos Testing
+
+**Separate from regular e2e tests** - stress tests create significant cluster load and should be run independently.
+
+```bash
+# Run stress/chaos tests (separate from regular e2e tests)
+KUBECONFIG=/path/to/kubeconfig make test-stress
+
+# Direct script execution
+KUBECONFIG=/path/to/kubeconfig ./hack/stress-test.sh
+
+# Stress test characteristics:
+# - Longer timeout (60m default)
+# - Fewer parallel workers (1 default - resource intensive)
+# - Tests plugin behavior under extreme load
+# - Creates rapid pod creation/deletion cycles
+# - Tests resource exhaustion scenarios
+# - Tests conflict resolution under load
+
+# Customization examples:
+KUBECONFIG=/path/to/kubeconfig TEST_TIMEOUT=90m ./hack/stress-test.sh  # Longer timeout
+KUBECONFIG=/path/to/kubeconfig TEST_PARALLEL=2 ./hack/stress-test.sh   # More parallel workers (careful!)
+KUBECONFIG=/path/to/kubeconfig PRESERVE_ON_FAILURE=true ./hack/stress-test.sh  # Preserve failed resources
+
+# Prerequisites for stress testing:
+# - At least 8 CPU cores per node recommended
+# - Multiple nodes recommended for full coverage
+# - Run during maintenance windows or on dedicated test clusters
+# - Monitor cluster resources during execution
 ```
 
 ## Prerequisites

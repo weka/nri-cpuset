@@ -59,8 +59,12 @@ test-e2e-kind: ## Run e2e tests with kind cluster (RECOMMENDED)
 	./hack/kind-e2e.sh
 
 .PHONY: test-e2e-live
-test-e2e-live: ## Run e2e tests against live cluster
+test-e2e-live: ## Run e2e tests against live cluster (excludes stress/chaos tests)
 	./hack/e2e-live.sh
+
+.PHONY: test-stress
+test-stress: ## Run stress/chaos tests against live cluster
+	./hack/stress-test.sh
 
 .PHONY: test-e2e
 test-e2e: ## Run e2e tests (defaults to kind)

@@ -2,6 +2,7 @@ package container
 
 import (
 	"github.com/containerd/nri/pkg/api"
+	"github.com/weka/nri-cpuset/pkg/numa"
 )
 
 // HasIntegerSemantics determines if a container meets the criteria for integer pod classification.
@@ -88,6 +89,29 @@ func DetermineContainerMode(pod *api.PodSandbox, container *api.Container) strin
 	}
 
 	return "shared"
+}
+
+// GetForbiddenCPUs parses and validates the weka.io/forbid-core-ids annotation
+// Returns empty slice if annotation is not present or invalid
+func GetForbiddenCPUs(pod *api.PodSandbox) []int {
+	if pod.Annotations == nil {
+		return nil
+	}
+
+	forbidList, exists := pod.Annotations["weka.io/forbid-core-ids"]
+	if !exists || forbidList == "" {
+		return nil
+	}
+
+	// Parse the CPU list - same format as cores-ids annotation
+	cpus, err := numa.ParseCPUList(forbidList)
+	if err != nil {
+		// If parsing fails, return empty list (ignore invalid annotation)
+		// This follows the same pattern as the cores-ids validation in the allocator
+		return nil
+	}
+
+	return cpus
 }
 
 // Helper function for floating point comparison

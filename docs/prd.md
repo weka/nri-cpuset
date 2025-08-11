@@ -17,18 +17,47 @@ A node-resident component shall control CPU and NUMA-memory placement for every 
 | **Annotated pod** | A pod whose sandbox carries `weka.io/cores-ids: "<CPU-list>"`. The value is a comma/range-formatted list ("0,2-3,8"). The pod may request either fractional CPU shares or whole CPUs. It shall receive unrestricted access to every listed logical CPU. |
 | **Integer pod** | A pod without the annotation whose every container meets static CPU-manager criteria: `requests.cpu == limits.cpu`, `requests.memory == limits.memory`, and `limits.cpu` is an integer (`quota % period == 0`). |
 | **Shared pod** | Any pod that is neither annotated nor integer. |
+| **Forbidden CPU annotation** | An optional annotation `weka.io/forbid-core-ids: "<CPU-list>"` that can be applied to any pod type. CPUs listed in this annotation shall be excluded from allocation for that specific pod, providing resource isolation and conflict avoidance. |
 | **Reserved core** | A logical CPU already allocated to an annotated or integer pod. |
 | **Shared pool** | `online CPUs − reserved cores`; the dynamic set that shared pods are allowed to use. |
 
 ## 3. Functional Requirements
 
-### 3.1 Admission-time Behaviour
+### 3.1 Forbidden CPU Semantics
+
+The `weka.io/forbid-core-ids` annotation provides preventive CPU allocation control:
+
+#### Purpose
+- **Resource Isolation**: Prevent specific pods from using designated CPUs
+- **Conflict Avoidance**: Reserve CPUs for future high-priority pods before they are created
+- **Workload Separation**: Ensure certain workloads avoid specific CPU resources
+
+#### Behavior by Pod Type
+
+| Pod type | Forbidden CPU Handling | Effect |
+|----------|----------------------|--------|
+| **Annotated** | Annotation is ignored. | Annotated pods always receive their exact requested CPUs from `weka.io/cores-ids`, regardless of forbidden CPU settings. |
+| **Integer** | Exclude forbidden CPUs from allocation pool. | When allocating N exclusive CPUs, the component shall exclude forbidden CPUs from the available set `online − reserved − forbidden`. |
+| **Shared** | Calculate per-container shared pool. | Each shared container receives access to `shared pool − forbidden CPUs for this pod`. This creates per-container shared pools based on individual forbidden CPU patterns. |
+
+#### Syntax and Validation
+- **Format**: Same as `weka.io/cores-ids` - comma/range-formatted list ("0,2-3,8")
+- **Invalid Syntax**: Invalid annotations shall be ignored with a warning logged; pod creation proceeds normally
+- **CPU Validation**: Offline or non-existent CPUs in forbidden list are ignored
+- **Empty Annotation**: Empty or missing annotation imposes no restrictions
+
+#### Interaction with Other Features
+- **Live Reallocation**: When integer pods are reallocated due to annotated pod conflicts, forbidden CPUs are respected during reassignment
+- **Shared Pool Updates**: When shared pool changes due to container lifecycle events, per-container forbidden CPUs are recalculated
+- **NUMA Placement**: Forbidden CPUs do not affect NUMA memory placement decisions
+
+### 3.2 Admission-time Behaviour
 
 | Pod type | Handling of cpuset.cpus | Admission errors |
 |----------|------------------------|------------------|
-| **Annotated** | Use the CPU list verbatim. Overlap with other annotated pods allowed (reference-count). If conflicts with integer pods exist and sufficient free CPUs are available, trigger live reallocation of conflicting integer pods to different exclusive CPU sets. | • CPU offline -or-<br>• CPU reserved by an integer pod with insufficient free CPUs for reallocation. |
-| **Integer** | Allocate N exclusive CPUs (N = limits.cpu) from the free set `online − reserved`. Prefer sibling cores (hyperthreads) when available: for 2 cores prefer siblings, for 3 cores prefer full core + one sibling, for additional cores prefer completing partial cores before fragmenting new ones. Must avoid CPUs already allocated to annotated pods. | Not enough free CPUs after excluding annotated pod allocations. |
-| **Shared** | Constrain to the current shared pool. | Shared pool would be empty after exclusion. |
+| **Annotated** | Use the CPU list verbatim, ignoring any forbidden CPU annotations. Overlap with other annotated pods allowed (reference-count). If conflicts with integer pods exist and sufficient free CPUs are available, trigger live reallocation of conflicting integer pods to different exclusive CPU sets. | • CPU offline -or-<br>• CPU reserved by an integer pod with insufficient free CPUs for reallocation. |
+| **Integer** | Allocate N exclusive CPUs (N = limits.cpu) from the free set `online − reserved − forbidden`. Prefer sibling cores (hyperthreads) when available: for 2 cores prefer siblings, for 3 cores prefer full core + one sibling, for additional cores prefer completing partial cores before fragmenting new ones. Must avoid CPUs already allocated to annotated pods and forbidden CPUs for this pod. | Not enough free CPUs after excluding annotated pod allocations and forbidden CPUs. |
+| **Shared** | Constrain to the current shared pool minus pod-specific forbidden CPUs: `shared pool − forbidden CPUs for this pod`. | Pod-specific shared pool would be empty after forbidden CPU exclusion. |
 
 ### 3.2 Runtime Updates
 

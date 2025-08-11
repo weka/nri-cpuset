@@ -83,6 +83,9 @@ func TestE2E(t *testing.T) {
 var _ = BeforeSuite(func() {
 	ctx = context.Background()
 
+	// Initialize failed test nodes tracking
+	failedTestNodes = make(map[string]bool)
+
 	// Check if we should preserve resources on failure
 	if os.Getenv("PRESERVE_ON_FAILURE") == "true" {
 		preserveOnFailure = true
@@ -175,6 +178,7 @@ var (
 	currentTestNode      string
 	currentTestNamespace string
 	currentTestFailed    bool
+	failedTestNodes      map[string]bool // Track nodes that had failed tests
 )
 
 var _ = BeforeEach(func() {
@@ -186,9 +190,30 @@ var _ = BeforeEach(func() {
 		Fail("No available nodes for test execution")
 	}
 
-	// Assign node deterministically but cycle through all available nodes
-	nodeIndex := (workerID - 1) % len(availableNodes) // Ginkgo workers are 1-based
-	currentTestNode = availableNodes[nodeIndex]
+	// Find a node that hasn't had failed tests for this test
+	// This ensures failed test nodes are isolated for debugging
+	var selectedNode string
+	startIndex := (workerID - 1) % len(availableNodes) // Ginkgo workers are 1-based
+	
+	for i := 0; i < len(availableNodes); i++ {
+		nodeIndex := (startIndex + i) % len(availableNodes)
+		candidateNode := availableNodes[nodeIndex]
+		
+		// Skip nodes that have had failed tests to preserve debugging state
+		if !failedTestNodes[candidateNode] {
+			selectedNode = candidateNode
+			break
+		}
+	}
+	
+	// If all nodes have failed tests, use the original deterministic assignment
+	// This handles the case where we run out of clean nodes
+	if selectedNode == "" {
+		selectedNode = availableNodes[startIndex]
+		fmt.Printf("WARNING: All nodes have failed tests, reusing node %s\n", selectedNode)
+	}
+	
+	currentTestNode = selectedNode
 
 	// Create unique namespace per node (simplified from worker-based approach)
 	// Each node gets one namespace shared by all workers assigned to it
@@ -226,6 +251,9 @@ var _ = AfterEach(func() {
 	currentTestFailed = CurrentSpecReport().Failed()
 	if currentTestFailed {
 		hasFailedTests = true
+		// Mark this node as having failed tests - it won't be reused for new tests
+		failedTestNodes[currentTestNode] = true
+		fmt.Printf("Node %s marked as failed - will be preserved for debugging and not reused\n", currentTestNode)
 	}
 
 	// Handle namespace cleanup based on failure status

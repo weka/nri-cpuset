@@ -91,10 +91,13 @@ func (m *Manager) scheduleSharedPoolUpdate(alloc Allocator) {
 
 	// Schedule new timer
 	m.sharedPoolDebounceTimer = time.AfterFunc(debounceDelay, func() {
+		fmt.Printf("DEBUG: scheduleSharedPoolUpdate timer fired, acquiring lock\n")
 		m.mu.Lock()
-		defer m.mu.Unlock()
+		fmt.Printf("DEBUG: scheduleSharedPoolUpdate acquired lock\n")
 
 		if !m.sharedPoolUpdatePending {
+			fmt.Printf("DEBUG: scheduleSharedPoolUpdate update not pending, releasing lock\n")
+			m.mu.Unlock()
 			return // Update was already processed or cancelled
 		}
 
@@ -121,13 +124,23 @@ func (m *Manager) scheduleSharedPoolUpdate(alloc Allocator) {
 
 		m.sharedPoolUpdatePending = false
 
-		// Call the callback if we have updates
+		// Extract callback and updates under lock, then release lock before calling
+		var callback func([]*api.ContainerUpdate)
 		if len(updates) > 0 && m.pendingUpdateCallback != nil {
-			callback := m.pendingUpdateCallback
-			// Release lock before calling callback to prevent deadlock
-			m.mu.Unlock()
+			callback = m.pendingUpdateCallback
+		}
+
+		// Always unlock here - no defer needed since we handle all paths explicitly
+		fmt.Printf("DEBUG: scheduleSharedPoolUpdate releasing lock before callback\n")
+		m.mu.Unlock()
+
+		// Call the callback outside the lock to prevent deadlock
+		if callback != nil {
+			fmt.Printf("DEBUG: scheduleSharedPoolUpdate calling callback with %d updates\n", len(updates))
 			callback(updates)
-			return // Don't re-lock since defer will unlock
+			fmt.Printf("DEBUG: scheduleSharedPoolUpdate callback completed\n")
+		} else {
+			fmt.Printf("DEBUG: scheduleSharedPoolUpdate no callback to call\n")
 		}
 	})
 }

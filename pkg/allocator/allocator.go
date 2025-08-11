@@ -298,6 +298,33 @@ func (a *CPUAllocator) AllocateContainerCPUs(pod *api.PodSandbox, container *api
 	return result.CPUs, result.Mode, nil
 }
 
+// AllocateContainerCPUsWithForbidden provides allocation logic that respects forbidden CPUs
+func (a *CPUAllocator) AllocateContainerCPUsWithForbidden(pod *api.PodSandbox, container *api.Container, reserved []int, forbidden []int) ([]int, string, error) {
+	mode := a.determineContainerMode(pod, container)
+
+	var result *AllocationResult
+	var err error
+
+	switch mode {
+	case "annotated":
+		result, err = a.handleAnnotatedContainer(pod, reserved)
+	case "integer":
+		result, err = a.handleIntegerContainerWithForbidden(container, reserved, forbidden)
+	case "shared":
+		// For shared containers, forbidden CPUs are treated like reserved CPUs
+		combinedReserved := append(reserved, forbidden...)
+		result, err = a.handleSharedContainer(combinedReserved)
+	default:
+		return nil, "", fmt.Errorf("unknown container mode: %s", mode)
+	}
+
+	if err != nil {
+		return nil, "", err
+	}
+
+	return result.CPUs, result.Mode, nil
+}
+
 func (a *CPUAllocator) determineContainerMode(pod *api.PodSandbox, container *api.Container) string {
 	// Check for annotation first
 	if pod.Annotations != nil {
@@ -419,6 +446,35 @@ func (a *CPUAllocator) handleIntegerContainer(container *api.Container, reserved
 
 	// Per PRD 3.3: Integer pods keep flexible NUMA memory (no binding) to support live reallocation
 	// This prevents memory placement conflicts during live reassignment
+
+	return &AllocationResult{
+		CPUs:     cpus,
+		MemNodes: nil, // No NUMA memory binding for integer pods
+		Mode:     "integer",
+	}, nil
+}
+
+// handleIntegerContainerWithForbidden handles integer containers while respecting forbidden CPUs
+func (a *CPUAllocator) handleIntegerContainerWithForbidden(container *api.Container, reserved []int, forbidden []int) (*AllocationResult, error) {
+	if container.Linux == nil || container.Linux.Resources == nil || container.Linux.Resources.Cpu == nil {
+		return nil, fmt.Errorf("missing CPU resources for integer container")
+	}
+
+	cpu := container.Linux.Resources.Cpu
+	if cpu.Quota == nil || cpu.Period == nil || cpu.Quota.GetValue() <= 0 || cpu.Period.GetValue() <= 0 {
+		return nil, fmt.Errorf("invalid CPU quota/period for integer container")
+	}
+
+	cpuCores := int(cpu.Quota.GetValue() / int64(cpu.Period.GetValue()))
+
+	// Combine reserved and forbidden CPUs to exclude from allocation
+	combinedReserved := append(reserved, forbidden...)
+
+	// Use sibling-aware allocation for integer containers
+	cpus, err := a.AllocateExclusiveCPUsWithSiblings(cpuCores, combinedReserved)
+	if err != nil {
+		return nil, fmt.Errorf("failed to allocate exclusive CPUs (avoiding forbidden cores): %w", err)
+	}
 
 	return &AllocationResult{
 		CPUs:     cpus,

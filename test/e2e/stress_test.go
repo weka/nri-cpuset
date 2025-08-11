@@ -142,7 +142,7 @@ func (s *StressTestState) GetPodCount() int {
 	return len(s.ActivePods)
 }
 
-var _ = Describe("Chaos Stress Testing", Label("e2e", "stress", "parallel"), func() {
+var _ = Describe("Chaos Stress Testing", Label("stress", "chaos"), func() {
 	var (
 		metrics      *StressTestMetrics
 		stressState  *StressTestState
@@ -334,7 +334,6 @@ var _ = Describe("Chaos Stress Testing", Label("e2e", "stress", "parallel"), fun
 			By("Creating rapid conflict scenarios to test live reallocation under stress")
 
 			// Create several integer pods first
-			var integerPods []*corev1.Pod
 			numIntegerPods := min(6, nodeCPUCount/4) // Each takes ~2-4 CPUs
 
 			for i := 0; i < numIntegerPods; i++ {
@@ -354,7 +353,6 @@ var _ = Describe("Chaos Stress Testing", Label("e2e", "stress", "parallel"), fun
 				createdPod, err := kubeClient.CoreV1().Pods(testNamespace).Create(ctx, pod, metav1.CreateOptions{})
 				Expect(err).ToNot(HaveOccurred())
 				waitForPodRunning(createdPod.Name)
-				integerPods = append(integerPods, createdPod)
 				stressState.AddPod(createdPod, "integer", nil)
 			}
 
@@ -535,11 +533,12 @@ func createPodTemplates(nodeCPUCount int) []PodTemplate {
 
 // chaosWorker runs continuous pod creation/deletion during chaos phase
 func chaosWorker(ctx context.Context, wg *sync.WaitGroup, workerID int, metrics *StressTestMetrics,
-	stressState *StressTestState, templates []PodTemplate, nodeCPUCount int) {
+	stressState *StressTestState, templates []PodTemplate, nodeCPUCount int,
+) {
 	defer wg.Done()
 
 	AddDebugInfo(fmt.Sprintf("Chaos worker %d starting", workerID))
-	rand.Seed(time.Now().UnixNano() + int64(workerID))
+	rng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(workerID)))
 
 	operationCounter := 0
 	for {
@@ -552,17 +551,17 @@ func chaosWorker(ctx context.Context, wg *sync.WaitGroup, workerID int, metrics 
 
 			// Decide operation: 70% create, 30% delete (if pods exist)
 			activePods := stressState.GetActivePods()
-			shouldCreate := rand.Float64() < 0.7 || len(activePods) == 0
+			shouldCreate := rng.Float64() < 0.7 || len(activePods) == 0
 
 			if shouldCreate {
 				// Create a pod
-				template := selectRandomTemplate(templates)
+				template := selectRandomTemplate(templates, rng)
 				podName := fmt.Sprintf("chaos-w%d-op%d-%s", workerID, operationCounter, template.PodType)
 
 				// Randomize annotated pod CPU selections
 				annotations := template.Annotations
 				if template.PodType == "annotated" && annotations != nil {
-					annotations = randomizeAnnotations(annotations, nodeCPUCount)
+					annotations = randomizeAnnotations(annotations, nodeCPUCount, rng)
 				}
 
 				pod := createTestPod(podName, annotations, template.Resources)
@@ -578,7 +577,7 @@ func chaosWorker(ctx context.Context, wg *sync.WaitGroup, workerID int, metrics 
 				}
 			} else if len(activePods) > 0 {
 				// Delete a random pod
-				podToDelete := activePods[rand.Intn(len(activePods))]
+				podToDelete := activePods[rng.Intn(len(activePods))]
 				err := kubeClient.CoreV1().Pods(testNamespace).Delete(ctx, podToDelete.Name, metav1.DeleteOptions{})
 
 				if err != nil {
@@ -592,20 +591,20 @@ func chaosWorker(ctx context.Context, wg *sync.WaitGroup, workerID int, metrics 
 			}
 
 			// Variable delay between operations (100ms to 2s)
-			delay := time.Duration(100+rand.Intn(1900)) * time.Millisecond
+			delay := time.Duration(100+rng.Intn(1900)) * time.Millisecond
 			time.Sleep(delay)
 		}
 	}
 }
 
 // selectRandomTemplate selects a pod template based on weights
-func selectRandomTemplate(templates []PodTemplate) PodTemplate {
+func selectRandomTemplate(templates []PodTemplate, rng *rand.Rand) PodTemplate {
 	totalWeight := 0
 	for _, t := range templates {
 		totalWeight += t.Weight
 	}
 
-	randomValue := rand.Intn(totalWeight)
+	randomValue := rng.Intn(totalWeight)
 	currentWeight := 0
 
 	for _, t := range templates {
@@ -620,21 +619,21 @@ func selectRandomTemplate(templates []PodTemplate) PodTemplate {
 }
 
 // randomizeAnnotations creates variations of CPU annotations for chaos testing
-func randomizeAnnotations(baseAnnotations map[string]string, nodeCPUCount int) map[string]string {
+func randomizeAnnotations(baseAnnotations map[string]string, nodeCPUCount int, rng *rand.Rand) map[string]string {
 	if _, exists := baseAnnotations["weka.io/cores-ids"]; exists {
 		// Create random variations of CPU selections
 		maxCPU := min(nodeCPUCount-1, 31) // Use reasonable CPU range
 
 		variations := []string{
-			fmt.Sprintf("%d", rand.Intn(maxCPU)),
-			fmt.Sprintf("%d,%d", rand.Intn(maxCPU), rand.Intn(maxCPU)),
-			fmt.Sprintf("%d-%d", rand.Intn(maxCPU/2), rand.Intn(maxCPU/2)+maxCPU/2),
+			fmt.Sprintf("%d", rng.Intn(maxCPU)),
+			fmt.Sprintf("%d,%d", rng.Intn(maxCPU), rng.Intn(maxCPU)),
+			fmt.Sprintf("%d-%d", rng.Intn(maxCPU/2), rng.Intn(maxCPU/2)+maxCPU/2),
 		}
 
 		newAnnotations := make(map[string]string)
 		for k, v := range baseAnnotations {
 			if k == "weka.io/cores-ids" {
-				newAnnotations[k] = variations[rand.Intn(len(variations))]
+				newAnnotations[k] = variations[rng.Intn(len(variations))]
 			} else {
 				newAnnotations[k] = v
 			}

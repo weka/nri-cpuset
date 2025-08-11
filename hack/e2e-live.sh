@@ -225,8 +225,7 @@ run_tests() {
     echo "- Test pod status will be shown periodically"
     echo "- Individual test progress will be displayed below"
     echo "- Using Ginkgo v2 with parallel execution (${TEST_PARALLEL} workers - default: cluster size)"
-    echo "- Parallel tests: annotated pods, integer pods, shared pods"
-    echo "- Sequential tests: recovery, live reallocation, conflict resolution"
+    echo "- Parallel tests: annotated pods, integer pods, shared pods, recovery, live reallocation, conflict resolution"
     echo "- Resource preservation on failure: $PRESERVE_ON_FAILURE"
     echo "==============================================================================="
     
@@ -243,11 +242,11 @@ run_tests() {
     cd "$(dirname "$0")/.."  # Ensure we're in the project root
     
     if command -v ginkgo &> /dev/null; then
-        # Run parallel tests first (faster execution)
-        log_info "Running parallel tests (annotated pods, integer pods, shared pods)..."
+        # Run parallel tests - exclude stress/chaos tests
+        log_info "Running parallel tests (all e2e tests)..."
         ginkgo -r \
             --timeout="$TEST_TIMEOUT" \
-            --label-filter="parallel" \
+            --label-filter="parallel && e2e" \
             --procs="$optimal_parallel" \
             -v \
             --show-node-events \
@@ -255,26 +254,12 @@ run_tests() {
             --junit-report=test-results-parallel.xml \
             ./test/e2e/ || test_result=$?
         
-        # Run sequential tests if parallel tests passed or if we want to continue regardless
-        if [[ "$test_result" -eq 0 ]] || [[ "${CONTINUE_ON_FAILURE:-false}" == "true" ]]; then
-            log_info "Running sequential tests (recovery, live reallocation, conflicts)..."
-            ginkgo -r \
-                --timeout="$TEST_TIMEOUT" \
-                --label-filter="sequential" \
-                -v \
-                --show-node-events \
-                --json-report=test-results-sequential.json \
-                --junit-report=test-results-sequential.xml \
-                ./test/e2e/ || test_result=$?
-        else
-            log_warn "Parallel tests failed, skipping sequential tests (set CONTINUE_ON_FAILURE=true to run all)"
-        fi
     else
-        # Fallback to go test (less optimal)
+        # Fallback to go test (less optimal) - exclude stress/chaos tests
         go test ./test/e2e \
             -timeout="$TEST_TIMEOUT" \
             -v \
-            -ginkgo.label-filter="e2e" \
+            -ginkgo.label-filter="e2e && !stress" \
             -ginkgo.procs="$optimal_parallel" \
             -ginkgo.show-node-events \
             -ginkgo.json-report=test-results.json \
@@ -295,7 +280,6 @@ run_tests() {
     if [[ -f test-results-parallel.json ]] || [[ -f test-results-sequential.json ]] || [[ -f test-results.json ]]; then
         log_info "Test results summary available in test-results-*.json files"
         [[ -f test-results-parallel.json ]] && log_info "Parallel test results: test-results-parallel.json"
-        [[ -f test-results-sequential.json ]] && log_info "Sequential test results: test-results-sequential.json"
         [[ -f test-results.json ]] && log_info "Combined test results: test-results.json"
     fi
     
@@ -321,7 +305,6 @@ cleanup() {
     
     # Show available reports
     [[ -f test-results-parallel.json ]] && log_info "Parallel JSON report: test-results-parallel.json"
-    [[ -f test-results-sequential.json ]] && log_info "Sequential JSON report: test-results-sequential.json"
     [[ -f test-results.json ]] && log_info "Combined JSON report: test-results.json"
     [[ -f test-results.xml ]] && log_info "Combined JUnit report: test-results.xml"
 }
@@ -449,7 +432,7 @@ Environment Variables:
   TEST_TIMEOUT    Test timeout (default: 30m)
   TEST_PARALLEL   Number of parallel workers (default: cluster size)
   PRESERVE_ON_FAILURE Preserve failed test resources for debugging (default: true)
-  CONTINUE_ON_FAILURE Continue with sequential tests even if parallel tests fail (default: false)
+  CONTINUE_ON_FAILURE Continue running tests even if some fail (default: false)
   FORCE_DEPLOY    Force plugin redeployment (default: false)
   SKIP_CLEANUP    Skip test namespace cleanup (default: false)
   PRESERVE_REPORTS Keep test report files after completion (default: false)
@@ -477,7 +460,7 @@ Examples:
   # Run with fewer parallel workers (reduce from default 8)
   TEST_PARALLEL=4 $0
   
-  # Continue all tests even if some fail (preserve is already default)
+  # Continue running all tests even if some fail (preserve is already default)
   CONTINUE_ON_FAILURE=true $0
   
   # Disable failure preservation (faster cleanup)

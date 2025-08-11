@@ -51,6 +51,7 @@ type plugin struct {
 type updateRequest struct {
 	updates   []*api.ContainerUpdate
 	operation string
+	callback  func(success bool) // Optional callback for result notification
 }
 
 var (
@@ -175,15 +176,24 @@ func (p *plugin) processBackgroundUpdates() {
 			// Safety check to prevent nil pointer dereference
 			if p.stub == nil {
 				fmt.Printf("WARNING: Stub not initialized, skipping %d background updates for %s\n", len(req.updates), req.operation)
+				if req.callback != nil {
+					req.callback(false) // Treat uninitialized stub as failure
+				}
 				continue
 			}
 
 			fmt.Printf("Processing %d background container updates for %s\n", len(req.updates), req.operation)
 			_, err := p.stub.UpdateContainers(req.updates)
+			success := err == nil
 			if err != nil {
 				fmt.Printf("ERROR: Background UpdateContainers failed for %s: %v\n", req.operation, err)
 			} else {
 				fmt.Printf("Successfully applied %d background updates for %s\n", len(req.updates), req.operation)
+			}
+
+			// Call the callback if provided
+			if req.callback != nil {
+				req.callback(success)
 			}
 		}
 	}
@@ -191,13 +201,22 @@ func (p *plugin) processBackgroundUpdates() {
 
 // queueBackgroundUpdate queues container updates for background processing (async)
 func (p *plugin) queueBackgroundUpdate(updates []*api.ContainerUpdate, operation string) {
+	p.queueBackgroundUpdateWithCallback(updates, operation, nil)
+}
+
+// queueBackgroundUpdateWithCallback queues container updates with a success/failure callback
+func (p *plugin) queueBackgroundUpdateWithCallback(updates []*api.ContainerUpdate, operation string, callback func(success bool)) {
 	if len(updates) == 0 {
+		if callback != nil {
+			callback(true) // No updates means success
+		}
 		return
 	}
 
 	req := updateRequest{
 		updates:   updates,
 		operation: operation,
+		callback:  callback,
 	}
 
 	select {
@@ -205,8 +224,14 @@ func (p *plugin) queueBackgroundUpdate(updates []*api.ContainerUpdate, operation
 		fmt.Printf("Queued %d container updates for background processing (%s)\n", len(updates), operation)
 	case <-p.updateCtx.Done():
 		fmt.Printf("Plugin shutting down, discarding %d updates for %s\n", len(updates), operation)
+		if callback != nil {
+			callback(false) // Treat shutdown as failure
+		}
 	default:
 		fmt.Printf("WARNING: Update queue full, discarding %d updates for %s\n", len(updates), operation)
+		if callback != nil {
+			callback(false) // Treat queue full as failure
+		}
 	}
 }
 
@@ -339,10 +364,17 @@ func (p *plugin) handleAnnotatedContainer(pod *api.PodSandbox, container *api.Co
 	// Queue live reallocation updates for background processing (async, no blocking)
 	if len(updates) > 0 {
 		fmt.Printf("Queuing %d live reallocation updates for annotated container %s\n", len(updates), container.Name)
-		// Apply the reallocation plan optimistically - the background update will handle any failures
-		p.state.ApplySuccessfulReallocation()
-		// Queue updates asynchronously (no blocking of NRI callback)
-		p.queueBackgroundUpdate(updates, "live reallocation")
+		// CRITICAL FIX: Only apply reallocation plan after updates succeed
+		// For now, queue updates and let them apply the plan on success
+		p.queueBackgroundUpdateWithCallback(updates, "live reallocation", func(success bool) {
+			if success {
+				p.state.ApplySuccessfulReallocation()
+				fmt.Printf("Applied reallocation plan after successful background updates\n")
+			} else {
+				p.state.ClearPendingReallocation()
+				fmt.Printf("Cleared pending reallocation plan due to failed background updates\n")
+			}
+		})
 		fmt.Printf("Queued live reallocation updates for background processing\n")
 	}
 
@@ -361,24 +393,59 @@ func (p *plugin) handleAnnotatedContainer(pod *api.PodSandbox, container *api.Co
 func (p *plugin) handleIntegerContainer(pod *api.PodSandbox, container *api.Container) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
 	// For integer containers, get all reserved CPUs (both annotated and integer)
 	reserved := p.state.GetReservedCPUs()
-	adjustment, updates, err := p.allocator.AllocateContainer(pod, container, reserved)
+
+	// Get forbidden CPUs from annotation
+	forbidden := containerPkg.GetForbiddenCPUs(pod)
+
+	// Use the new allocator method that respects forbidden CPUs for integer containers
+	cpus, _, err := p.allocator.AllocateContainerCPUsWithForbidden(pod, container, reserved, forbidden)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	// Record the successful allocation in state manager
-	if adjustment != nil {
-		err := p.state.RecordIntegerContainer(container, pod, adjustment)
-		if err != nil {
-			return nil, nil, fmt.Errorf("failed to record integer container: %w", err)
-		}
+	// Create the adjustment manually since we need to handle forbidden CPUs
+	adjustment := &api.ContainerAdjustment{
+		Linux: &api.LinuxContainerAdjustment{
+			Resources: &api.LinuxResources{
+				Cpu: &api.LinuxCPU{
+					Cpus: numa.FormatCPUList(cpus),
+				},
+			},
+		},
 	}
 
-	return adjustment, updates, nil
+	// Record the successful allocation in state manager
+	err = p.state.RecordIntegerContainer(container, pod, adjustment)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to record integer container: %w", err)
+	}
+
+	return adjustment, nil, nil
 }
 
 func (p *plugin) handleSharedContainer(pod *api.PodSandbox, container *api.Container) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
 	// For shared containers, get all reserved CPUs (both annotated and integer)
 	reserved := p.state.GetReservedCPUs()
-	return p.allocator.AllocateContainer(pod, container, reserved)
+
+	// Get forbidden CPUs from annotation
+	forbidden := containerPkg.GetForbiddenCPUs(pod)
+
+	// Use the new allocator method that respects forbidden CPUs for shared containers
+	cpus, _, err := p.allocator.AllocateContainerCPUsWithForbidden(pod, container, reserved, forbidden)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Create the adjustment manually
+	adjustment := &api.ContainerAdjustment{
+		Linux: &api.LinuxContainerAdjustment{
+			Resources: &api.LinuxResources{
+				Cpu: &api.LinuxCPU{
+					Cpus: numa.FormatCPUList(cpus),
+				},
+			},
+		},
+	}
+
+	return adjustment, nil, nil
 }

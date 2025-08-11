@@ -945,6 +945,165 @@ func (m *MockNUMAManager) GetCPUNodesUnion(cpus []int) []int {
 	return nodes
 }
 
+var _ = Describe("Forbidden CPU Allocation", func() {
+	var (
+		allocator   *TestCPUAllocator
+		mockNumaMgr *MockNumaManager
+		realNumaMgr *numa.Manager
+	)
+
+	BeforeEach(func() {
+		mockNumaMgr = newMockNumaManager()
+		realNumaMgr = &numa.Manager{} // We can't easily mock this, so we'll work around it
+		// Create allocator with mock online CPUs for testing
+		allocator = &TestCPUAllocator{
+			CPUAllocator: &CPUAllocator{
+				numa:       realNumaMgr,
+				onlineCPUs: []int{0, 1, 2, 3, 4, 5, 6, 7}, // Mock online CPUs
+			},
+			mockNuma: mockNumaMgr,
+		}
+	})
+
+	It("should avoid forbidden CPUs for integer containers", func() {
+		pod := &api.PodSandbox{
+			Annotations: map[string]string{
+				"weka.io/forbid-core-ids": "1,3,5",
+			},
+		}
+		container := &api.Container{
+			Linux: &api.LinuxContainer{
+				Resources: &api.LinuxResources{
+					Cpu: &api.LinuxCPU{
+						Quota:  &api.OptionalInt64{Value: 200000}, // 2 CPUs
+						Period: &api.OptionalUInt64{Value: 100000},
+						Shares: &api.OptionalUInt64{Value: 2048}, // 2 CPUs request
+					},
+					Memory: &api.LinuxMemory{
+						Limit: &api.OptionalInt64{Value: 1024 * 1024 * 1024},
+					},
+				},
+			},
+		}
+
+		reserved := []int{}         // No reserved CPUs
+		forbidden := []int{1, 3, 5} // These should be avoided
+
+		cpus, mode, err := allocator.AllocateContainerCPUsWithForbidden(pod, container, reserved, forbidden)
+
+		Expect(err).ToNot(HaveOccurred())
+		Expect(mode).To(Equal("integer"))
+		Expect(cpus).To(HaveLen(2))
+
+		// None of the allocated CPUs should be in the forbidden list
+		for _, cpu := range cpus {
+			Expect(forbidden).ToNot(ContainElement(cpu))
+		}
+	})
+
+	It("should avoid forbidden CPUs for shared containers", func() {
+		pod := &api.PodSandbox{
+			Annotations: map[string]string{
+				"weka.io/forbid-core-ids": "0,2,4",
+			},
+		}
+		container := &api.Container{} // Shared container (no integer semantics)
+
+		reserved := []int{}         // No reserved CPUs
+		forbidden := []int{0, 2, 4} // These should be avoided
+
+		cpus, mode, err := allocator.AllocateContainerCPUsWithForbidden(pod, container, reserved, forbidden)
+
+		Expect(err).ToNot(HaveOccurred())
+		Expect(mode).To(Equal("shared"))
+
+		// None of the allocated CPUs should be in the forbidden list
+		for _, cpu := range cpus {
+			Expect(forbidden).ToNot(ContainElement(cpu))
+		}
+		// Available CPUs should be {1, 3, 5, 6, 7}
+		expectedAvailable := []int{1, 3, 5, 6, 7}
+		for _, cpu := range cpus {
+			Expect(expectedAvailable).To(ContainElement(cpu))
+		}
+	})
+
+	It("should handle combined reserved and forbidden CPUs", func() {
+		pod := &api.PodSandbox{
+			Annotations: map[string]string{
+				"weka.io/forbid-core-ids": "1,3",
+			},
+		}
+		container := &api.Container{
+			Linux: &api.LinuxContainer{
+				Resources: &api.LinuxResources{
+					Cpu: &api.LinuxCPU{
+						Quota:  &api.OptionalInt64{Value: 100000}, // 1 CPU
+						Period: &api.OptionalUInt64{Value: 100000},
+						Shares: &api.OptionalUInt64{Value: 1024}, // 1 CPU request
+					},
+					Memory: &api.LinuxMemory{
+						Limit: &api.OptionalInt64{Value: 1024 * 1024 * 1024},
+					},
+				},
+			},
+		}
+
+		reserved := []int{0, 2}  // Reserved by other containers
+		forbidden := []int{1, 3} // Forbidden by annotation
+
+		cpus, mode, err := allocator.AllocateContainerCPUsWithForbidden(pod, container, reserved, forbidden)
+
+		Expect(err).ToNot(HaveOccurred())
+		Expect(mode).To(Equal("integer"))
+		Expect(cpus).To(HaveLen(1))
+
+		// Allocated CPU should not be reserved or forbidden
+		cpu := cpus[0]
+		Expect(reserved).ToNot(ContainElement(cpu))
+		Expect(forbidden).ToNot(ContainElement(cpu))
+		// Should be from available set {4, 5, 6, 7}
+		Expect([]int{4, 5, 6, 7}).To(ContainElement(cpu))
+	})
+
+	It("should fail when insufficient CPUs after excluding forbidden cores", func() {
+		pod := &api.PodSandbox{
+			Annotations: map[string]string{
+				"weka.io/forbid-core-ids": "0,1,2,3,4,5,6,7", // All CPUs forbidden
+			},
+		}
+		container := &api.Container{
+			Linux: &api.LinuxContainer{
+				Resources: &api.LinuxResources{
+					Cpu: &api.LinuxCPU{
+						Quota:  &api.OptionalInt64{Value: 100000}, // 1 CPU
+						Period: &api.OptionalUInt64{Value: 100000},
+						Shares: &api.OptionalUInt64{Value: 1024}, // 1 CPU request
+					},
+					Memory: &api.LinuxMemory{
+						Limit: &api.OptionalInt64{Value: 1024 * 1024 * 1024},
+					},
+				},
+			},
+		}
+
+		reserved := []int{}                        // No reserved CPUs
+		forbidden := []int{0, 1, 2, 3, 4, 5, 6, 7} // All CPUs forbidden
+
+		cpus, _, err := allocator.AllocateContainerCPUsWithForbidden(pod, container, reserved, forbidden)
+
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("insufficient free CPUs"))
+		Expect(cpus).To(BeNil())
+	})
+
+	It("should not affect annotated containers (they ignore forbidden CPUs)", func() {
+		// Skip this test for now since annotated containers don't need forbidden CPU logic
+		// They get exactly the CPUs specified in their annotation
+		Skip("Annotated containers don't use forbidden CPU logic")
+	})
+})
+
 // NOTE: Advanced allocation tests are temporarily disabled due to interface compatibility issues
 // The sibling allocation and live reallocation functionality is implemented and working,
 // but the test infrastructure needs to be updated to work with the current numa.Manager interface.
