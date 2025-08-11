@@ -1,130 +1,234 @@
-name: Semantic Release
+name: Build and Release
 
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
 
 permissions:
   contents: write
-  issues: write
-  pull-requests: write
+  packages: write
 
 jobs:
-  release:
+  analyze-commits:
     runs-on: ubuntu-latest
     outputs:
-      new-release-published: ${{ steps.semantic.outputs.new-release-published }}
-      new-release-version: ${{ steps.semantic.outputs.new-release-version }}
+      should-release: ${{ steps.semantic.outputs.should-release }}
+      release-type: ${{ steps.semantic.outputs.release-type }}
+      next-version: ${{ steps.semantic.outputs.next-version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          persist-credentials: false
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
-      - name: Install semantic-release
-        run: |
-          npm install -g semantic-release@22 \
-            @semantic-release/commit-analyzer@11 \
-            @semantic-release/release-notes-generator@12 \
-            @semantic-release/github@9 \
-            conventional-changelog-conventionalcommits@7
-
-      - name: Create semantic-release config
-        run: |
-          cat > .releaserc.json << 'EOF'
-          {
-            "branches": ["main"],
-            "plugins": [
-              [
-                "@semantic-release/commit-analyzer",
-                {
-                  "preset": "conventionalcommits",
-                  "releaseRules": [
-                    {"type": "feat", "release": "minor"},
-                    {"type": "fix", "release": "patch"},
-                    {"type": "perf", "release": "patch"},
-                    {"type": "revert", "release": "patch"},
-                    {"type": "docs", "release": false},
-                    {"type": "chore", "release": false},
-                    {"type": "style", "release": false},
-                    {"type": "refactor", "release": false},
-                    {"type": "test", "release": false},
-                    {"type": "build", "release": false},
-                    {"type": "ci", "release": false}
-                  ]
-                }
-              ],
-              [
-                "@semantic-release/release-notes-generator",
-                {
-                  "preset": "conventionalcommits"
-                }
-              ],
-              [
-                "@semantic-release/github",
-                {
-                  "assets": []
-                }
-              ]
-            ]
-          }
-          EOF
-
-      - name: Run semantic-release
+      - name: Analyze commits for semantic versioning
         id: semantic
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: semantic-release
+        run: |
+          # Get commits since last tag or beginning if no tags
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          if [ -n "$LAST_TAG" ]; then
+            COMMITS=$(git log ${LAST_TAG}..HEAD --oneline)
+          else
+            COMMITS=$(git log --oneline)
+          fi
+          
+          echo "Analyzing commits:"
+          echo "$COMMITS"
+          
+          # Check for semantic commit patterns
+          FEAT_COUNT=$(echo "$COMMITS" | grep -E "^[a-f0-9]+ feat(\(.+\))?: " | wc -l || echo "0")
+          FIX_COUNT=$(echo "$COMMITS" | grep -E "^[a-f0-9]+ fix(\(.+\))?: " | wc -l || echo "0")
+          BREAK_COUNT=$(echo "$COMMITS" | grep -E "^[a-f0-9]+ .+!(\(.+\))?: " | wc -l || echo "0")
+          CHORE_COUNT=$(echo "$COMMITS" | grep -E "^[a-f0-9]+ chore(\(.+\))?: " | wc -l || echo "0")
+          DOCS_COUNT=$(echo "$COMMITS" | grep -E "^[a-f0-9]+ docs(\(.+\))?: " | wc -l || echo "0")
+          
+          echo "Found commits: feat=$FEAT_COUNT, fix=$FIX_COUNT, breaking=$BREAK_COUNT, chore=$CHORE_COUNT, docs=$DOCS_COUNT"
+          
+          # Determine release type
+          SHOULD_RELEASE="false"
+          RELEASE_TYPE=""
+          
+          if [ $BREAK_COUNT -gt 0 ]; then
+            SHOULD_RELEASE="true"
+            RELEASE_TYPE="major"
+          elif [ $FEAT_COUNT -gt 0 ]; then
+            SHOULD_RELEASE="true"
+            RELEASE_TYPE="minor"
+          elif [ $FIX_COUNT -gt 0 ]; then
+            SHOULD_RELEASE="true"
+            RELEASE_TYPE="patch"
+          elif [ $CHORE_COUNT -gt 0 ] || [ $DOCS_COUNT -gt 0 ]; then
+            SHOULD_RELEASE="true"
+            RELEASE_TYPE="patch"
+          fi
+          
+          # Calculate next version
+          CURRENT_VERSION="0.0.0"
+          if [ -n "$LAST_TAG" ]; then
+            CURRENT_VERSION=${LAST_TAG#v}
+          fi
+          
+          IFS='.' read -ra VERSION_PARTS <<< "$CURRENT_VERSION"
+          MAJOR=${VERSION_PARTS[0]:-0}
+          MINOR=${VERSION_PARTS[1]:-0}
+          PATCH=${VERSION_PARTS[2]:-0}
+          
+          case $RELEASE_TYPE in
+            major)
+              MAJOR=$((MAJOR + 1))
+              MINOR=0
+              PATCH=0
+              ;;
+            minor)
+              MINOR=$((MINOR + 1))
+              PATCH=0
+              ;;
+            patch)
+              PATCH=$((PATCH + 1))
+              ;;
+          esac
+          
+          NEXT_VERSION="$MAJOR.$MINOR.$PATCH"
+          
+          echo "should-release=$SHOULD_RELEASE" >> $GITHUB_OUTPUT
+          echo "release-type=$RELEASE_TYPE" >> $GITHUB_OUTPUT
+          echo "next-version=$NEXT_VERSION" >> $GITHUB_OUTPUT
+          
+          echo "Decision: should_release=$SHOULD_RELEASE, release_type=$RELEASE_TYPE, next_version=$NEXT_VERSION"
 
-  build-and-push:
-    needs: release
-    if: needs.release.outputs.new-release-published == 'true'
+  build:
     runs-on: ubuntu-latest
+    needs: analyze-commits
+    if: needs.analyze-commits.outputs.should-release == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to Quay.io
-        uses: docker/login-action@v3
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
-          registry: quay.io
-          username: ${{ secrets.QUAY_IO_USERNAME }}
-          password: ${{ secrets.QUAY_IO_PASSWORD }}
+          go-version: '1.24'
 
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+      - name: Cache Go modules
+        uses: actions/cache@v4
         with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: quay.io/weka.io/weka-nri-cpuset:${{ needs.release.outputs.new-release-version }}
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
 
-      - name: Update release with image link
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run tests
+        run: make test
+
+      - name: Create build directory
         run: |
-          IMAGE_URL="quay.io/weka.io/weka-nri-cpuset:${{ needs.release.outputs.new-release-version }}"
-          
-          # Get the release ID
-          RELEASE_ID=$(gh api repos/${{ github.repository }}/releases/tags/v${{ needs.release.outputs.new-release-version }} --jq '.id')
-          
-          # Get current release body
-          CURRENT_BODY=$(gh api repos/${{ github.repository }}/releases/$RELEASE_ID --jq '.body')
-          
-          # Add image information to release body
-          NEW_BODY="$CURRENT_BODY
+          rm -rf .temp
+          mkdir -p .temp
 
-          # Update the release
-          gh api repos/${{ github.repository }}/releases/$RELEASE_ID \
-            --method PATCH \
-            --field body="$NEW_BODY"
+      - name: Build Linux AMD64 binary
+        env:
+          GOOS: linux
+          GOARCH: amd64
+          CGO_ENABLED: "0"
+        run: |
+          go build -ldflags="-w -s" -o .temp/weka-cpuset-linux-amd64 ./cmd/weka-cpuset
+
+      - name: Build Linux ARM64 binary
+        env:
+          GOOS: linux
+          GOARCH: arm64
+          CGO_ENABLED: "0"
+        run: |
+          go build -ldflags="-w -s" -o .temp/weka-cpuset-linux-arm64 ./cmd/weka-cpuset
+
+      - name: Create checksums
+        run: |
+          cd .temp
+          ls -la
+          sha256sum weka-cpuset-linux-* > checksums.txt
+          cat checksums.txt
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: weka-cpuset-binaries
+          path: |
+            .temp/weka-cpuset-linux-amd64
+            .temp/weka-cpuset-linux-arm64
+            .temp/checksums.txt
+          retention-days: 1
+
+  release:
+    runs-on: ubuntu-latest
+    needs: [analyze-commits, build]
+    if: needs.analyze-commits.outputs.should-release == 'true' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: weka-cpuset-binaries
+          path: .temp/
+
+      - name: List downloaded artifacts
+        run: |
+          echo "Contents of .temp/:"
+          ls -la .temp/
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          VERSION="v${{ needs.analyze-commits.outputs.next-version }}"
+          
+          # Get commits since last tag or beginning
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          if [ -n "$LAST_TAG" ]; then
+            COMMITS=$(git log ${LAST_TAG}..HEAD --oneline)
+          else
+            COMMITS=$(git log --oneline)
+          fi
+          
+          echo "## What's Changed" > changelog.md
+          echo "" >> changelog.md
+          
+          # Group commits by type
+          echo "$COMMITS" | grep -E "^[a-f0-9]+ feat(\(.+\))?: " | sed 's/^[a-f0-9]* /- /' >> changelog.md || true
+          echo "$COMMITS" | grep -E "^[a-f0-9]+ fix(\(.+\))?: " | sed 's/^[a-f0-9]* /- /' >> changelog.md || true
+          echo "$COMMITS" | grep -E "^[a-f0-9]+ chore(\(.+\))?: " | sed 's/^[a-f0-9]* /- /' >> changelog.md || true
+          echo "$COMMITS" | grep -E "^[a-f0-9]+ docs(\(.+\))?: " | sed 's/^[a-f0-9]* /- /' >> changelog.md || true
+          
+          echo "" >> changelog.md
+          echo "## Binaries" >> changelog.md
+          echo "" >> changelog.md
+          echo "- \`weka-cpuset-linux-amd64\` - Linux x86_64 binary" >> changelog.md
+          echo "- \`weka-cpuset-linux-arm64\` - Linux ARM64 binary" >> changelog.md
+          echo "- \`checksums.txt\` - SHA256 checksums for all binaries" >> changelog.md
+          
+          cat changelog.md
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "v${{ needs.analyze-commits.outputs.next-version }}"
+          name: "Release v${{ needs.analyze-commits.outputs.next-version }}"
+          body_path: changelog.md
+          files: |
+            .temp/weka-cpuset-linux-amd64
+            .temp/weka-cpuset-linux-arm64
+            .temp/checksums.txt
+          draft: false
+          prerelease: false
