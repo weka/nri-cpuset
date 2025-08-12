@@ -119,18 +119,25 @@ func runPlugin(cmd *cobra.Command, args []string) error {
 		updateCancel: updateCancel,
 	}
 
-	// Create NRI stub options
+	// Create NRI stub options with proper launch mode detection
 	var stubOptions []stub.Option
 
-	// Add plugin name and index
-	fullPluginName := pluginIdx + "-" + pluginName
-	stubOptions = append(stubOptions, stub.WithPluginName(fullPluginName))
-	stubOptions = append(stubOptions, stub.WithPluginIdx(pluginIdx))
+	// Decide if we run externally (DaemonSet) or runtime-launched.
+	// External if user provided a socket (flag or env). Otherwise assume runtime-launched.
+	external := pluginSocket != "" || os.Getenv("NRI_SOCKET") != ""
 
-	// Add socket path if specified
-	if pluginSocket != "" {
-		stubOptions = append(stubOptions, stub.WithSocketPath(pluginSocket))
+	if external {
+		// Connect to the runtime's NRI socket.
+		socket := firstNonEmpty(pluginSocket, os.Getenv("NRI_SOCKET"), "/var/run/nri/nri.sock")
+		stubOptions = append(stubOptions, stub.WithSocketPath(socket))
+
+		// Set plugin name and index for external mode
+		name := firstNonEmpty(os.Getenv("NRI_PLUGIN_NAME"), pluginName) // e.g. "weka-cpuset"
+		idx := firstNonEmpty(os.Getenv("NRI_PLUGIN_IDX"), pluginIdx)    // e.g. "99"
+		stubOptions = append(stubOptions, stub.WithPluginName(name))
+		stubOptions = append(stubOptions, stub.WithPluginIdx(idx))
 	}
+	// For runtime-launched mode, don't set any options - stub derives name from argv[0]
 
 	// Create NRI stub
 	stub, err := stub.New(p, stubOptions...)
@@ -448,4 +455,14 @@ func (p *plugin) handleSharedContainer(pod *api.PodSandbox, container *api.Conta
 	}
 
 	return adjustment, nil, nil
+}
+
+// firstNonEmpty returns the first non-empty string from the provided list
+func firstNonEmpty(v ...string) string {
+	for _, s := range v {
+		if s != "" {
+			return s
+		}
+	}
+	return ""
 }

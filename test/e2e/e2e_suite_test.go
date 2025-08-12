@@ -194,25 +194,25 @@ var _ = BeforeEach(func() {
 	// This ensures failed test nodes are isolated for debugging
 	var selectedNode string
 	startIndex := (workerID - 1) % len(availableNodes) // Ginkgo workers are 1-based
-	
+
 	for i := 0; i < len(availableNodes); i++ {
 		nodeIndex := (startIndex + i) % len(availableNodes)
 		candidateNode := availableNodes[nodeIndex]
-		
+
 		// Skip nodes that have had failed tests to preserve debugging state
 		if !failedTestNodes[candidateNode] {
 			selectedNode = candidateNode
 			break
 		}
 	}
-	
+
 	// If all nodes have failed tests, use the original deterministic assignment
 	// This handles the case where we run out of clean nodes
 	if selectedNode == "" {
 		selectedNode = availableNodes[startIndex]
 		fmt.Printf("WARNING: All nodes have failed tests, reusing node %s\n", selectedNode)
 	}
-	
+
 	currentTestNode = selectedNode
 
 	// Create unique namespace per node (simplified from worker-based approach)

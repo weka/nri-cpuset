@@ -30,13 +30,28 @@ vendor: ## Download and vendor dependencies
 	go mod vendor
 
 .PHONY: build
-build: vendor ## Build the binary
-	@mkdir -p $(BUILD_DIR)
-	CGO_ENABLED=$(CGO_ENABLED) go build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY_NAME) ./cmd/weka-cpuset
+build: vendor ## Build the binary for Linux
+	@mkdir -p .temp
+	CGO_ENABLED=$(CGO_ENABLED) GOOS=linux GOARCH=amd64 go build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o .temp/$(BINARY_NAME) ./cmd/weka-cpuset
+
+.PHONY: deploy-linux
+deploy-linux: build ## Deploy binary to remote Linux machine via scp (usage: make deploy-linux TARGET=username@servername)
+	@if [ -z "$(TARGET)" ]; then \
+		echo "Usage: make deploy-linux TARGET=username@servername"; \
+		exit 1; \
+	fi
+	@echo "Deploying $(BINARY_NAME) to $(TARGET):/usr/local/bin/"
+	scp .temp/$(BINARY_NAME) $(TARGET):/usr/local/bin/weka-cpuset
+	@echo "Deployment complete"
+
+# Allow any target to be passed as argument without Make complaining
+%:
+	@:
 
 .PHONY: clean
 clean: ## Clean build artifacts
 	rm -rf $(BUILD_DIR)
+	rm -rf .temp
 	rm -rf vendor/
 
 .PHONY: lint
