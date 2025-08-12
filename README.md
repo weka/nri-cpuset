@@ -16,6 +16,7 @@ The Weka NRI CPUSet Component enables fine-grained CPU and NUMA memory managemen
 ## Key Features
 
 - 🎯 **Precise CPU Pinning**: Pin containers to specific logical CPUs using annotations
+- 🚫 **Forbidden CPU Support**: Exclude specific CPUs from allocation using `weka.io/forbid-core-ids`
 - 🔄 **Live Reassignment**: Dynamically reallocate integer containers when conflicts arise
 - 🧠 **NUMA-Aware**: Intelligent NUMA memory placement based on CPU assignments
 - 🔧 **Sibling Core Optimization**: Prefer hyperthreaded siblings for better cache locality
@@ -116,21 +117,6 @@ kubelet-arg:
 
 **Important**: The static CPU manager must be disabled as it conflicts with NRI-based CPU management.
 
-### Plugin Configuration
-
-The plugin supports configuration via environment variables or ConfigMap:
-
-```yaml
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: weka-nri-config
-  namespace: kube-system
-data:
-  debug: "true"
-  numa-memory-policy: "strict"  # strict|preferred|none
-```
-
 ## Usage Examples
 
 ### Annotated Pods
@@ -197,6 +183,50 @@ spec:
         cpu: "100m"   # Fractional CPU - uses shared pool
         memory: "256Mi"
 ```
+
+### Forbidden CPUs
+
+Exclude specific CPUs from allocation for a pod using the `weka.io/forbid-core-ids` annotation:
+
+```yaml
+# Integer pod that avoids specific CPUs
+apiVersion: v1
+kind: Pod
+metadata:
+  name: exclusive-workload
+  annotations:
+    weka.io/forbid-core-ids: "0-3,8"  # Exclude cores 0, 1, 2, 3, and 8
+spec:
+  containers:
+  - name: compute
+    image: compute-app:latest
+    resources:
+      requests:
+        cpu: "4"      # Will get 4 exclusive CPUs, but not from forbidden set
+        memory: "8Gi"
+      limits:
+        cpu: "4"
+        memory: "8Gi"
+
+---
+# Shared pod with forbidden CPUs creates a custom shared pool
+apiVersion: v1
+kind: Pod
+metadata:
+  name: isolated-service
+  annotations:
+    weka.io/forbid-core-ids: "1,3,5"  # Exclude odd-numbered cores
+spec:
+  containers:
+  - name: service
+    image: web-service:latest
+    resources:
+      requests:
+        cpu: "500m"   # Uses shared pool minus forbidden CPUs
+        memory: "1Gi"
+```
+
+**Note**: Annotated pods (with `weka.io/cores-ids`) ignore forbidden CPU annotations and always get their exact requested CPUs.
 
 ### Real-World Example: Mixed Workload
 
