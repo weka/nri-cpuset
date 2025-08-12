@@ -5,6 +5,10 @@ A Kubernetes NRI (Node Resource Interface) plugin that provides intelligent CPU 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/wekafs/weka-nri-cpuset)](https://github.com/wekafs/weka-nri-cpuset/releases)
 
+
+## Note
+Project is in early stage of its life and needs more testing and feedback before being used in production environments.
+
 ## Overview
 
 The Weka NRI CPUSet Component enables fine-grained CPU and NUMA memory management for containerized workloads in Kubernetes. It supports three types of workloads:
