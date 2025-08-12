@@ -11,3 +11,4 @@ deploy/manifests/daemonset-temp.yaml
 test/e2e/test/
 .swp
 reports
+.env
