@@ -34,9 +34,9 @@ Description:
   variable. At least one of these must be set.
 
 Examples:
-  $0 --kubeconfig ~/kc/operator-demo
+  $0 --kubeconfig /path/to/kubeconfig.yaml
   $0 --kubeconfig ~/.kube/config --registry my-registry.com:5000
-  KUBECONFIG=~/kc/operator-demo $0 --dry-run --debug
+  KUBECONFIG=/path/to/kubeconfig.yaml $0 --dry-run --debug
 EOF
     exit 1
 }

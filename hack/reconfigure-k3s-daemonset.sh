@@ -25,10 +25,10 @@ Options:
   --help              Show this help
 
 Examples:
-  $0 --kubeconfig ~/kc/operator-demo
+  $0 --kubeconfig /path/to/kubeconfig.yaml
   $0 --kubeconfig ~/.kube/config --ssh-username ubuntu
-  $0 --kubeconfig ~/kc/operator-demo --single-node 0
-  $0 --kubeconfig ~/kc/operator-demo --single-node 2
+  $0 --kubeconfig /path/to/kubeconfig.yaml --single-node 0
+  $0 --kubeconfig /path/to/kubeconfig.yaml --single-node 2
 EOF
     exit 1
 }

@@ -78,6 +78,8 @@ func (m *Manager) discoverNodes() error {
 			nodeStr := strings.TrimPrefix(name, "node")
 			if nodeID, err := strconv.Atoi(nodeStr); err == nil {
 				nodes = append(nodes, nodeID)
+				// Initialize the nodeMap entry for each discovered node
+				m.nodeMap[nodeID] = []int{}
 			}
 		}
 	}
@@ -130,7 +132,7 @@ func (m *Manager) mapCPUsToNodes() error {
 }
 
 func (m *Manager) getCPUNode(cpu int) (int, error) {
-	// Look for the CPU in each NUMA node directory
+	// First try to find the CPU in already discovered nodes
 	for nodeID := range m.nodeMap {
 		cpuListFile := filepath.Join(sysDevicesSystemNode, fmt.Sprintf("node%d", nodeID), "cpulist")
 		data, err := os.ReadFile(cpuListFile)
@@ -147,6 +149,41 @@ func (m *Manager) getCPUNode(cpu int) (int, error) {
 		for _, nodeCPU := range cpus {
 			if nodeCPU == cpu {
 				return nodeID, nil
+			}
+		}
+	}
+
+	// If not found in discovered nodes, try to discover all nodes directly
+	entries, err := os.ReadDir(sysDevicesSystemNode)
+	if err != nil {
+		return 0, fmt.Errorf("CPU %d not found and cannot read NUMA nodes directory: %w", cpu, err)
+	}
+
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, "node") && entry.IsDir() {
+			nodeStr := strings.TrimPrefix(name, "node")
+			nodeID, err := strconv.Atoi(nodeStr)
+			if err != nil {
+				continue
+			}
+
+			cpuListFile := filepath.Join(sysDevicesSystemNode, fmt.Sprintf("node%d", nodeID), "cpulist")
+			data, err := os.ReadFile(cpuListFile)
+			if err != nil {
+				continue
+			}
+
+			cpuList := strings.TrimSpace(string(data))
+			cpus, err := ParseCPUList(cpuList)
+			if err != nil {
+				continue
+			}
+
+			for _, nodeCPU := range cpus {
+				if nodeCPU == cpu {
+					return nodeID, nil
+				}
 			}
 		}
 	}

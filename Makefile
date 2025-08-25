@@ -40,9 +40,20 @@ deploy-linux: build ## Deploy binary to remote Linux machine via scp (usage: mak
 		echo "Usage: make deploy-linux TARGET=username@servername"; \
 		exit 1; \
 	fi
-	@echo "Deploying $(BINARY_NAME) to $(TARGET):/usr/local/bin/"
-	scp .temp/$(BINARY_NAME) $(TARGET):/usr/local/bin/weka-cpuset
-	@echo "Deployment complete"
+	@echo "Deploying $(BINARY_NAME) to $(TARGET) with timestamp versioning..."
+	@TIMESTAMP=$$(date +%Y%m%d-%H%M%S); \
+	BINARY_NAME_VERSIONED="weka-cpuset-dev-$$TIMESTAMP"; \
+	echo "Creating directory structure on $(TARGET)..."; \
+	ssh $(TARGET) "mkdir -p /opt/weka-nri-cpuset"; \
+	echo "Uploading binary as $$BINARY_NAME_VERSIONED..."; \
+	scp .temp/$(BINARY_NAME) $(TARGET):/opt/weka-nri-cpuset/$$BINARY_NAME_VERSIONED; \
+	echo "Creating symlink..."; \
+	ssh $(TARGET) "rm -f /usr/local/bin/weka-cpuset && ln -sf /opt/weka-nri-cpuset/$$BINARY_NAME_VERSIONED /usr/local/bin/weka-cpuset"; \
+	echo "Restarting k3s..."; \
+	ssh $(TARGET) "systemctl restart k3s"; \
+	echo "Waiting for k3s to be ready..."; \
+	ssh $(TARGET) "timeout 60 bash -c 'while ! systemctl is-active --quiet k3s; do sleep 2; done'"; \
+	echo "Deployment complete: $$BINARY_NAME_VERSIONED"
 
 # Allow any target to be passed as argument without Make complaining
 %:

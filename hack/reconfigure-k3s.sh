@@ -25,10 +25,10 @@ Options:
   --help              Show this help
 
 Examples:
-  $0 --kubeconfig ~/kc/operator-demo
+  $0 --kubeconfig /path/to/kubeconfig.yaml
   $0 --kubeconfig ~/.kube/config --ssh-username ubuntu
-  $0 --kubeconfig ~/kc/operator-demo --single-node 0
-  $0 --kubeconfig ~/kc/operator-demo --single-node 2
+  $0 --kubeconfig /path/to/kubeconfig.yaml --single-node 0
+  $0 --kubeconfig /path/to/kubeconfig.yaml --single-node 2
 EOF
     exit 1
 }
@@ -139,9 +139,13 @@ deploy_binary_to_node() {
     
     log "Deploying binary and wrapper script to $username@$node_ip..."
     
-    scp -o StrictHostKeyChecking=no "$binary_path" "$username@$node_ip:/tmp/weka-cpuset"
+    # Generate timestamp for versioning
+    local timestamp=$(date +%Y%m%d-%H%M%S)
+    local binary_name="weka-cpuset-dev-${timestamp}"
     
-    ssh -o StrictHostKeyChecking=no "$username@$node_ip" << 'EOF'
+    scp -o StrictHostKeyChecking=no "$binary_path" "$username@$node_ip:/tmp/$binary_name"
+    
+    ssh -o StrictHostKeyChecking=no "$username@$node_ip" << EOF
         # Stop any running services to prevent conflicts during re-deploy
         sudo systemctl stop weka-nri.service || true
         sudo systemctl disable weka-nri.service || true
@@ -152,12 +156,17 @@ deploy_binary_to_node() {
         
         # Create directories
         sudo mkdir -p /opt/nri/plugins
+        sudo mkdir -p /opt/weka-nri-cpuset
         sudo mkdir -p /var/log
         
-        # Move binary to /usr/local/bin
-        sudo mv /tmp/weka-cpuset /usr/local/bin/weka-cpuset
-        sudo chmod +x /usr/local/bin/weka-cpuset
-        sudo chown root:root /usr/local/bin/weka-cpuset
+        # Move binary to versioned location
+        sudo mv /tmp/$binary_name /opt/weka-nri-cpuset/$binary_name
+        sudo chmod +x /opt/weka-nri-cpuset/$binary_name
+        sudo chown root:root /opt/weka-nri-cpuset/$binary_name
+        
+        # Create/update symlink
+        sudo rm -f /usr/local/bin/weka-cpuset
+        sudo ln -sf /opt/weka-nri-cpuset/$binary_name /usr/local/bin/weka-cpuset
         
         # Create wrapper script in /opt/nri/plugins
         sudo tee /opt/nri/plugins/99-weka-cpuset > /dev/null << 'WRAPPER_EOF'

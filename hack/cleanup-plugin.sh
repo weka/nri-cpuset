@@ -23,14 +23,14 @@ Options:
 
 Description:
   One-time cleanup script to remove the weka-cpuset plugin from all nodes
-  in the ~/kc/operator-demo k8s cluster. This will:
+  in the k8s cluster. This will:
   - Stop any running plugin processes
   - Remove plugin binaries and wrapper scripts
   - Clean up systemd services
   - Remove plugin directories
 
 Examples:
-  $0 --kubeconfig ~/kc/operator-demo
+  $0 --kubeconfig /path/to/kubeconfig.yaml
   $0 --kubeconfig ~/.kube/config --ssh-username ubuntu
 EOF
     exit 1
