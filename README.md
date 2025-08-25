@@ -411,23 +411,19 @@ The plugin registers with `index = 99` to execute after topology-aware plugins. 
 | Kubernetes | Containerd | Status |
 |------------|------------|--------|
 | 1.24+ | 1.6.0+ | ✅ Supported |
-| 1.20-1.23 | 1.5.0+ | ✅ Supported |
 
 ### Container Runtimes
 
 | Runtime | Version | NRI Support | Status |
 |---------|---------|-------------|--------|
 | containerd | 1.7.0+ | Native | ✅ Fully supported |
-| containerd | 1.6.0+ | Native | ✅ Fully supported |
-| CRI-O | 1.23+ | Native | ✅ Supported |
 
 ### Operating Systems
 
 | OS | Architecture | Status |
 |----|--------------|--------|
 | Linux | x86_64 | ✅ Fully supported |
-| Linux | ARM64 | ✅ Supported |
-| Linux | s390x | ✅ Supported |
+
 
 ## License
 
