@@ -1,6 +1,8 @@
 package container
 
 import (
+	"fmt"
+	"sort"
 	"github.com/containerd/nri/pkg/api"
 	"github.com/weka/nri-cpuset/pkg/numa"
 )
@@ -98,20 +100,49 @@ func GetForbiddenCPUs(pod *api.PodSandbox) []int {
 		return nil
 	}
 
+	var cpus []int
+
+	// Check for weka.io/forbid-core-ids annotation
 	forbidList, exists := pod.Annotations["weka.io/forbid-core-ids"]
-	if !exists || forbidList == "" {
-		return nil
+	if exists && forbidList != "" {
+		// Parse the CPU list - same format as cores-ids annotation
+		forbiddenCPUs, err := numa.ParseCPUList(forbidList)
+		if err != nil {
+			// If parsing fails, continue (ignore invalid annotation)
+			fmt.Printf("Warning: Failed to parse forbid-core-ids annotation '%s': %v\n", forbidList, err)
+		} else {
+			cpus = append(cpus, forbiddenCPUs...)
+		}
 	}
 
-	// Parse the CPU list - same format as cores-ids annotation
-	cpus, err := numa.ParseCPUList(forbidList)
-	if err != nil {
-		// If parsing fails, return empty list (ignore invalid annotation)
-		// This follows the same pattern as the cores-ids validation in the allocator
-		return nil
+	// Check for weka.io/cores-ids annotation (treat as forbidden for integer pods)
+	coresList, exists := pod.Annotations["weka.io/cores-ids"]
+	if exists && coresList != "" {
+		// Parse the CPU list
+		coresCPUs, err := numa.ParseCPUList(coresList)
+		if err != nil {
+			// If parsing fails, continue (ignore invalid annotation)
+			fmt.Printf("Warning: Failed to parse cores-ids annotation '%s': %v\n", coresList, err)
+		} else {
+			cpus = append(cpus, coresCPUs...)
+		}
 	}
 
-	return cpus
+	// Remove duplicates
+	uniqueCPUs := make(map[int]struct{})
+	for _, cpu := range cpus {
+		uniqueCPUs[cpu] = struct{}{}
+	}
+
+	var result []int
+	for cpu := range uniqueCPUs {
+		result = append(result, cpu)
+	}
+
+	// Sort the result for consistent ordering
+	sort.Ints(result)
+
+	return result
 }
 
 // Helper function for floating point comparison

@@ -1,0 +1,27 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: compute-integer
+  namespace: wekaplugin-e2e
+spec:
+  selector:
+    matchLabels:
+      app: compute-integer
+  template:
+    metadata:
+      labels:
+        app: compute-integer
+    spec:
+      containers:
+      - name: busybox
+        image: busybox:latest
+        command: ["sleep", "infinity"]
+        resources:
+          limits:
+            cpu: "23"
+            memory: 63900Mi
+          requests:
+            cpu: "23"
+            memory: 63900Mi
+      tolerations:
+      - operator: Exists

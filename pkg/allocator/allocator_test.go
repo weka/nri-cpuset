@@ -189,7 +189,8 @@ var _ = Describe("CPUAllocator", func() {
 			cpus, err := allocator.AllocateExclusiveCPUs(2, []int{})
 			Expect(err).ToNot(HaveOccurred())
 			Expect(cpus).To(HaveLen(2))
-			Expect(cpus).To(Equal([]int{0, 1}))
+			// CPU 0 avoidance: should prefer non-zero CPUs
+			Expect(cpus).To(Equal([]int{1, 2}))
 		})
 
 		It("should exclude reserved CPUs", func() {
@@ -647,7 +648,8 @@ var _ = Describe("Advanced Allocation Scenarios", func() {
 			reserved := []int{99, 100} // Outside online range
 			cpus, err := allocator.AllocateExclusiveCPUs(2, reserved)
 			Expect(err).ToNot(HaveOccurred())
-			Expect(cpus).To(Equal([]int{0, 1})) // Should ignore out-of-range reserved CPUs
+			// CPU 0 avoidance: should prefer non-zero CPUs even when ignoring out-of-range reserved CPUs
+			Expect(cpus).To(Equal([]int{1, 2})) // Should ignore out-of-range reserved CPUs and avoid CPU 0
 		})
 
 		It("should be deterministic in allocation order", func() {

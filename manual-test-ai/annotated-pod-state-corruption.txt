@@ -1,0 +1,412 @@
+# Annotated Pod State Corruption Manual Test
+
+Tests the bug where NRI plugin loses track of core accounting after annotated pods are removed and replaced with integer pods, causing subsequent pod creations to fail with "insufficient free CPUs" errors.
+
+## Issue Background
+The NRI plugin has a state management bug where annotated containers' allocated cores are not properly deallocated when the containers are removed. This causes resource leaks in the internal accounting system:
+
+1. Annotated pods get allocated specific CPU cores and are tracked in plugin state
+2. When annotated pods are removed, plugin logs removal but fails to deallocate cores from internal state 
+3. New integer pods are created and get different CPUs correctly
+4. Plugin still thinks old annotated pod cores are occupied PLUS new integer pod cores
+5. When new pods try to allocate cores, plugin reports insufficient free CPUs even when there are plenty available
+
+## Test Scenario
+1. **Bulk Deploy**: Create multiple annotated pods simultaneously consuming ~80% of node CPU cores
+2. **Bulk Remove**: Delete all annotated pods simultaneously to stress state management 
+3. **Bulk Replace**: Create multiple integer pods simultaneously to replace them
+4. Try to create additional client pods - they should fail with "insufficient free CPUs"
+5. Verify plugin state corruption and demonstrate fix
+
+## Prerequisites  
+- KUBECONFIG set to cluster with NRI-enabled containerd/k3s
+- Weka NRI CPUSet plugin deployed as native NRI plugin (not daemonset)
+- Node with 64 CPU cores (adjust core counts for different architectures)
+- SSH access to nodes for plugin log examination
+
+## Test Steps
+
+### 1. Environment Setup
+```bash
+kubectl create namespace annotated-state-test --dry-run=client -o yaml | kubectl apply -f -
+export TEST_NS=annotated-state-test
+export TARGET_NODE=worker-node-1  # Replace with actual node name
+echo "Testing annotated pod state corruption on node: $TARGET_NODE"
+```
+
+### 2. Bulk Create Multiple Annotated Pods (Consuming 52/64 cores)
+```bash
+# Create multiple annotated pods simultaneously to stress state management
+cat > /tmp/bulk-annotated-pods.yaml << 'EOF'
+# Multiple annotated pods to create simultaneously - total 52 cores
+apiVersion: v1
+kind: Pod
+metadata:
+  name: annotated-compute-1
+  namespace: ${TEST_NS}
+  annotations:
+    weka.io/cores-ids: "0-14"  # 15 cores
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: ${TARGET_NODE}
+  containers:
+  - name: weka-container
+    image: busybox:latest
+    command: ["sleep", "3600"]
+    resources:
+      requests: {cpu: "15", memory: "1Gi"}
+      limits: {cpu: "15", memory: "1Gi"}
+  restartPolicy: Never
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: annotated-compute-2
+  namespace: ${TEST_NS}
+  annotations:
+    weka.io/cores-ids: "15-29"  # 15 cores
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: ${TARGET_NODE}
+  containers:
+  - name: weka-container
+    image: busybox:latest
+    command: ["sleep", "3600"]
+    resources:
+      requests: {cpu: "15", memory: "1Gi"}
+      limits: {cpu: "15", memory: "1Gi"}
+  restartPolicy: Never
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: annotated-drive-1
+  namespace: ${TEST_NS}
+  annotations:
+    weka.io/cores-ids: "32-43"  # 12 cores
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: ${TARGET_NODE}
+  containers:
+  - name: weka-container
+    image: busybox:latest
+    command: ["sleep", "3600"]
+    resources:
+      requests: {cpu: "12", memory: "1Gi"}
+      limits: {cpu: "12", memory: "1Gi"}
+  restartPolicy: Never
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: annotated-client-1
+  namespace: ${TEST_NS}
+  annotations:
+    weka.io/cores-ids: "44-53"  # 10 cores
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: ${TARGET_NODE}
+  containers:
+  - name: weka-container
+    image: busybox:latest
+    command: ["sleep", "3600"]
+    resources:
+      requests: {cpu: "10", memory: "1Gi"}
+      limits: {cpu: "10", memory: "1Gi"}
+  restartPolicy: Never
+EOF
+
+# Deploy all annotated pods simultaneously
+kubectl apply -f /tmp/bulk-annotated-pods.yaml
+
+# Wait for all pods to start
+kubectl wait --for=condition=Ready pod/annotated-compute-1 pod/annotated-compute-2 pod/annotated-drive-1 pod/annotated-client-1 -n $TEST_NS --timeout=60s
+```
+
+**Expected**: All annotated pods start successfully and get their specific CPU allocations.
+
+### 3. Verify Initial State and Plugin Logs
+```bash
+echo "=== Bulk Annotated Pod CPU Assignments (52 cores total) ==="
+kubectl exec -n $TEST_NS annotated-compute-1 -- cat /proc/1/status | grep Cpus_allowed_list
+kubectl exec -n $TEST_NS annotated-compute-2 -- cat /proc/1/status | grep Cpus_allowed_list
+kubectl exec -n $TEST_NS annotated-drive-1 -- cat /proc/1/status | grep Cpus_allowed_list
+kubectl exec -n $TEST_NS annotated-client-1 -- cat /proc/1/status | grep Cpus_allowed_list
+
+# Check plugin logs for allocation tracking
+echo "=== Plugin Allocation Logs ==="
+ssh root@${TARGET_NODE} "tail -20 /var/log/weka-cpuset.log | grep -E 'annotated|allocated|HandleAnnotated'"
+```
+
+**Expected Output**: Plugin logs should show successful allocations like:
+- `DEBUG: HandleAnnotatedContainerWithIntegerConflictCheck returning CPUs: [0 1 2...44] for annotation: 0-12,33-44`
+- `DEBUG: createAnnotatedAdjustment received CPUs: [0 1 2...44], formatted as: 0,1,2...44`
+
+### 4. Bulk Remove Annotated Pods (Stress State Management)
+```bash  
+echo "=== Deleting All Annotated Pods Simultaneously ==="
+kubectl delete pod annotated-compute-1 annotated-compute-2 annotated-drive-1 annotated-client-1 -n $TEST_NS --grace-period=5
+
+# Wait for bulk removals to complete
+sleep 10
+
+# Check plugin removal logs
+echo "=== Plugin Removal Logs ==="
+ssh root@${TARGET_NODE} "tail -20 /var/log/weka-cpuset.log | grep -E 'Removing|annotated'"
+```
+
+**Expected**: Plugin logs should show container removals but may not properly deallocate cores from internal state.
+
+### 5. Bulk Create Integer Pods (Replacement Workload)
+```bash
+# Create multiple integer pods simultaneously to replace annotated pods
+cat > /tmp/bulk-integer-pods.yaml << 'EOF'
+# Multiple integer pods to replace annotated pods - total 45 cores
+apiVersion: v1
+kind: Pod
+metadata:
+  name: integer-compute-1
+  namespace: ${TEST_NS}
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: ${TARGET_NODE}
+  containers:
+  - name: weka-container
+    image: busybox:latest
+    command: ["sleep", "3600"]
+    resources:
+      requests: {cpu: "20", memory: "1Gi"}  # 20 cores - integer allocation
+      limits: {cpu: "20", memory: "1Gi"}
+  restartPolicy: Never
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: integer-compute-2
+  namespace: ${TEST_NS}
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: ${TARGET_NODE}
+  containers:
+  - name: weka-container
+    image: busybox:latest
+    command: ["sleep", "3600"]
+    resources:
+      requests: {cpu: "15", memory: "1Gi"}  # 15 cores - integer allocation
+      limits: {cpu: "15", memory: "1Gi"}
+  restartPolicy: Never
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: integer-drive-1
+  namespace: ${TEST_NS}
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: ${TARGET_NODE}
+  containers:
+  - name: weka-container
+    image: busybox:latest
+    command: ["sleep", "3600"]
+    resources:
+      requests: {cpu: "10", memory: "1Gi"}  # 10 cores - integer allocation
+      limits: {cpu: "10", memory: "1Gi"}
+  restartPolicy: Never
+EOF
+
+# Deploy all integer pods simultaneously
+kubectl apply -f /tmp/bulk-integer-pods.yaml
+
+# Wait for all pods to start
+kubectl wait --for=condition=Ready pod/integer-compute-1 pod/integer-compute-2 pod/integer-drive-1 -n $TEST_NS --timeout=60s
+```
+
+**Expected**: Integer pods start successfully and get automatically allocated CPUs (different from the annotated pods).
+
+### 6. Verify Integer Pod Allocations
+```bash
+echo "=== Integer Pod CPU Assignments (45 cores used) ==="
+kubectl exec -n $TEST_NS integer-compute-1 -- cat /proc/1/status | grep Cpus_allowed_list
+kubectl exec -n $TEST_NS integer-compute-2 -- cat /proc/1/status | grep Cpus_allowed_list
+kubectl exec -n $TEST_NS integer-drive-1 -- cat /proc/1/status | grep Cpus_allowed_list
+
+# Check plugin logs for integer allocations
+echo "=== Plugin Integer Allocation Logs ==="
+ssh root@${TARGET_NODE} "tail -15 /var/log/weka-cpuset.log | grep -E 'Recorded.*integer.*container'"
+```
+
+**Expected Output**: Plugin logs should show integer containers recorded with different CPUs:
+- `DEBUG: Recorded integer container <id> with CPUs [0 1 2 3 4 5 6 7 8 9 10 11 12 32 33 34 35 36 37 38 39 40 41 42 43]`
+- `DEBUG: Recorded integer container <id> with CPUs [25 26 27 28 29 30 31 57 58 59 60 61 62]`
+
+### 7. Attempt to Create Additional Trigger Pods (This Should Expose the Bug)
+```bash
+# Create additional pods to trigger insufficient CPU errors - total 25 cores (should fail if state corrupted)
+cat > /tmp/trigger-pods.yaml << 'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: trigger-client-1
+  namespace: ${TEST_NS}
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: ${TARGET_NODE}
+  containers:
+  - name: weka-container
+    image: busybox:latest
+    command: ["sleep", "3600"]
+    resources:
+      requests: {cpu: "12", memory: "1Gi"}  # Should fit in 19 remaining cores
+      limits: {cpu: "12", memory: "1Gi"}
+  restartPolicy: Never
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: trigger-client-2
+  namespace: ${TEST_NS}
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: ${TARGET_NODE}
+  containers:
+  - name: weka-container
+    image: busybox:latest
+    command: ["sleep", "3600"]
+    resources:
+      requests: {cpu: "13", memory: "1Gi"}  # This should cause insufficient CPUs if bug exists 
+      limits: {cpu: "13", memory: "1Gi"}
+  restartPolicy: Never
+EOF
+
+kubectl apply -f /tmp/trigger-pods.yaml
+
+# Check pod status - second pod should fail to create containers
+sleep 20
+kubectl get pods -n $TEST_NS -o wide
+kubectl describe pod trigger-client-2 -n $TEST_NS | grep -A 10 -B 5 "CreateContainerError\|insufficient\|Events\|FailedScheduling"
+```
+
+**Expected Failure**: If the bug exists, `trigger-client-2` should be stuck in `Pending` or `CreateContainerError` with events showing:
+- `Warning FailedScheduling: 0/N nodes are available: 1 Insufficient cpu` (scheduler-level)
+- OR `Error: failed to create containerd container: failed to get NRI adjustment for container`
+- OR `rpc error: code = Unknown desc = failed to allocate exclusive CPUs: insufficient free CPUs: need 13, have X`
+
+### 8. Analyze Plugin State Corruption
+```bash
+echo "=== Current Node CPU Resources ==="
+kubectl describe node $TARGET_NODE | grep -A 10 "Allocated resources"
+
+echo "=== Current Running Pods on Node ==="
+kubectl get pods --all-namespaces -o wide --field-selector spec.nodeName=$TARGET_NODE | grep Running
+
+echo "=== Total Current CPU Allocations ==="
+echo "integer-compute-1 (20 cores):"; kubectl exec -n $TEST_NS integer-compute-1 -- cat /proc/1/status | grep Cpus_allowed_list
+echo "integer-compute-2 (15 cores):"; kubectl exec -n $TEST_NS integer-compute-2 -- cat /proc/1/status | grep Cpus_allowed_list
+echo "integer-drive-1 (10 cores):"; kubectl exec -n $TEST_NS integer-drive-1 -- cat /proc/1/status | grep Cpus_allowed_list
+echo "trigger-client-1 (12 cores):"; kubectl exec -n $TEST_NS trigger-client-1 -- cat /proc/1/status | grep Cpus_allowed_list 2>/dev/null || echo "Pod not running"
+
+echo "=== Plugin Activity During Trigger Pod Creation ==="
+ssh root@${TARGET_NODE} "tail -30 /var/log/weka-cpuset.log | grep -E 'insufficient|trigger-client|DEBUG.*Recorded'"
+```
+
+**Expected Analysis**:
+- **If Bug Exists**: Node shows 64 total CPUs but plugin internal state is corrupted
+- Plugin thinks: 52 cores from old annotated pods + 57 cores from integer pods = 109/64 cores occupied
+- Plugin reports insufficient CPUs even when only ~57 cores are actually used
+- **If Working Correctly**: Plugin properly allocates cores and only fails when genuinely insufficient (57+ cores used)
+
+### 9. Demonstrate the Fix
+```bash
+echo "=== Applying State Reset Fix ==="
+# Get plugin process PID and restart to reset internal state
+PLUGIN_PID=$(ssh root@${TARGET_NODE} "ps aux | grep weka-cpuset | grep -v grep | grep -v bash | awk '{print \$2}'")
+echo "Plugin PID: $PLUGIN_PID"
+
+# Restart k3s to cleanly reinitialize NRI plugin state
+ssh root@${TARGET_NODE} "systemctl restart k3s"
+
+# Wait for k3s and plugin to restart
+sleep 15
+
+echo "=== Verify Plugin Restarted ==="
+ssh root@${TARGET_NODE} "ps aux | grep weka-cpuset | head -3"
+
+# Check if failing pod now starts
+kubectl get pod integer-client-test -n $TEST_NS
+kubectl wait --for=condition=Ready pod/integer-client-test -n $TEST_NS --timeout=60s 2>/dev/null || echo "Pod still failing - checking status..."
+kubectl get pod integer-client-test -n $TEST_NS
+```
+
+**Expected Fix Result**: After plugin restart, the integer-client-test pod should transition from `CreateContainerError` to `Running` as the plugin now has correct internal state.
+
+### 10. Verify Fix Success
+```bash
+echo "=== Verify All Pods Running After Fix ==="
+kubectl get pods -n $TEST_NS -o wide
+
+echo "=== Verify CPU Allocations ==="
+kubectl exec -n $TEST_NS integer-compute-1 -- cat /proc/1/status | grep Cpus_allowed_list
+kubectl exec -n $TEST_NS integer-compute-2 -- cat /proc/1/status | grep Cpus_allowed_list
+kubectl exec -n $TEST_NS integer-drive-1 -- cat /proc/1/status | grep Cpus_allowed_list
+kubectl exec -n $TEST_NS trigger-client-1 -- cat /proc/1/status | grep Cpus_allowed_list 2>/dev/null || echo "Pod not running"
+kubectl exec -n $TEST_NS trigger-client-2 -- cat /proc/1/status | grep Cpus_allowed_list 2>/dev/null || echo "Pod not running"
+
+echo "=== Plugin State After Reset ==="
+ssh root@${TARGET_NODE} "tail -15 /var/log/weka-cpuset.log | grep -E 'Synchronizing|Recorded'"
+```
+
+**Expected Final State**:
+- All pods should be Running after fix
+- Plugin logs should show proper synchronization: `Synchronizing integer container <id> with existing CPUs`
+- Total CPU allocations should be reasonable for successful pods
+
+## Failure Modes & Debugging
+
+### If Annotated Pods Fail to Start
+- Check node has sufficient CPU cores and correct annotations format
+- Verify NRI plugin is running: `ssh root@${TARGET_NODE} "ps aux | grep weka-cpuset"`
+- Check plugin logs for annotation parsing errors
+
+### If Integer Pods Fail to Start  
+- Verify there are sufficient free cores after annotated pod removal
+- Check for competing workloads on the node
+
+### If Bug Doesn't Reproduce
+- Verify plugin is running as native NRI plugin (not daemonset)
+- Try with different core allocation patterns  
+- Check plugin version supports both annotated and integer containers
+
+## Cleanup
+```bash
+kubectl delete namespace $TEST_NS
+rm -f /tmp/bulk-*.yaml /tmp/trigger-*.yaml
+```
+
+## Key Debugging Commands
+
+### Plugin State Inspection
+```bash
+ssh root@${TARGET_NODE} "tail -50 /var/log/weka-cpuset.log | grep -E 'DEBUG|allocated|Recorded'"
+```
+
+### Container Creation Error Analysis  
+```bash
+kubectl describe pod trigger-client-2 -n $TEST_NS | grep -A 20 "Events"
+```
+
+### Node Resource Analysis
+```bash  
+kubectl top node $TARGET_NODE
+kubectl describe node $TARGET_NODE | grep -A 15 "Allocated resources"
+```
+
+This test demonstrates the core accounting state corruption bug using **bulk operations** to stress the plugin's state management. The bulk approach creates multiple pods simultaneously and deletes them all at once, increasing the likelihood of reproducing race conditions or state management issues in the plugin's internal accounting system.
+
+## Key Improvements in Bulk Operations Approach
+
+1. **Increased State Management Stress**: Creating/deleting multiple pods simultaneously puts more pressure on plugin state tracking
+2. **Higher Resource Utilization**: Uses 52 cores initially (81% utilization) vs 45 cores (70% utilization) 
+3. **More Realistic Workload**: Simulates real-world scenarios where multiple pods are deployed/removed rapidly
+4. **Better Bug Detection**: More likely to expose timing-related state corruption issues
+
+The test verifies that restarting the NRI plugin service properly resets the internal state to resolve any detected issues.

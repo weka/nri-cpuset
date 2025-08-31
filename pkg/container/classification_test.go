@@ -154,14 +154,14 @@ var _ = Describe("Container Classification", func() {
 			Expect(forbidden).To(BeEmpty())
 		})
 
-		It("should return empty slice when forbid-core-ids annotation is missing", func() {
+		It("should return CPUs when cores-ids annotation is present (treated as forbidden for integer pods)", func() {
 			pod := &api.PodSandbox{
 				Annotations: map[string]string{
 					"weka.io/cores-ids": "0,1",
 				},
 			}
 			forbidden := container.GetForbiddenCPUs(pod)
-			Expect(forbidden).To(BeEmpty())
+			Expect(forbidden).To(ConsistOf(0, 1))
 		})
 
 		It("should return empty slice when forbid-core-ids annotation is empty", func() {

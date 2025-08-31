@@ -21,11 +21,6 @@ This indicates the container resiliency fix (commit e0d41318ba68ec4b12164aa08f2a
 
 ## Reproduction Steps
 
-### 1. Prerequisites
-```bash
-export KUBECONFIG=~/kc/operator-demo
-```
-
 ### 2. Identify Current State
 ```bash
 # Check for crashing plugin pods

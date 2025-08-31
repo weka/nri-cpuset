@@ -7,6 +7,7 @@ import (
 	"os/signal"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/containerd/nri/pkg/api"
@@ -45,6 +46,11 @@ type plugin struct {
 	updateQueue  chan updateRequest
 	updateCtx    context.Context
 	updateCancel context.CancelFunc
+
+	// Container cache for stateless querying
+	cachedContainersMu sync.RWMutex
+	cachedContainers   []*api.Container
+	cachedPods         []*api.PodSandbox
 }
 
 // updateRequest represents a background container update request
@@ -152,6 +158,19 @@ func runPlugin(cmd *cobra.Command, args []string) error {
 		p.queueBackgroundUpdate(updates, "debounced shared pool update")
 	})
 
+	// Set up container query callback to enable true stateless operation
+	stateManager.SetContainerQueryCallback(func() ([]*api.Container, error) {
+		// Query containers from the cached state maintained during Synchronize
+		return p.getCachedContainers()
+	})
+
+	// Set up pod-container query callback for proper classification
+	stateManager.SetPodContainerQueryCallback(func() ([]*api.PodSandbox, []*api.Container, error) {
+		// Query both pods and containers from cached state
+		return p.getCachedPodsAndContainers()
+	})
+
+
 	// Start background update processor AFTER stub is initialized
 	go p.processBackgroundUpdates()
 
@@ -170,6 +189,8 @@ func runPlugin(cmd *cobra.Command, args []string) error {
 }
 
 // processBackgroundUpdates handles unsolicited container updates in a serialized manner
+// NOTE: These updates are intentionally asynchronous and run outside the allocation lock
+// They only call stub.UpdateContainers() which doesn't modify our internal state
 func (p *plugin) processBackgroundUpdates() {
 	for {
 		select {
@@ -252,12 +273,86 @@ func (p *plugin) Configure(ctx context.Context, config, runtime, version string)
 func (p *plugin) Synchronize(ctx context.Context, pods []*api.PodSandbox, containers []*api.Container) ([]*api.ContainerUpdate, error) {
 	fmt.Printf("Synchronizing state with %d pods and %d containers\n", len(pods), len(containers))
 
+	// CRITICAL FIX: Acquire global allocation lock to prevent races with ongoing allocations
+	// Synchronize() rebuilds the entire state, so it must be serialized with all other operations
+	p.state.GetAllocationLock().Lock()
+	defer p.state.GetAllocationLock().Unlock()
+
+	fmt.Printf("DEBUG: Synchronize() acquired global allocation lock\n")
+
+	// Cache the current state for stateless querying under the global lock
+	p.cachedContainersMu.Lock()
+	p.cachedContainers = containers
+	p.cachedPods = pods
+	p.cachedContainersMu.Unlock()
+
 	updates, err := p.state.Synchronize(pods, containers, p.allocator)
 	if err != nil {
 		return nil, fmt.Errorf("synchronization failed: %w", err)
 	}
 
+	fmt.Printf("DEBUG: Synchronize() completed successfully, releasing global allocation lock\n")
 	return updates, nil
+}
+
+// getCachedContainers returns the cached container state for stateless querying
+func (p *plugin) getCachedContainers() ([]*api.Container, error) {
+	p.cachedContainersMu.RLock()
+	defer p.cachedContainersMu.RUnlock()
+	
+	if p.cachedContainers == nil {
+		return nil, fmt.Errorf("no cached containers available")
+	}
+	
+	// Return a copy to avoid race conditions
+	result := make([]*api.Container, len(p.cachedContainers))
+	copy(result, p.cachedContainers)
+	return result, nil
+}
+
+// getCachedPodsAndContainers returns the cached pod and container state for stateless querying
+func (p *plugin) getCachedPodsAndContainers() ([]*api.PodSandbox, []*api.Container, error) {
+	p.cachedContainersMu.RLock()
+	defer p.cachedContainersMu.RUnlock()
+	
+	if p.cachedContainers == nil || p.cachedPods == nil {
+		return nil, nil, fmt.Errorf("no cached pods/containers available")
+	}
+	
+	// Return copies to avoid race conditions
+	pods := make([]*api.PodSandbox, len(p.cachedPods))
+	copy(pods, p.cachedPods)
+	
+	containers := make([]*api.Container, len(p.cachedContainers))
+	copy(containers, p.cachedContainers)
+	
+	return pods, containers, nil
+}
+
+// updateCachedContainers updates the cached container list when containers are added/removed
+func (p *plugin) updateCachedContainers(container *api.Container, isAdd bool) {
+	p.cachedContainersMu.Lock()
+	defer p.cachedContainersMu.Unlock()
+	
+	if p.cachedContainers == nil {
+		if isAdd {
+			p.cachedContainers = []*api.Container{container}
+		}
+		return
+	}
+	
+	if isAdd {
+		// Add container to cache
+		p.cachedContainers = append(p.cachedContainers, container)
+	} else {
+		// Remove container from cache
+		for i, cached := range p.cachedContainers {
+			if cached.Id == container.Id {
+				p.cachedContainers = append(p.cachedContainers[:i], p.cachedContainers[i+1:]...)
+				break
+			}
+		}
+	}
 }
 
 func (p *plugin) RunPodSandbox(ctx context.Context, pod *api.PodSandbox) error {
@@ -267,6 +362,11 @@ func (p *plugin) RunPodSandbox(ctx context.Context, pod *api.PodSandbox) error {
 
 func (p *plugin) CreateContainer(ctx context.Context, pod *api.PodSandbox, container *api.Container) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
 	modeStr := containerPkg.DetermineContainerMode(pod, container)
+
+	fmt.Printf("DEBUG: CreateContainer called for %s container %s/%s (container %s)\n", 
+		modeStr, pod.Namespace, pod.Name, safeShortID(container.Id))
+
+	// Note: We update cached containers after successful allocation, not here
 
 	switch modeStr {
 	case "annotated":
@@ -281,34 +381,18 @@ func (p *plugin) CreateContainer(ctx context.Context, pod *api.PodSandbox, conta
 }
 
 func (p *plugin) UpdateContainer(ctx context.Context, pod *api.PodSandbox, container *api.Container, r *api.LinuxResources) ([]*api.ContainerUpdate, error) {
-	fmt.Printf("Updating container %s in pod %s/%s\n", container.Name, pod.Namespace, pod.Name)
+	fmt.Printf("DEBUG: UpdateContainer called for container %s in pod %s/%s\n", 
+		safeShortID(container.Id), pod.Namespace, pod.Name)
 
-	// CRITICAL FIX: When NRI calls UpdateContainer, we need to return the proper CPU assignment
-	// for containers we're managing. Returning nil,nil might cause NRI to apply default/shared CPUs.
-
-	// Get the container's current CPU assignment from our state
-	containerInfo := p.state.GetContainerInfo(container.Id)
-	if containerInfo == nil {
+	// NEW STATELESS ARCHITECTURE: Use stateless update handling with global lock
+	update := p.state.StatelessUpdateContainer(container.Id)
+	if update == nil {
 		// Container not managed by us, let NRI handle it
+		fmt.Printf("DEBUG: Container %s not managed, letting NRI handle\n", safeShortID(container.Id))
 		return nil, nil
 	}
 
-	fmt.Printf("DEBUG: UpdateContainer called for managed container %s (mode: %s, CPUs: %v)\n",
-		safeShortID(container.Id), containerInfo.Mode, containerInfo.CPUs)
-
-	// Return the current CPU assignment to prevent NRI from overriding it
-	update := &api.ContainerUpdate{
-		ContainerId: container.Id,
-		Linux: &api.LinuxContainerUpdate{
-			Resources: &api.LinuxResources{
-				Cpu: &api.LinuxCPU{
-					Cpus: formatCPUListForUpdate(containerInfo.CPUs, containerInfo.Mode),
-				},
-			},
-		},
-	}
-
-	fmt.Printf("DEBUG: Returning CPU assignment %s for container %s in UpdateContainer\n",
+	fmt.Printf("DEBUG: Returning CPU assignment %s for managed container %s\n",
 		update.Linux.Resources.Cpu.Cpus, safeShortID(container.Id))
 
 	return []*api.ContainerUpdate{update}, nil
@@ -345,6 +429,16 @@ func safeShortID(id string) string {
 func (p *plugin) RemoveContainer(ctx context.Context, pod *api.PodSandbox, container *api.Container) error {
 	fmt.Printf("Removing container %s from pod %s/%s\n", container.Name, pod.Namespace, pod.Name)
 
+	// CRITICAL FIX: Acquire global allocation lock to prevent races
+	// RemoveContainer() modifies state and cache, so it must be serialized
+	p.state.GetAllocationLock().Lock()
+	defer p.state.GetAllocationLock().Unlock()
+
+	fmt.Printf("DEBUG: RemoveContainer() acquired global allocation lock for container %s\n", safeShortID(container.Id))
+
+	// Update cached containers to remove the container for stateless querying
+	p.updateCachedContainers(container, false)
+
 	// Release resources and trigger shared pool update via background processing
 	updates, err := p.state.RemoveContainer(container.Id, p.allocator)
 	if err != nil {
@@ -356,12 +450,67 @@ func (p *plugin) RemoveContainer(ctx context.Context, pod *api.PodSandbox, conta
 		p.queueBackgroundUpdate(updates, "container removal")
 	}
 
+	fmt.Printf("DEBUG: RemoveContainer() completed successfully, releasing global allocation lock\n")
 	return nil
 }
 
 // Helper methods for container mode determination and handling
 
+// handleAnnotatedContainer uses the memory-based architecture with proper synchronization
 func (p *plugin) handleAnnotatedContainer(pod *api.PodSandbox, container *api.Container) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
+	fmt.Printf("DEBUG: Handling annotated container %s with synchronized architecture\n", safeShortID(container.Id))
+
+	// Use memory-based allocation method with proper synchronization and global locking
+	adjustment, updates, err := p.state.AllocateAnnotated(pod, container, p.allocator)
+	if err != nil {
+		fmt.Printf("DEBUG: Stateless annotated allocation failed for container %s: %v\n", safeShortID(container.Id), err)
+		return nil, nil, err
+	}
+
+	// CRITICAL FIX: Update the cached containers immediately after successful allocation
+	// This ensures that subsequent allocations can see this container's CPU assignment
+	if adjustment != nil {
+		// Update container with the allocated CPU assignment for stateless querying
+		updatedContainer := *container // Copy the container
+		if updatedContainer.Linux == nil {
+			updatedContainer.Linux = &api.LinuxContainer{}
+		}
+		if updatedContainer.Linux.Resources == nil {
+			updatedContainer.Linux.Resources = &api.LinuxResources{}
+		}
+		if updatedContainer.Linux.Resources.Cpu == nil {
+			updatedContainer.Linux.Resources.Cpu = &api.LinuxCPU{}
+		}
+		
+		// Set the allocated CPU assignment from the adjustment
+		if adjustment.Linux != nil && adjustment.Linux.Resources != nil && 
+			adjustment.Linux.Resources.Cpu != nil {
+			updatedContainer.Linux.Resources.Cpu.Cpus = adjustment.Linux.Resources.Cpu.Cpus
+		}
+		
+		// Update the cache with the allocated CPU assignment
+		p.updateCachedContainers(&updatedContainer, true)
+		fmt.Printf("DEBUG: Updated cached containers after successful allocation for %s with CPUs: %s\n", 
+			safeShortID(container.Id), updatedContainer.Linux.Resources.Cpu.Cpus)
+	}
+
+	// If we have reallocation updates, queue them for background processing
+	if len(updates) > 0 {
+		fmt.Printf("DEBUG: Queuing %d reallocation updates for annotated container %s\n", 
+			len(updates), safeShortID(container.Id))
+		
+		p.queueBackgroundUpdate(updates, "annotated container reallocation")
+	}
+
+	fmt.Printf("DEBUG: Successfully handled annotated container %s\n", safeShortID(container.Id))
+	return adjustment, nil, nil
+}
+
+// Remove old deprecated method
+
+// handleAnnotatedContainerWithReallocation handles annotated containers with potential live reallocation
+// This is now the fallback method when atomic allocation fails due to conflicts
+func (p *plugin) handleAnnotatedContainerWithReallocation(pod *api.PodSandbox, container *api.Container) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
 	// For annotated containers, try allocation with potential live reallocation
 	adjustment, updates, err := p.state.AllocateAnnotatedWithReallocation(pod, p.allocator)
 	if err != nil {
@@ -386,49 +535,69 @@ func (p *plugin) handleAnnotatedContainer(pod *api.PodSandbox, container *api.Co
 	}
 
 	// Record the successful allocation with proper reference counting for annotated containers
-	if adjustment != nil {
-		err := p.state.RecordAnnotatedContainer(container, pod, adjustment)
-		if err != nil {
-			return nil, nil, fmt.Errorf("failed to record annotated container: %w", err)
-		}
-	}
+	// Note: In the reallocation case, the allocation has already been recorded in AllocateAnnotatedWithReallocation
+	// so we don't need to record it again here
 
 	// Return adjustment only, since updates have been applied already
 	return adjustment, nil, nil
 }
 
+// handleIntegerContainer uses the memory-based architecture with proper synchronization
 func (p *plugin) handleIntegerContainer(pod *api.PodSandbox, container *api.Container) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
-	// For integer containers, get all reserved CPUs (both annotated and integer)
-	reserved := p.state.GetReservedCPUs()
+	fmt.Printf("DEBUG: Handling integer container %s with synchronized architecture\n", safeShortID(container.Id))
 
-	// Get forbidden CPUs from annotation
+	// Get forbidden CPUs from annotation (should never use these)
 	forbidden := containerPkg.GetForbiddenCPUs(pod)
+	
+	fmt.Printf("DEBUG: Integer container %s - forbidden CPUs from annotation: %v\n", 
+		safeShortID(container.Id), forbidden)
 
-	// Use the new allocator method that respects forbidden CPUs for integer containers
-	cpus, _, err := p.allocator.AllocateContainerCPUsWithForbidden(pod, container, reserved, forbidden)
+	// Use memory-based allocation method with proper synchronization and global locking
+	adjustment, err := p.state.AllocateInteger(pod, container, p.allocator, forbidden)
 	if err != nil {
+		fmt.Printf("DEBUG: Stateless integer allocation failed for container %s: %v\n", safeShortID(container.Id), err)
 		return nil, nil, err
 	}
 
-	// Create the adjustment manually since we need to handle forbidden CPUs
-	adjustment := &api.ContainerAdjustment{
-		Linux: &api.LinuxContainerAdjustment{
-			Resources: &api.LinuxResources{
-				Cpu: &api.LinuxCPU{
-					Cpus: numa.FormatCPUList(cpus),
-				},
-			},
-		},
+	// Extract CPUs for logging
+	var cpus []int
+	if adjustment.Linux != nil && adjustment.Linux.Resources != nil && 
+		adjustment.Linux.Resources.Cpu != nil && adjustment.Linux.Resources.Cpu.Cpus != "" {
+		cpus, _ = numa.ParseCPUList(adjustment.Linux.Resources.Cpu.Cpus)
 	}
 
-	// Record the successful allocation in state manager
-	err = p.state.RecordIntegerContainer(container, pod, adjustment)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to record integer container: %w", err)
+	// CRITICAL FIX: Update the cached containers immediately after successful allocation
+	// This ensures that subsequent allocations can see this container's CPU assignment
+	if adjustment != nil {
+		// Update container with the allocated CPU assignment for stateless querying
+		updatedContainer := *container // Copy the container
+		if updatedContainer.Linux == nil {
+			updatedContainer.Linux = &api.LinuxContainer{}
+		}
+		if updatedContainer.Linux.Resources == nil {
+			updatedContainer.Linux.Resources = &api.LinuxResources{}
+		}
+		if updatedContainer.Linux.Resources.Cpu == nil {
+			updatedContainer.Linux.Resources.Cpu = &api.LinuxCPU{}
+		}
+		
+		// Set the allocated CPU assignment from the adjustment
+		if adjustment.Linux != nil && adjustment.Linux.Resources != nil && 
+			adjustment.Linux.Resources.Cpu != nil {
+			updatedContainer.Linux.Resources.Cpu.Cpus = adjustment.Linux.Resources.Cpu.Cpus
+		}
+		
+		// Update the cache with the allocated CPU assignment  
+		p.updateCachedContainers(&updatedContainer, true)
+		fmt.Printf("DEBUG: Updated cached containers after successful allocation for %s with CPUs: %s\n", 
+			safeShortID(container.Id), updatedContainer.Linux.Resources.Cpu.Cpus)
 	}
 
+	fmt.Printf("DEBUG: Successfully allocated integer container %s with CPUs: %v\n", safeShortID(container.Id), cpus)
 	return adjustment, nil, nil
 }
+
+// Remove old deprecated method
 
 func (p *plugin) handleSharedContainer(pod *api.PodSandbox, container *api.Container) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
 	// For shared containers, get all reserved CPUs (both annotated and integer)

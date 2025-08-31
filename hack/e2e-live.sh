@@ -279,8 +279,12 @@ run_tests() {
     # Show test summary if reports were generated
     if [[ -f test-results-parallel.json ]] || [[ -f test-results-sequential.json ]] || [[ -f test-results.json ]]; then
         log_info "Test results summary available in test-results-*.json files"
-        [[ -f test-results-parallel.json ]] && log_info "Parallel test results: test-results-parallel.json"
-        [[ -f test-results.json ]] && log_info "Combined test results: test-results.json"
+        if [[ -f test-results-parallel.json ]]; then
+            log_info "Parallel test results: test-results-parallel.json"
+        fi
+        if [[ -f test-results.json ]]; then
+            log_info "Combined test results: test-results.json"
+        fi
     fi
     
     return $test_result
@@ -304,9 +308,15 @@ cleanup() {
     fi
     
     # Show available reports
-    [[ -f test-results-parallel.json ]] && log_info "Parallel JSON report: test-results-parallel.json"
-    [[ -f test-results.json ]] && log_info "Combined JSON report: test-results.json"
-    [[ -f test-results.xml ]] && log_info "Combined JUnit report: test-results.xml"
+    if [[ -f test-results-parallel.json ]]; then
+        log_info "Parallel JSON report: test-results-parallel.json"
+    fi
+    if [[ -f test-results.json ]]; then
+        log_info "Combined JSON report: test-results.json"
+    fi
+    if [[ -f test-results.xml ]]; then
+        log_info "Combined JUnit report: test-results.xml"
+    fi
 }
 
 # Reset test environment to clean state

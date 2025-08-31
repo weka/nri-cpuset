@@ -76,6 +76,25 @@ func (t *TestAllocator) CanReallocateInteger(currentCPUs []int, conflictCPUs []i
 	return newCPUs, true
 }
 
+func (t *TestAllocator) AllocateContainerCPUsWithForbidden(pod *api.PodSandbox, container *api.Container, reserved []int, forbidden []int) ([]int, string, error) {
+	// Combine reserved and forbidden CPUs
+	combinedReserved := append(reserved, forbidden...)
+	
+	// Remove duplicates
+	combinedSet := make(map[int]struct{})
+	for _, cpu := range combinedReserved {
+		combinedSet[cpu] = struct{}{}
+	}
+	
+	var uniqueReserved []int
+	for cpu := range combinedSet {
+		uniqueReserved = append(uniqueReserved, cpu)
+	}
+	
+	// Delegate to the existing AllocateContainerCPUs method
+	return t.AllocateContainerCPUs(pod, container, uniqueReserved)
+}
+
 func (t *TestAllocator) AllocateContainerCPUs(pod *api.PodSandbox, container *api.Container, reserved []int) ([]int, string, error) {
 	// Determine container mode
 	mode := "shared" // default

@@ -52,7 +52,11 @@ make clean
    ```
 
 #### Build & Deploy
-Prefer using this scripts instead of `make image` and patching
+
+**Two Deployment Methods Available:**
+
+##### Method 1: DaemonSet Deployment (containerized)
+For clusters using Kubernetes DaemonSet-based plugin deployment:
 ```bash
 # Automated build and deploy to live cluster (uses existing Dockerfile via Makefile)
 ./hack/build-and-deploy.sh --kubeconfig /path/to/kubeconfig
@@ -62,9 +66,30 @@ Prefer using this scripts instead of `make image` and patching
 
 # Dry run (see what would happen)
 ./hack/build-and-deploy.sh --kubeconfig /path/to/kubeconfig --dry-run --debug
+```
 
+##### Method 2: Direct Plugin Deployment (on-host binary)
+For clusters using direct on-host NRI plugin deployment (like numa-1.yaml cluster):
+```bash
+# Deploy plugin binary directly to cluster nodes
+./hack/deploy-plugin.sh --kubeconfig /path/to/kubeconfig
 
-# Alternative: Use Makefile directly for just building/pushing
+# Deploy to specific nodes only
+./hack/deploy-plugin.sh --kubeconfig /path/to/kubeconfig --nodes node1,node2,node3
+
+# With custom build options
+./hack/deploy-plugin.sh --kubeconfig /path/to/kubeconfig --rebuild
+```
+
+**Key Differences:**
+- `build-and-deploy.sh`: Creates containerized plugin, deploys as Kubernetes DaemonSet
+- `deploy-plugin`: Builds binary, copies directly to nodes as `/usr/local/bin/weka-cpuset` and `/opt/nri/plugins/99-weka-cpuset`
+- Use `deploy-plugin` for development/testing clusters where plugins run as host processes
+- Use `build-and-deploy.sh` for production clusters with containerized plugin architecture
+
+##### Alternative: Manual Build/Push
+```bash
+# Use Makefile directly for just building/pushing (DaemonSet method)
 make image-push REGISTRY=my-registry.com:5000 IMAGE_NAME=weka-nri-cpuset
 ```
 

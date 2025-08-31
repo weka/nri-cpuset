@@ -1,0 +1,29 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: drive-annotated
+  namespace: wekaplugin-e2e
+spec:
+  selector:
+    matchLabels:
+      app: drive-annotated
+  template:
+    metadata:
+      annotations:
+        weka.io/cores-ids: "16-21,48-54"
+      labels:
+        app: drive-annotated
+    spec:
+      containers:
+      - name: busybox
+        image: busybox:latest
+        command: ["sleep", "infinity"]
+        resources:
+          limits:
+            cpu: "13"
+            memory: 30200Mi
+          requests:
+            cpu: "13"
+            memory: 30200Mi
+      tolerations:
+      - operator: Exists

@@ -60,8 +60,15 @@ func (a *CPUAllocator) AllocateExclusiveCPUsWithSiblings(count int, reserved []i
 		}
 	}
 
+	// ENHANCED DEBUG LOG FOR CPU ALLOCATION
+	fmt.Printf("DEBUG: AllocateExclusiveCPUs need=%d, reserved=%v (%d CPUs), available=%v (%d CPUs), online=%v (%d CPUs)\n", 
+		count, reserved, len(reserved), available, len(available), a.onlineCPUs, len(a.onlineCPUs))
+
 	if len(available) < count {
-		return nil, fmt.Errorf("insufficient free CPUs: need %d, have %d", count, len(available))
+		// ENHANCED ERROR WITH DEBUG INFO
+		fmt.Printf("ERROR: CPU allocation failed - need %d CPUs, have %d available. Reserved CPUs: %v. Online CPUs: %v\n", 
+			count, len(available), reserved, a.onlineCPUs)
+		return nil, fmt.Errorf("insufficient free CPUs: need %d, have %d (reserved: %v)", count, len(available), reserved)
 	}
 
 	// Try sibling-aware allocation first
@@ -75,18 +82,18 @@ func (a *CPUAllocator) AllocateExclusiveCPUsWithSiblings(count int, reserved []i
 	return available[:count], nil
 }
 
-// allocateWithSiblingPreference implements the sibling allocation strategy
+// allocateWithSiblingPreference implements the improved sibling allocation strategy
 func (a *CPUAllocator) allocateWithSiblingPreference(available []int, count int, reservedSet map[int]struct{}) []int {
-	if !a.numa.IsHyperthreadingEnabled() {
-		// No hyperthreading, just return first available CPUs
-		sort.Ints(available)
-		if len(available) >= count {
-			return available[:count]
-		}
-		return nil
+	htEnabled := a.numa.IsHyperthreadingEnabled()
+	fmt.Printf("DEBUG: allocateWithSiblingPreference count=%d, hyperthreading=%t\n", count, htEnabled)
+	
+	if !htEnabled {
+		// No hyperthreading, avoid CPU 0 if possible and return first available CPUs
+		return a.selectAvoidingCPUZero(available, count)
 	}
 
 	coreGroups := a.numa.GetPhysicalCoreGroups()
+	fmt.Printf("DEBUG: Found %d core groups: %v\n", len(coreGroups), coreGroups)
 	var allocated []int
 	remaining := count
 
@@ -96,50 +103,74 @@ func (a *CPUAllocator) allocateWithSiblingPreference(available []int, count int,
 		availableSet[cpu] = struct{}{}
 	}
 
-	// Strategy: Complete partial cores first, then allocate full cores, then partial cores
+	// IMPROVED STRATEGY: 
+	// 1. Complete partial cores that are already reserved (efficient use of existing fragmentation)
+	// 2. Allocate full cores (maximizing full core availability for future containers)
+	// 3. Avoid CPU 0 unless absolutely necessary
+	// 4. Use partial cores only as last resort
 
 	// Phase 1: Complete partially allocated cores (if any exist in reserved set)
-	coreUtilization := a.numa.GetCoreUtilization(getKeysFromSet(reservedSet))
-	for groupIdx, group := range coreGroups {
-		if remaining <= 0 {
-			break
-		}
+	// This is efficient - if we already have fragmention, complete those cores first
+	if len(reservedSet) > 0 {
+		coreUtilization := a.numa.GetCoreUtilization(getKeysFromSet(reservedSet))
+		for groupIdx, group := range coreGroups {
+			if remaining <= 0 {
+				break
+			}
 
-		reservedInCore := coreUtilization[groupIdx]
-		if reservedInCore > 0 && reservedInCore < len(group) {
-			// This core is partially used, try to complete it
-			for _, cpu := range group {
-				if remaining <= 0 {
-					break
-				}
-				if _, isAvailable := availableSet[cpu]; isAvailable {
-					allocated = append(allocated, cpu)
-					delete(availableSet, cpu)
-					remaining--
+			reservedInCore := coreUtilization[groupIdx]
+			if reservedInCore > 0 && reservedInCore < len(group) {
+				// This core is partially used, complete it to avoid further fragmentation
+				for _, cpu := range group {
+					if remaining <= 0 {
+						break
+					}
+					if _, isAvailable := availableSet[cpu]; isAvailable {
+						allocated = append(allocated, cpu)
+						delete(availableSet, cpu)
+						remaining--
+					}
 				}
 			}
 		}
 	}
 
-	// Phase 2: Allocate full cores for remaining pairs
-	for remaining >= 2 && len(coreGroups) > 0 {
+	// Phase 2: Allocate full cores for remaining CPUs (prioritize full cores)
+	for remaining >= 2 {
 		bestGroup := -1
+		bestScore := -1
 
 		for groupIdx, group := range coreGroups {
 			if len(group) < 2 {
 				continue // Not a hyperthreaded core
 			}
 
+			// Check if entire core is available
 			availableInGroup := 0
+			containsCPUZero := false
 			for _, cpu := range group {
 				if _, isAvailable := availableSet[cpu]; isAvailable {
 					availableInGroup++
+					if cpu == 0 {
+						containsCPUZero = true
+					}
 				}
 			}
 
 			if availableInGroup == len(group) {
-				// Full core available, prefer smaller cores first
-				if bestGroup == -1 || len(group) < len(coreGroups[bestGroup]) {
+				// Full core available - score it
+				score := 100 // Base score for full core
+				
+				// Prefer cores that don't contain CPU 0
+				if containsCPUZero {
+					score -= 50 // Significant penalty for CPU 0
+				}
+				
+				// Prefer smaller core IDs (better locality)
+				score -= groupIdx // Small penalty for higher core indices
+				
+				if score > bestScore {
+					bestScore = score
 					bestGroup = groupIdx
 				}
 			}
@@ -157,31 +188,169 @@ func (a *CPUAllocator) allocateWithSiblingPreference(available []int, count int,
 				}
 			}
 		} else {
-			break // No full cores available
+			break // No full cores available, move to partial allocation
 		}
 	}
 
-	// Phase 3: Allocate remaining CPUs from any available cores
+	// Phase 3: Allocate remaining CPUs with intelligent partial core strategy
 	if remaining > 0 {
-		for _, group := range coreGroups {
-			if remaining <= 0 {
+		fmt.Printf("DEBUG: Phase 3 - allocating %d remaining CPUs\n", remaining)
+		
+		// Strategy for remaining CPUs (typically 1 CPU for odd requests):
+		// 1. First: Use partial cores (where sibling is already reserved)
+		// 2. Second: Break up a new core, preferring core 0↔32 for fragmentation
+		// 3. Last resort: Simple CPU selection with CPU 0 avoidance
+		
+		remainingAllocated := 0
+		
+		// Step 1: Look for partial cores (one sibling already reserved)
+		for groupIdx, group := range coreGroups {
+			if remainingAllocated >= remaining {
 				break
 			}
+			if len(group) < 2 {
+				continue // Skip non-hyperthreaded cores
+			}
+			
+			// Check if this core has one sibling reserved and one available
+			availableInGroup := 0
+			reservedInGroup := 0
+			var availableCPU int
+			
 			for _, cpu := range group {
-				if remaining <= 0 {
-					break
-				}
 				if _, isAvailable := availableSet[cpu]; isAvailable {
-					allocated = append(allocated, cpu)
-					delete(availableSet, cpu)
-					remaining--
+					availableInGroup++
+					availableCPU = cpu
+				} else {
+					reservedInGroup++
 				}
+			}
+			
+			// Perfect case: partial core (1 reserved, 1 available)
+			if availableInGroup == 1 && reservedInGroup == 1 {
+				fmt.Printf("DEBUG: Using partial core %d (group %d) - CPU %d available, sibling reserved\n", 
+					groupIdx, groupIdx, availableCPU)
+				allocated = append(allocated, availableCPU)
+				delete(availableSet, availableCPU)
+				remainingAllocated++
+			}
+		}
+		
+		// Step 2: If no partial cores, break up a new core (prefer core 0↔32)
+		if remainingAllocated < remaining {
+			fmt.Printf("DEBUG: No partial cores available, breaking up a new core\n")
+			
+			// Find the best core to break up - prefer core 0↔32, then others
+			bestCoreToBreak := -1
+			bestCPU := -1
+			
+			for groupIdx, group := range coreGroups {
+				if len(group) < 2 {
+					continue
+				}
+				
+				// Check if entire core is available
+				availableInGroup := 0
+				containsCPUZero := false
+				var firstAvailableCPU int
+				
+				for _, cpu := range group {
+					if _, isAvailable := availableSet[cpu]; isAvailable {
+						if availableInGroup == 0 {
+							firstAvailableCPU = cpu
+						}
+						availableInGroup++
+						if cpu == 0 {
+							containsCPUZero = true
+						}
+					}
+				}
+				
+				if availableInGroup == len(group) {
+					// This core is completely available
+					if containsCPUZero {
+						// Prefer breaking up core 0↔32, but use sibling (32) first
+						bestCoreToBreak = groupIdx
+						// Use sibling of 0 first (should be 32)
+						for _, cpu := range group {
+							if cpu != 0 {
+								bestCPU = cpu
+								break
+							}
+						}
+						break // Core 0 found, use it immediately
+					} else if bestCoreToBreak == -1 {
+						// Use first available core if no better option
+						bestCoreToBreak = groupIdx  
+						bestCPU = firstAvailableCPU
+					}
+				}
+			}
+			
+			// Allocate from the chosen core to break up
+			if bestCoreToBreak >= 0 && remainingAllocated < remaining {
+				fmt.Printf("DEBUG: Breaking up core %d, using CPU %d (leaves sibling for future reuse)\n", 
+					bestCoreToBreak, bestCPU)
+				allocated = append(allocated, bestCPU)
+				delete(availableSet, bestCPU)
+				remainingAllocated++
+			}
+		}
+		
+		// Step 3: Last resort - simple allocation with CPU 0 avoidance
+		if remainingAllocated < remaining {
+			fmt.Printf("DEBUG: Last resort allocation for remaining %d CPUs\n", remaining - remainingAllocated)
+			
+			var remainingCPUs []int
+			for cpu := range availableSet {
+				remainingCPUs = append(remainingCPUs, cpu)
+			}
+			
+			// Sort with preference: non-zero CPUs first
+			sort.Slice(remainingCPUs, func(i, j int) bool {
+				cpuA, cpuB := remainingCPUs[i], remainingCPUs[j]
+				
+				// Strongly prefer non-zero CPUs
+				if (cpuA == 0) != (cpuB == 0) {
+					return cpuB == 0 // cpuA is preferred if cpuB is 0
+				}
+				
+				// Among non-zero CPUs, prefer lower CPU numbers
+				return cpuA < cpuB
+			})
+			
+			// Allocate remaining CPUs
+			needed := remaining - remainingAllocated
+			for i := 0; i < min(needed, len(remainingCPUs)); i++ {
+				allocated = append(allocated, remainingCPUs[i])
 			}
 		}
 	}
 
 	sort.Ints(allocated)
 	return allocated
+}
+
+// selectAvoidingCPUZero selects CPUs while avoiding CPU 0 if possible
+func (a *CPUAllocator) selectAvoidingCPUZero(available []int, count int) []int {
+	if len(available) < count {
+		return nil
+	}
+
+	// Sort CPUs with preference: non-zero CPUs first
+	sort.Slice(available, func(i, j int) bool {
+		cpuA, cpuB := available[i], available[j]
+		
+		// Strongly prefer non-zero CPUs
+		if (cpuA == 0) != (cpuB == 0) {
+			return cpuB == 0 // cpuA is preferred if cpuB is 0
+		}
+		
+		// Among CPUs of same type (zero/non-zero), prefer lower numbers
+		return cpuA < cpuB
+	})
+	
+	return available[:count]
 }
 
 // getKeysFromSet converts a set to a slice of keys

@@ -33,15 +33,25 @@ const (
 )
 
 type ContainerInfo struct {
-	ID     string
-	Mode   string
-	CPUs   []int
-	PodID  string
-	PodUID string
+	ID        string
+	Mode      string
+	CPUs      []int
+	PodID     string
+	PodUID    string
+	CreatedAt time.Time
 }
 
 type Manager struct {
+	// GLOBAL ALLOCATION LOCK - all allocation operations must acquire this
+	// This eliminates all race conditions between allocation, reallocation, and state updates
+	allocationMu sync.Mutex
+
+	// State access lock - separate from allocation lock to prevent deadlocks
 	mu sync.RWMutex
+
+	// Synchronization state tracking
+	synchronized bool // True after initial Synchronize() completes
+	syncCond     *sync.Cond // Condition variable to wait for synchronization
 
 	// annotRef[cpu] -> refcount (annotated sharing)
 	annotRef map[int]int
@@ -60,14 +70,45 @@ type Manager struct {
 	sharedPoolUpdatePending bool
 	sharedPoolDebounceTimer *time.Timer
 	pendingUpdateCallback   func([]*api.ContainerUpdate)
+
+	// Container query callback for state synchronization
+	containerQueryCallback  func() ([]*api.Container, error)
+	// Pod and container query callback for proper classification
+	podContainerQueryCallback func() ([]*api.PodSandbox, []*api.Container, error)
+
+	// Note: In true stateless architecture, no cleanup timers needed
+	// State is always queried fresh from the runtime
+}
+
+// GetAllocationLock returns the global allocation lock for external synchronization
+// This allows callers like Synchronize() to participate in the global locking protocol
+func (m *Manager) GetAllocationLock() *sync.Mutex {
+	return &m.allocationMu
+}
+
+// waitForSynchronization blocks until initial Synchronize() completes
+// All allocation operations must call this first to ensure consistent state
+func (m *Manager) waitForSynchronization() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	
+	for !m.synchronized {
+		fmt.Printf("DEBUG: Waiting for initial synchronization to complete...\n")
+		m.syncCond.Wait()
+	}
+	fmt.Printf("DEBUG: Initial synchronization confirmed - proceeding with operation\n")
 }
 
 func NewManager() *Manager {
-	return &Manager{
-		annotRef: make(map[int]int),
-		intOwner: make(map[int]string),
-		byCID:    make(map[string]*ContainerInfo),
+	m := &Manager{
+		annotRef:             make(map[int]int),
+		intOwner:             make(map[int]string),
+		byCID:                make(map[string]*ContainerInfo),
+		synchronized:         false,
+		// Note: We maintain state based on Synchronize() + incremental updates
 	}
+	m.syncCond = sync.NewCond(&m.mu)
+	return m
 }
 
 // SetUpdateCallback sets the callback function for debounced shared pool updates
@@ -76,6 +117,24 @@ func (m *Manager) SetUpdateCallback(callback func([]*api.ContainerUpdate)) {
 	defer m.mu.Unlock()
 	m.pendingUpdateCallback = callback
 }
+
+// SetContainerQueryCallback sets the callback function for querying actual running containers
+func (m *Manager) SetContainerQueryCallback(callback func() ([]*api.Container, error)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.containerQueryCallback = callback
+}
+
+// SetPodContainerQueryCallback sets the callback function for querying both pods and containers for proper classification
+func (m *Manager) SetPodContainerQueryCallback(callback func() ([]*api.PodSandbox, []*api.Container, error)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.podContainerQueryCallback = callback
+}
+
+
+
+
 
 // scheduleSharedPoolUpdate schedules a debounced shared pool update
 func (m *Manager) scheduleSharedPoolUpdate(alloc Allocator) {
@@ -91,9 +150,14 @@ func (m *Manager) scheduleSharedPoolUpdate(alloc Allocator) {
 
 	// Schedule new timer
 	m.sharedPoolDebounceTimer = time.AfterFunc(debounceDelay, func() {
-		fmt.Printf("DEBUG: scheduleSharedPoolUpdate timer fired, acquiring lock\n")
+		fmt.Printf("DEBUG: scheduleSharedPoolUpdate timer fired, acquiring locks\n")
+		// CRITICAL FIX: Acquire global allocation lock first to prevent races with allocations
+		// This ensures shared pool updates don't interfere with ongoing container allocations
+		m.allocationMu.Lock()
+		defer m.allocationMu.Unlock()
+		
 		m.mu.Lock()
-		fmt.Printf("DEBUG: scheduleSharedPoolUpdate acquired lock\n")
+		fmt.Printf("DEBUG: scheduleSharedPoolUpdate acquired locks\n")
 
 		if !m.sharedPoolUpdatePending {
 			fmt.Printf("DEBUG: scheduleSharedPoolUpdate update not pending, releasing lock\n")
@@ -158,6 +222,8 @@ type Allocator interface {
 	AllocateExclusiveCPUs(count int, reserved []int) ([]int, error)
 	// Add the new unified allocation method
 	AllocateContainerCPUs(pod *api.PodSandbox, container *api.Container, reserved []int) ([]int, string, error)
+	// Add method for allocation with forbidden CPUs
+	AllocateContainerCPUsWithForbidden(pod *api.PodSandbox, container *api.Container, reserved []int, forbidden []int) ([]int, string, error)
 	// Add the specific method for annotated containers with integer conflict checking
 	HandleAnnotatedContainerWithIntegerConflictCheck(pod *api.PodSandbox, integerReserved []int) (*allocator.AllocationResult, error)
 	// Add method for checking reallocation feasibility
@@ -174,38 +240,52 @@ type ReallocationPlan struct {
 
 // pendingReallocationPlan removed - now instance-based in Manager struct
 
-// AllocateAnnotatedWithReallocation attempts to allocate an annotated container with potential integer reallocation
-func (m *Manager) AllocateAnnotatedWithReallocation(pod *api.PodSandbox, alloc Allocator) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+// AllocateAnnotated performs allocation of annotated containers with proper synchronization
+// DESIGN PRINCIPLE: Wait for initial Synchronize(), then use in-memory state with global locking
+func (m *Manager) AllocateAnnotated(pod *api.PodSandbox, container *api.Container, alloc Allocator) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
+	// STEP 1: Wait for initial synchronization to complete
+	m.waitForSynchronization()
+	
+	// STEP 2: GLOBAL ALLOCATION LOCK - prevents ALL race conditions
+	m.allocationMu.Lock()
+	defer m.allocationMu.Unlock()
 
-	// First, try normal allocation without reallocation
-	integerReserved := m.getIntegerReservedCPUsUnsafe()
-	fmt.Printf("DEBUG: Current integer reserved CPUs: %v\n", integerReserved)
-	fmt.Printf("DEBUG: Current integer containers in state: %d\n", len(m.intOwner))
-	for cpu, containerID := range m.intOwner {
-		if container := m.byCID[containerID]; container != nil {
-			fmt.Printf("DEBUG: Integer container %s owns CPU %d (has CPUs %v)\n", safeShortID(containerID), cpu, container.CPUs)
-		}
-	}
-	result, err := alloc.HandleAnnotatedContainerWithIntegerConflictCheck(pod, integerReserved)
+	fmt.Printf("DEBUG: AllocateAnnotated acquired global lock for container %s\n", safeShortID(container.Id))
+
+	// STEP 3: Get current state from memory (synchronized from Synchronize() + incremental updates)
+	m.mu.RLock()
+	currentIntegerReserved := m.getIntegerReservedCPUsUnsafe()
+	currentAnnotatedReserved := m.getAnnotatedCPUsUnsafe()
+	m.mu.RUnlock()
+
+	fmt.Printf("DEBUG: Memory state - integer reserved: %v, annotated reserved: %v\n", currentIntegerReserved, currentAnnotatedReserved)
+
+	// STEP 2: Try direct allocation (no conflicts)
+	result, err := alloc.HandleAnnotatedContainerWithIntegerConflictCheck(pod, currentIntegerReserved)
 	if err == nil {
-		// No conflicts, proceed normally
-		fmt.Printf("DEBUG: No conflicts detected for annotated pod %s/%s\n", pod.Namespace, pod.Name)
-		return m.createAnnotatedAdjustment(result), nil, nil
+		// SUCCESS: No conflicts, record atomically and return
+		fmt.Printf("DEBUG: No conflicts for annotated container %s, recording atomically\n", safeShortID(container.Id))
+		adjustment := m.createAnnotatedAdjustment(result)
+		
+		// Record state atomically
+		m.mu.Lock()
+		m.recordAnnotatedContainerUnsafe(container, pod, result.CPUs)
+		m.mu.Unlock()
+		
+		return adjustment, nil, nil
 	}
 
-	// Check if this is a validation error (invalid CPU annotation) rather than a conflict
+	// STEP 3: Check if error is a conflict (can be resolved) vs invalid annotation (cannot be resolved)
 	if strings.Contains(err.Error(), "invalid CPU list") ||
 		strings.Contains(err.Error(), "not online") ||
 		strings.Contains(err.Error(), "missing") {
-		// Invalid annotation - cannot be fixed with reallocation, fail immediately
-		fmt.Printf("DEBUG: Invalid CPU annotation for annotated pod %s/%s: %v\n", pod.Namespace, pod.Name, err)
+		fmt.Printf("DEBUG: Invalid annotation for annotated container %s: %v\n", safeShortID(container.Id), err)
 		return nil, nil, err
 	}
 
-	// Conflicts detected, attempt live reallocation
-	fmt.Printf("DEBUG: Conflicts detected for annotated pod %s/%s, attempting live reallocation: %v\n", pod.Namespace, pod.Name, err)
+	// STEP 4: Handle conflicts with reallocation
+	fmt.Printf("DEBUG: Conflicts detected for annotated container %s, attempting reallocation: %v\n", safeShortID(container.Id), err)
+	
 	cpuList, exists := pod.Annotations[WekaAnnotation]
 	if !exists {
 		return nil, nil, fmt.Errorf("missing %s annotation", WekaAnnotation)
@@ -216,43 +296,38 @@ func (m *Manager) AllocateAnnotatedWithReallocation(pod *api.PodSandbox, alloc A
 		return nil, nil, fmt.Errorf("invalid CPU list in annotation: %w", err)
 	}
 
-	// Find conflicting integer containers
-	conflictingContainers := m.findConflictingIntegerContainers(requestedCPUs)
-	if len(conflictingContainers) == 0 {
-		return nil, nil, fmt.Errorf("unknown conflict with annotated container allocation")
-	}
-
-	// Plan reallocation for conflicting containers
-	fmt.Printf("DEBUG: Found %d conflicting integer containers\n", len(conflictingContainers))
-	reallocationPlan, err := m.planReallocation(conflictingContainers, requestedCPUs, alloc)
+	// STEP 5: Calculate reallocation plan atomically
+	reallocationPlan, adjustment, err := m.calculateReallocationPlan(requestedCPUs, alloc)
 	if err != nil {
 		fmt.Printf("DEBUG: Reallocation planning failed: %v\n", err)
-		return nil, nil, fmt.Errorf("cannot reallocate conflicting integer containers: %w", err)
+		return nil, nil, fmt.Errorf("cannot reallocate conflicting containers: %w", err)
 	}
 
-	// Execute reallocation plan (create updates but don't apply state changes yet)
-	fmt.Printf("DEBUG: Executing reallocation plan with %d containers\n", len(reallocationPlan))
-	updates, err := m.executeReallocationPlan(reallocationPlan, alloc)
+	// STEP 6: Execute reallocation and record new state atomically
+	updates, err := m.executeReallocationPlanAtomic(reallocationPlan, container, pod, requestedCPUs)
 	if err != nil {
-		fmt.Printf("DEBUG: Reallocation execution failed: %v\n", err)
-		return nil, nil, fmt.Errorf("failed to execute reallocation plan: %w", err)
-	}
-	fmt.Printf("DEBUG: Generated %d container updates for live reallocation\n", len(updates))
-
-	// Store the plan for later application after successful container updates
-	m.pendingReallocationPlan = reallocationPlan
-
-	// Now allocate the annotated container using projected state (after reallocation)
-	projectedIntegerReserved := m.getProjectedIntegerReservedCPUs(reallocationPlan)
-	result, err = alloc.HandleAnnotatedContainerWithIntegerConflictCheck(pod, projectedIntegerReserved)
-	if err != nil {
-		// Clear pending plan on failure
-		m.pendingReallocationPlan = nil
-		return nil, nil, fmt.Errorf("annotated container allocation failed after reallocation: %w", err)
+		return nil, nil, fmt.Errorf("reallocation execution failed: %w", err)
 	}
 
-	adjustment := m.createAnnotatedAdjustment(result)
+	fmt.Printf("DEBUG: Successfully planned reallocation of %d containers for annotated container %s\n", 
+		len(reallocationPlan), safeShortID(container.Id))
+
 	return adjustment, updates, nil
+}
+
+// AllocateAnnotatedWithReallocation - DEPRECATED, kept for backward compatibility
+// Use StatelessAllocateAnnotated instead
+func (m *Manager) AllocateAnnotatedWithReallocation(pod *api.PodSandbox, alloc Allocator) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
+	fmt.Printf("WARNING: Using deprecated AllocateAnnotatedWithReallocation, use StatelessAllocateAnnotated instead\n")
+	
+	// Create a temporary container for backward compatibility
+	tempContainer := &api.Container{
+		Id:           fmt.Sprintf("temp-%s", pod.Uid),
+		PodSandboxId: pod.Id,
+		Name:         "temp-container",
+	}
+	
+	return m.StatelessAllocateAnnotated(pod, tempContainer, alloc)
 }
 
 // findConflictingIntegerContainers identifies integer containers using the requested CPUs
@@ -540,6 +615,7 @@ func (m *Manager) GetContainerInfo(containerID string) *ContainerInfo {
 }
 
 func (m *Manager) Synchronize(pods []*api.PodSandbox, containers []*api.Container, alloc Allocator) ([]*api.ContainerUpdate, error) {
+	
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -554,12 +630,19 @@ func (m *Manager) Synchronize(pods []*api.PodSandbox, containers []*api.Containe
 		fmt.Printf("Synchronizing: filtering out %d stopped containers from %d total\n", stoppedCount, len(containers))
 	}
 
+
 	// Clear existing state (including any invalid containers from previous runs)
+	fmt.Printf("CRITICAL DEBUG: Synchronize() CLEARING STATE - before clear: intOwner=%d entries, annotRef=%d entries, byCID=%d entries\n", len(m.intOwner), len(m.annotRef), len(m.byCID))
+	for cpu, owner := range m.intOwner {
+		fmt.Printf("CRITICAL DEBUG: Synchronize() CLEARING intOwner - CPU %d was owned by %s\n", cpu, safeShortID(owner))
+	}
 	m.annotRef = make(map[int]int)
 	m.intOwner = make(map[int]string)
 	m.byCID = make(map[string]*ContainerInfo)
+	fmt.Printf("CRITICAL DEBUG: Synchronize() STATE CLEARED - now: intOwner=%d entries, annotRef=%d entries, byCID=%d entries\n", len(m.intOwner), len(m.annotRef), len(m.byCID))
 	// Also clear any pending reallocation plans from previous failed operations
 	m.pendingReallocationPlan = nil
+
 
 	// Separate containers by type for prioritized processing
 	var annotatedContainers []*api.Container
@@ -631,11 +714,12 @@ func (m *Manager) Synchronize(pods []*api.PodSandbox, containers []*api.Containe
 			// Track this container as problematic for debugging purposes
 			// These invalid containers won't interfere with normal allocation since they have no CPUs
 			info := &ContainerInfo{
-				ID:     container.Id,
-				Mode:   "invalid-annotated", // Special mode for problematic containers
-				CPUs:   nil,                 // No CPUs allocated
-				PodID:  container.PodSandboxId,
-				PodUID: pod.Uid,
+				ID:        container.Id,
+				Mode:      "invalid-annotated", // Special mode for problematic containers
+				CPUs:      nil,                 // No CPUs allocated
+				PodID:     container.PodSandboxId,
+				PodUID:    pod.Uid,
+				CreatedAt: time.Now(),
 			}
 			m.byCID[container.Id] = info
 			skippedContainers = append(skippedContainers, container.Id)
@@ -644,11 +728,12 @@ func (m *Manager) Synchronize(pods []*api.PodSandbox, containers []*api.Containe
 
 		// Annotated container allocation successful
 		info := &ContainerInfo{
-			ID:     container.Id,
-			Mode:   ModeAnnotated,
-			CPUs:   result.CPUs,
-			PodID:  container.PodSandboxId,
-			PodUID: pod.Uid,
+			ID:        container.Id,
+			Mode:      ModeAnnotated,
+			CPUs:      result.CPUs,
+			PodID:     container.PodSandboxId,
+			PodUID:    pod.Uid,
+			CreatedAt: time.Now(),
 		}
 
 		m.byCID[container.Id] = info
@@ -887,11 +972,12 @@ func (m *Manager) Synchronize(pods []*api.PodSandbox, containers []*api.Containe
 		}
 
 		info := &ContainerInfo{
-			ID:     container.Id,
-			Mode:   ModeShared,
-			CPUs:   sharedPool,
-			PodID:  container.PodSandboxId,
-			PodUID: pod.Uid,
+			ID:        container.Id,
+			Mode:      ModeShared,
+			CPUs:      sharedPool,
+			PodID:     container.PodSandboxId,
+			PodUID:    pod.Uid,
+			CreatedAt: time.Now(),
 		}
 
 		m.byCID[container.Id] = info
@@ -912,6 +998,12 @@ func (m *Manager) Synchronize(pods []*api.PodSandbox, containers []*api.Containe
 		}
 	}
 
+	// Mark synchronization as complete and notify waiting operations
+	// NOTE: We already hold m.mu lock from the beginning of this function
+	m.synchronized = true
+	m.syncCond.Broadcast() // Wake up any operations waiting for synchronization
+	
+	fmt.Printf("DEBUG: Synchronize() completed - state manager now synchronized\n")
 	return updates, nil
 }
 
@@ -947,31 +1039,53 @@ func (m *Manager) RemoveContainer(containerID string, alloc Allocator) ([]*api.C
 
 	info := m.byCID[containerID]
 	if info == nil {
+		// ADD DEBUG LOG FOR MISSING CONTAINER
+		fmt.Printf("DEBUG: RemoveContainer called for unknown container %s (not in state)\n", safeShortID(containerID))
 		return nil, nil
 	}
 
-	// Release reservations
+	// ADD DEBUG LOG FOR REMOVAL START
+	fmt.Printf("DEBUG: RemoveContainer %s mode=%s CPUs=%v (before removal: intOwner=%d entries, annotRef=%d entries)\n", 
+		safeShortID(containerID), info.Mode, info.CPUs, len(m.intOwner), len(m.annotRef))
+
+	// Release reservations with enhanced validation
 	switch info.Mode {
 	case ModeAnnotated:
 		for _, cpu := range info.CPUs {
 			if count := m.annotRef[cpu]; count > 1 {
 				m.annotRef[cpu] = count - 1
+				fmt.Printf("DEBUG: Decremented annotation count for CPU %d to %d\n", cpu, count-1)
 			} else {
 				delete(m.annotRef, cpu)
+				fmt.Printf("DEBUG: Released annotated CPU %d from container %s\n", cpu, safeShortID(containerID))
 			}
 		}
 	case ModeInteger:
+		// CRITICAL FIX: Validate CPU ownership before removal
 		for _, cpu := range info.CPUs {
+			if currentOwner := m.intOwner[cpu]; currentOwner != containerID {
+				fmt.Printf("WARNING: CPU %d ownership mismatch during removal - expected %s, found %s\n", 
+					cpu, safeShortID(containerID), safeShortID(currentOwner))
+				// Still remove it to prevent state corruption, but log the issue
+			}
 			delete(m.intOwner, cpu)
+			fmt.Printf("DEBUG: Released integer CPU %d from container %s\n", cpu, safeShortID(containerID))
 		}
 	case ModeShared:
 		// No specific reservations to release for shared containers
 	case "invalid-annotated", "invalid-integer":
 		// Invalid containers don't have CPU reservations to release
-		fmt.Printf("DEBUG: Removing invalid container %s (mode: %s)\n", containerID, info.Mode)
+		fmt.Printf("DEBUG: Removing invalid container %s (mode: %s)\n", safeShortID(containerID), info.Mode)
 	}
 
 	delete(m.byCID, containerID)
+
+	// ADD DEBUG LOG FOR REMOVAL COMPLETE
+	fmt.Printf("DEBUG: RemoveContainer %s complete (after removal: intOwner=%d entries, annotRef=%d entries)\n", 
+		safeShortID(containerID), len(m.intOwner), len(m.annotRef))
+
+	// CRITICAL FIX: Validate state consistency after removal
+	m.validateStateConsistency()
 
 	// If we have a callback set up, use debounced updates to prevent explosion during rapid deletions
 	if m.pendingUpdateCallback != nil {
@@ -1009,6 +1123,197 @@ func (m *Manager) GetReservedCPUs() []int {
 	return m.getReservedCPUsUnsafe()
 }
 
+// AtomicAllocateAndRecordAnnotated performs atomic allocation and state recording for annotated containers
+// This fixes the race condition where periodic cleanup removes annotation references before container is recorded
+func (m *Manager) AtomicAllocateAndRecordAnnotated(pod *api.PodSandbox, container *api.Container, alloc Allocator) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Get current integer reservations under lock
+	integerReserved := m.getIntegerReservedCPUsUnsafe()
+
+	// Try allocation with current integer reservations
+	result, err := alloc.HandleAnnotatedContainerWithIntegerConflictCheck(pod, integerReserved)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Create adjustment immediately
+	adjustment := m.createAnnotatedAdjustment(result)
+
+	// Record container info and annotation references atomically within the same lock
+	info := &ContainerInfo{
+		ID:        container.Id,
+		Mode:      ModeAnnotated,
+		CPUs:      result.CPUs,
+		PodID:     container.PodSandboxId,
+		PodUID:    pod.Uid,
+		CreatedAt: time.Now(),
+	}
+
+	m.byCID[container.Id] = info
+
+	// Update annotation reference counts
+	for _, cpu := range result.CPUs {
+		m.annotRef[cpu]++
+	}
+
+	fmt.Printf("DEBUG: Atomically allocated and recorded annotated container %s with %d CPUs (annotRef now has %d entries)\n", 
+		safeShortID(container.Id), len(result.CPUs), len(m.annotRef))
+
+	return adjustment, nil, nil
+}
+
+// AllocateInteger performs allocation of integer containers with proper synchronization
+// DESIGN PRINCIPLE: Wait for initial Synchronize(), then use in-memory state with global locking
+func (m *Manager) AllocateInteger(pod *api.PodSandbox, container *api.Container, alloc Allocator, forbidden []int) (*api.ContainerAdjustment, error) {
+	// STEP 1: Wait for initial synchronization to complete
+	m.waitForSynchronization()
+	
+	// STEP 2: GLOBAL ALLOCATION LOCK - prevents ALL race conditions
+	m.allocationMu.Lock()
+	defer m.allocationMu.Unlock()
+
+	fmt.Printf("DEBUG: AllocateInteger acquired global lock for container %s\n", safeShortID(container.Id))
+	
+	// CRITICAL DEBUG: Log current state when entering allocation
+	m.mu.RLock()
+	fmt.Printf("DEBUG: AllocateInteger ENTRY STATE - intOwner has %d entries, annotRef has %d entries, byCID has %d entries\n", len(m.intOwner), len(m.annotRef), len(m.byCID))
+	for cpu, owner := range m.intOwner {
+		fmt.Printf("DEBUG: AllocateInteger ENTRY STATE - CPU %d owned by %s\n", cpu, safeShortID(owner))
+	}
+	m.mu.RUnlock()
+
+	// STEP 3: Get current state from memory (synchronized from Synchronize() + incremental updates)
+	m.mu.RLock()
+	currentReserved := m.getReservedCPUsUnsafe()
+	currentAnnotated := m.getAnnotatedCPUsUnsafe()
+	m.mu.RUnlock()
+
+	fmt.Printf("DEBUG: Memory state - reserved: %v, annotated: %v, forbidden: %v\n", currentReserved, currentAnnotated, forbidden)
+
+	// STEP 2: Check for conflicts with annotated containers (REJECT if conflict)
+	annotatedSet := make(map[int]struct{})
+	for _, cpu := range currentAnnotated {
+		annotatedSet[cpu] = struct{}{}
+	}
+
+	// STEP 3: Combine all unavailable CPUs
+	allUnavailable := make(map[int]struct{})
+	for _, cpu := range currentReserved {
+		allUnavailable[cpu] = struct{}{}
+	}
+	for _, cpu := range currentAnnotated {
+		allUnavailable[cpu] = struct{}{}
+	}
+	for _, cpu := range forbidden {
+		allUnavailable[cpu] = struct{}{}
+	}
+
+	var unavailableSlice []int
+	for cpu := range allUnavailable {
+		unavailableSlice = append(unavailableSlice, cpu)
+	}
+
+	// STEP 4: Attempt allocation
+	cpus, _, err := alloc.AllocateContainerCPUsWithForbidden(pod, container, unavailableSlice, nil)
+	if err != nil {
+		// Check if this is due to annotated container conflict
+		if len(currentAnnotated) > 0 {
+			conflictCPUs := make([]int, 0)
+			for _, cpu := range forbidden {
+				if _, isAnnotated := annotatedSet[cpu]; isAnnotated {
+					conflictCPUs = append(conflictCPUs, cpu)
+				}
+			}
+			if len(conflictCPUs) > 0 {
+				return nil, fmt.Errorf("integer container allocation rejected: conflicts with annotated containers on CPUs %v", conflictCPUs)
+			}
+		}
+		
+		fmt.Printf("DEBUG: Integer allocation failed for container %s: %v\n", safeShortID(container.Id), err)
+		return nil, fmt.Errorf("failed to allocate CPUs: %w", err)
+	}
+
+	// STEP 5: Validate no CPU ownership conflicts (double-check)
+	m.mu.RLock()
+	var conflicts []int
+	var conflictOwners []string
+	
+	for _, cpu := range cpus {
+		if existingOwner := m.intOwner[cpu]; existingOwner != "" {
+			conflicts = append(conflicts, cpu)
+			conflictOwners = append(conflictOwners, safeShortID(existingOwner))
+		}
+		// Also check annotated conflicts (should not happen but safety check)
+		if _, hasAnnotated := m.annotRef[cpu]; hasAnnotated {
+			fmt.Printf("ERROR: Integer container %s attempted to allocate annotated CPU %d\n", safeShortID(container.Id), cpu)
+			conflicts = append(conflicts, cpu)
+		}
+	}
+	m.mu.RUnlock()
+
+	if len(conflicts) > 0 {
+		return nil, fmt.Errorf("CPU conflict detected during integer allocation: CPUs %v already owned by %v", conflicts, conflictOwners)
+	}
+
+	// STEP 6: Record allocation in internal state for consistency
+	// Even in "stateless" architecture, we need to track containers for RemoveContainer() calls
+	// The "stateless" part refers to querying fresh reserved CPUs, not avoiding all state
+	m.mu.Lock()
+	
+	info := &ContainerInfo{
+		ID:        container.Id,
+		Mode:      ModeInteger,
+		CPUs:      cpus,
+		PodID:     container.PodSandboxId,
+		PodUID:    pod.Uid,
+		CreatedAt: time.Now(),
+	}
+	
+	m.byCID[container.Id] = info
+	
+	// Record integer CPU ownership
+	for _, cpu := range cpus {
+		m.intOwner[cpu] = container.Id
+		fmt.Printf("DEBUG: StatelessAllocateInteger - assigned CPU %d to container %s\n", cpu, safeShortID(container.Id))
+	}
+	
+	m.mu.Unlock()
+	
+	fmt.Printf("DEBUG: StatelessAllocateInteger - recorded container %s in state with CPUs %v\n", safeShortID(container.Id), cpus)
+
+	// STEP 7: Create adjustment
+	adjustment := &api.ContainerAdjustment{
+		Linux: &api.LinuxContainerAdjustment{
+			Resources: &api.LinuxResources{
+				Cpu: &api.LinuxCPU{
+					Cpus: numa.FormatCPUList(cpus),
+				},
+			},
+		},
+	}
+
+	fmt.Printf("DEBUG: Successfully allocated integer container %s with CPUs %v\n", safeShortID(container.Id), cpus)
+	fmt.Printf("DEBUG: TRUE STATELESS - allocation recorded by NRI, will be discovered in next query\n")
+	return adjustment, nil
+}
+
+// StatelessAllocateAnnotated - compatibility wrapper for old name
+func (m *Manager) StatelessAllocateAnnotated(pod *api.PodSandbox, container *api.Container, alloc Allocator) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
+	return m.AllocateAnnotated(pod, container, alloc)
+}
+
+// StatelessAllocateInteger - compatibility wrapper for old name
+func (m *Manager) StatelessAllocateInteger(pod *api.PodSandbox, container *api.Container, alloc Allocator, forbidden []int) (*api.ContainerAdjustment, error) {
+	return m.AllocateInteger(pod, container, alloc, forbidden)
+}
+
+// AtomicAllocateAndRecordInteger - DEPRECATED, kept for backward compatibility
+func (m *Manager) AtomicAllocateAndRecordInteger(pod *api.PodSandbox, container *api.Container, alloc Allocator, forbidden []int) (*api.ContainerAdjustment, error) {
+	return m.AllocateInteger(pod, container, alloc, forbidden)
+}
+
 func (m *Manager) GetIntegerReservedCPUs() []int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -1022,6 +1327,687 @@ func (m *Manager) getIntegerReservedCPUsUnsafe() []int {
 	}
 	fmt.Printf("DEBUG: getIntegerReservedCPUsUnsafe() returning %v, intOwner map has %d entries\n", reserved, len(m.intOwner))
 	return reserved
+}
+
+// NEW STATELESS HELPER METHODS - these fetch fresh state every time
+
+// getFreshReservedCPUs returns all currently reserved CPUs (both annotated and integer)
+// TRUE STATELESS IMPLEMENTATION: Query live container state instead of in-memory maps
+// If pods and containers are provided, uses them directly; otherwise queries runtime
+func (m *Manager) getFreshReservedCPUs() []int {
+	return m.getFreshReservedCPUsWithContext(nil, nil)
+}
+
+// getFreshReservedCPUsWithContext allows providing pod/container context for better classification
+func (m *Manager) getFreshReservedCPUsWithContext(pods []*api.PodSandbox, containers []*api.Container) []int {
+	// APPROACH 5: Query container runtime state directly from cgroups
+	// This is the most direct and stateless approach - query what CPUs are actually assigned right now
+	return m.queryReservedCPUsFromCgroups()
+}
+
+// queryReservedCPUsFromCgroups directly queries the cgroup filesystem to see what CPUs are currently assigned
+func (m *Manager) queryReservedCPUsFromCgroups() []int {
+	fmt.Printf("DEBUG: queryReservedCPUsFromCgroups() - querying cgroup filesystem for current CPU assignments\n")
+	
+	// For now, fall back to the original callback-based approach
+	// TODO: Implement direct cgroup querying in future iteration
+	pods, containers, err := m.queryRunningPodsAndContainers()
+	if err != nil {
+		fmt.Printf("DEBUG: queryReservedCPUsFromCgroups() - pod-container query failed: %v, trying containers only\n", err)
+		
+		// Fallback to container-only query
+		containers, err := m.queryRunningContainers()
+		if err != nil {
+			fmt.Printf("ERROR: queryReservedCPUsFromCgroups() failed to query running containers: %v, falling back to in-memory state\n", err)
+			return m.getFreshReservedCPUsFromMemory() // Fallback to old approach
+		}
+		pods = nil // No pod information available for runtime queries
+		fmt.Printf("DEBUG: queryReservedCPUsFromCgroups() - queried %d containers from runtime (no pod context)\n", len(containers))
+	} else {
+		fmt.Printf("DEBUG: queryReservedCPUsFromCgroups() - using pod-container context: %d pods, %d containers\n", len(pods), len(containers))
+	}
+
+	reserved := make(map[int]struct{})
+
+	// Extract CPU assignments from live container data  
+	for _, container := range containers {
+		if container == nil {
+			continue
+		}
+
+		// Extract CPUs from container resources
+		var cpus []int
+		if container.Linux != nil && container.Linux.Resources != nil &&
+			container.Linux.Resources.Cpu != nil && container.Linux.Resources.Cpu.Cpus != "" {
+			var err error
+			cpus, err = numa.ParseCPUList(container.Linux.Resources.Cpu.Cpus)
+			if err != nil {
+				fmt.Printf("DEBUG: queryReservedCPUsFromCgroups() - failed to parse CPU list '%s' for container %s: %v\n", 
+					container.Linux.Resources.Cpu.Cpus, safeShortID(container.Id), err)
+				continue
+			}
+
+			// Find the pod for this container for proper classification
+			var pod *api.PodSandbox
+			if pods != nil && container.PodSandboxId != "" {
+				pod = m.findPod(pods, container.PodSandboxId)
+			}
+
+			// IMPROVED FIX: Additional system container filtering based on CPU assignment pattern
+			// System containers often have access to all CPUs, which indicates they're not exclusive
+			if len(cpus) > 50 { // If container has access to more than 50 CPUs, it's likely a system container
+				fmt.Printf("DEBUG: queryReservedCPUsFromCgroups() - skipping container %s with broad CPU access (%d CPUs) - likely system container\n", 
+					safeShortID(container.Id), len(cpus))
+				continue
+			}
+
+			// IMPROVED FIX: Check if this container has exclusive CPU allocation semantics using pod-based classification
+			if !m.hasExclusiveCPUSemantics(container, pod) {
+				if pod != nil {
+					fmt.Printf("DEBUG: queryReservedCPUsFromCgroups() - skipping non-exclusive container %s (pod %s/%s)\n", 
+						safeShortID(container.Id), pod.Namespace, pod.Name)
+				} else {
+					fmt.Printf("DEBUG: queryReservedCPUsFromCgroups() - skipping non-exclusive container %s (no pod info)\n", 
+						safeShortID(container.Id))
+				}
+				continue
+			}
+
+			if pod != nil {
+				fmt.Printf("DEBUG: queryReservedCPUsFromCgroups() - exclusive container %s (pod %s/%s) has CPU assignment %v (%d CPUs)\n", 
+					safeShortID(container.Id), pod.Namespace, pod.Name, cpus, len(cpus))
+			} else {
+				fmt.Printf("DEBUG: queryReservedCPUsFromCgroups() - exclusive container %s (no pod info) has CPU assignment %v (%d CPUs)\n", 
+					safeShortID(container.Id), cpus, len(cpus))
+			}
+			for _, cpu := range cpus {
+				reserved[cpu] = struct{}{}
+			}
+		}
+	}
+
+	var result []int
+	for cpu := range reserved {
+		result = append(result, cpu)
+	}
+
+	fmt.Printf("DEBUG: queryReservedCPUsFromCgroups() - STATELESS QUERY returned %d total reserved CPUs: %v\n", len(result), result)
+	return result
+}
+
+// getFreshReservedCPUsFromMemory - fallback to in-memory maps (old approach)
+func (m *Manager) getFreshReservedCPUsFromMemory() []int {
+	reserved := make(map[int]struct{})
+	
+	fmt.Printf("DEBUG: getFreshReservedCPUsFromMemory() - FALLBACK - intOwner map has %d entries, annotRef map has %d entries\n", len(m.intOwner), len(m.annotRef))
+	
+	// Add annotated CPUs
+	for cpu := range m.annotRef {
+		reserved[cpu] = struct{}{}
+	}
+	
+	// Add integer CPUs
+	for cpu := range m.intOwner {
+		reserved[cpu] = struct{}{}
+	}
+	
+	var result []int
+	for cpu := range reserved {
+		result = append(result, cpu)
+	}
+	
+	fmt.Printf("DEBUG: getFreshReservedCPUsFromMemory() - FALLBACK returned %d CPUs: %v\n", len(result), result)
+	return result
+}
+
+// getFreshIntegerReservedCPUs returns CPUs reserved by integer containers
+// TRUE STATELESS IMPLEMENTATION: Query live integer container state
+func (m *Manager) getFreshIntegerReservedCPUs() []int {
+	// STATELESS APPROACH: Get live container data from runtime
+	runningContainers, err := m.queryRunningContainers()
+	if err != nil {
+		fmt.Printf("ERROR: getFreshIntegerReservedCPUs() failed to query running containers: %v, falling back to in-memory state\n", err)
+		return m.getFreshIntegerReservedCPUsFromMemory() // Fallback
+	}
+
+	var reserved []int
+	fmt.Printf("DEBUG: getFreshIntegerReservedCPUs() - querying %d running containers for integer CPUs\n", len(runningContainers))
+
+	// Find integer containers and extract their CPU assignments
+	for _, container := range runningContainers {
+		if container == nil {
+			continue
+		}
+
+		// Check if this is an integer container by checking CPU quota
+		if !m.isIntegerContainer(container) {
+			continue
+		}
+
+		// Extract CPUs from container resources  
+		if container.Linux != nil && container.Linux.Resources != nil &&
+			container.Linux.Resources.Cpu != nil && container.Linux.Resources.Cpu.Cpus != "" {
+			cpus, err := numa.ParseCPUList(container.Linux.Resources.Cpu.Cpus)
+			if err != nil {
+				fmt.Printf("DEBUG: getFreshIntegerReservedCPUs() - failed to parse CPU list for integer container %s: %v\n", 
+					safeShortID(container.Id), err)
+				continue
+			}
+
+			fmt.Printf("DEBUG: getFreshIntegerReservedCPUs() - integer container %s has CPUs %v\n", safeShortID(container.Id), cpus)
+			reserved = append(reserved, cpus...)
+		}
+	}
+
+	fmt.Printf("DEBUG: getFreshIntegerReservedCPUs() - STATELESS QUERY returned %d integer CPUs: %v\n", len(reserved), reserved)
+	return reserved
+}
+
+// getFreshIntegerReservedCPUsFromMemory - fallback to in-memory maps (old approach)
+func (m *Manager) getFreshIntegerReservedCPUsFromMemory() []int {
+	var reserved []int
+	fmt.Printf("DEBUG: getFreshIntegerReservedCPUsFromMemory() - FALLBACK - intOwner map has %d entries\n", len(m.intOwner))
+	for cpu := range m.intOwner {
+		reserved = append(reserved, cpu)
+		fmt.Printf("DEBUG: getFreshIntegerReservedCPUsFromMemory() - found CPU %d owned by %s\n", cpu, safeShortID(m.intOwner[cpu]))
+	}
+	fmt.Printf("DEBUG: getFreshIntegerReservedCPUsFromMemory() - FALLBACK returned %d CPUs: %v\n", len(reserved), reserved)
+	return reserved
+}
+
+// getAnnotatedCPUsUnsafe returns CPUs reserved by annotated containers from memory (caller must hold lock)
+func (m *Manager) getAnnotatedCPUsUnsafe() []int {
+	var annotated []int
+	for cpu := range m.annotRef {
+		annotated = append(annotated, cpu)
+	}
+	return annotated
+}
+
+// queryRunningContainers gets the current list of running containers from the runtime
+func (m *Manager) queryRunningContainers() ([]*api.Container, error) {
+	m.mu.RLock()
+	callback := m.containerQueryCallback
+	m.mu.RUnlock()
+
+	if callback != nil {
+		containers, err := callback()
+		if err != nil {
+			return nil, fmt.Errorf("container query callback failed: %w", err)
+		}
+		fmt.Printf("DEBUG: queryRunningContainers() - callback returned %d containers\n", len(containers))
+		return containers, nil
+	}
+
+
+	return nil, fmt.Errorf("no container query method available")
+}
+
+// queryRunningPodsAndContainers gets both pods and containers for proper classification
+func (m *Manager) queryRunningPodsAndContainers() ([]*api.PodSandbox, []*api.Container, error) {
+	m.mu.RLock()
+	callback := m.podContainerQueryCallback
+	m.mu.RUnlock()
+
+	if callback != nil {
+		pods, containers, err := callback()
+		if err != nil {
+			return nil, nil, fmt.Errorf("pod-container query callback failed: %w", err)
+		}
+		fmt.Printf("DEBUG: queryRunningPodsAndContainers() - callback returned %d pods, %d containers\n", len(pods), len(containers))
+		return pods, containers, nil
+	}
+
+	return nil, nil, fmt.Errorf("no pod-container query method available")
+}
+
+
+// isIntegerContainer checks if a container should be treated as an integer container
+func (m *Manager) isIntegerContainer(container *api.Container) bool {
+	// Check if container has integer CPU semantics (whole number of CPUs)
+	if container.Linux == nil || container.Linux.Resources == nil || 
+	   container.Linux.Resources.Cpu == nil {
+		return false
+	}
+
+	cpu := container.Linux.Resources.Cpu
+	if cpu.Quota == nil || cpu.Period == nil {
+		return false
+	}
+
+	quota := cpu.Quota.GetValue()
+	period := int64(cpu.Period.GetValue())
+	if quota <= 0 || period <= 0 {
+		return false
+	}
+
+	// Check if it's requesting whole CPUs (integer semantics)
+	cpuCount := float64(quota) / float64(period)
+	isInteger := cpuCount == float64(int(cpuCount)) && cpuCount >= 1.0
+
+	if isInteger {
+		fmt.Printf("DEBUG: isIntegerContainer() - container %s is integer (%.1f CPUs)\n", safeShortID(container.Id), cpuCount)
+	}
+
+	return isInteger
+}
+
+// hasExclusiveCPUSemantics checks if a container requires exclusive CPU allocation
+// Uses proper pod-based classification instead of heuristics
+func (m *Manager) hasExclusiveCPUSemantics(container *api.Container, pod *api.PodSandbox) bool {
+	if pod == nil {
+		// Fallback to simple integer check if pod is not available
+		fmt.Printf("DEBUG: hasExclusiveCPUSemantics() - no pod available for container %s, using integer check\n", safeShortID(container.Id))
+		return m.isIntegerContainer(container)
+	}
+
+	// Use proper container classification based on pod information
+	mode := m.determineContainerMode(pod, container)
+	
+	switch mode {
+	case "annotated", "integer":
+		fmt.Printf("DEBUG: hasExclusiveCPUSemantics() - container %s (pod %s/%s) has mode %s - requires exclusive CPUs\n", 
+			safeShortID(container.Id), pod.Namespace, pod.Name, mode)
+		return true
+	case "shared":
+		fmt.Printf("DEBUG: hasExclusiveCPUSemantics() - container %s (pod %s/%s) has mode %s - does not require exclusive CPUs\n", 
+			safeShortID(container.Id), pod.Namespace, pod.Name, mode)
+		return false
+	default:
+		fmt.Printf("DEBUG: hasExclusiveCPUSemantics() - container %s (pod %s/%s) has unknown mode %s - defaulting to no exclusivity\n", 
+			safeShortID(container.Id), pod.Namespace, pod.Name, mode)
+		return false
+	}
+}
+
+// getFreshAnnotatedCPUs returns CPUs reserved by annotated containers  
+// TRUE STATELESS IMPLEMENTATION: Query live annotated container state
+func (m *Manager) getFreshAnnotatedCPUs() []int {
+	// STATELESS APPROACH: Get live container data from runtime
+	runningContainers, err := m.queryRunningContainers()
+	if err != nil {
+		fmt.Printf("ERROR: getFreshAnnotatedCPUs() failed to query running containers: %v, falling back to in-memory state\n", err)
+		return m.getFreshAnnotatedCPUsFromMemory() // Fallback
+	}
+
+	var annotated []int
+	fmt.Printf("DEBUG: getFreshAnnotatedCPUs() - querying %d running containers for annotated CPUs\n", len(runningContainers))
+
+	// Find annotated containers by looking for containers that have CPU annotations
+	for _, container := range runningContainers {
+		if container == nil {
+			continue
+		}
+
+		// Check if this container is managed by an annotated pod
+		if !m.isAnnotatedContainer(container) {
+			continue
+		}
+
+		// Extract CPUs from container resources
+		if container.Linux != nil && container.Linux.Resources != nil &&
+			container.Linux.Resources.Cpu != nil && container.Linux.Resources.Cpu.Cpus != "" {
+			cpus, err := numa.ParseCPUList(container.Linux.Resources.Cpu.Cpus)
+			if err != nil {
+				fmt.Printf("DEBUG: getFreshAnnotatedCPUs() - failed to parse CPU list for annotated container %s: %v\n", 
+					safeShortID(container.Id), err)
+				continue
+			}
+
+			fmt.Printf("DEBUG: getFreshAnnotatedCPUs() - annotated container %s has CPUs %v\n", safeShortID(container.Id), cpus)
+			annotated = append(annotated, cpus...)
+		}
+	}
+
+	fmt.Printf("DEBUG: getFreshAnnotatedCPUs() - STATELESS QUERY returned %d annotated CPUs: %v\n", len(annotated), annotated)
+	return annotated
+}
+
+// getFreshAnnotatedCPUsFromMemory - fallback to in-memory maps (old approach)  
+func (m *Manager) getFreshAnnotatedCPUsFromMemory() []int {
+	var annotated []int
+	fmt.Printf("DEBUG: getFreshAnnotatedCPUsFromMemory() - FALLBACK - annotRef map has %d entries\n", len(m.annotRef))
+	for cpu := range m.annotRef {
+		annotated = append(annotated, cpu)
+	}
+	fmt.Printf("DEBUG: getFreshAnnotatedCPUsFromMemory() - FALLBACK returned %d CPUs: %v\n", len(annotated), annotated)
+	return annotated
+}
+
+// isContainerManagedByNRI checks if a container was allocated by our NRI plugin
+func (m *Manager) isContainerManagedByNRI(container *api.Container) bool {
+	// Strategy: Only count containers that have specific, exclusive CPU assignments
+	// System containers typically have broad CPU access (0-63) and should be ignored
+	
+	if container.Linux == nil || container.Linux.Resources == nil ||
+		container.Linux.Resources.Cpu == nil || container.Linux.Resources.Cpu.Cpus == "" {
+		return false
+	}
+
+	cpus, err := numa.ParseCPUList(container.Linux.Resources.Cpu.Cpus)
+	if err != nil {
+		return false
+	}
+
+	// Heuristic: Containers managed by NRI plugin typically have:
+	// - Specific, non-overlapping CPU assignments (not 0-63)
+	// - Reasonable CPU counts (not all cores)
+	// - Integer CPU semantics for exclusive allocation
+	
+	// If container has most/all CPUs, it's likely a system container
+	if len(cpus) > 50 { // More than 50 CPUs suggests system container with broad access
+		fmt.Printf("DEBUG: isContainerManagedByNRI() - container %s has %d CPUs (system container)\n", safeShortID(container.Id), len(cpus))
+		return false
+	}
+
+	// Check if it's an integer container (which we manage)
+	if m.isIntegerContainer(container) {
+		fmt.Printf("DEBUG: isContainerManagedByNRI() - container %s is NRI-managed integer container\n", safeShortID(container.Id))
+		return true
+	}
+
+	// TODO: Add logic for annotated containers when implemented
+	// For now, assume non-integer containers are not managed by us
+	fmt.Printf("DEBUG: isContainerManagedByNRI() - container %s is not managed by NRI\n", safeShortID(container.Id))
+	return false
+}
+
+// isAnnotatedContainer checks if a container belongs to a pod with CPU annotations
+func (m *Manager) isAnnotatedContainer(container *api.Container) bool {
+	// For now, we can't easily determine this without pod information in the stateless context
+	// This would require querying pod annotations from the API server
+	// As a heuristic, assume containers with very specific CPU assignments (non-sequential) 
+	// might be annotated containers
+	
+	// TODO: Implement proper pod annotation checking via Kubernetes API
+	// For now, return false to avoid false positives
+	fmt.Printf("DEBUG: isAnnotatedContainer() - container %s annotation check not implemented (assuming false)\n", safeShortID(container.Id))
+	return false
+}
+
+// recordAnnotatedContainerUnsafe records an annotated container without locking (caller must hold lock)
+func (m *Manager) recordAnnotatedContainerUnsafe(container *api.Container, pod *api.PodSandbox, cpus []int) {
+	info := &ContainerInfo{
+		ID:        container.Id,
+		Mode:      ModeAnnotated,
+		CPUs:      cpus,
+		PodID:     container.PodSandboxId,
+		PodUID:    pod.Uid,
+		CreatedAt: time.Now(),
+	}
+	
+	m.byCID[container.Id] = info
+	
+	// Update annotation reference counts
+	for _, cpu := range cpus {
+		m.annotRef[cpu]++
+	}
+	
+	fmt.Printf("DEBUG: Recorded annotated container %s with CPUs %v\n", safeShortID(container.Id), cpus)
+}
+
+// findFreshConflictingContainers finds containers that conflict with requested CPUs by querying runtime state
+func (m *Manager) findFreshConflictingContainers(requestedCPUs []int) (map[string]*ContainerInfo, error) {
+	// Query fresh container state from runtime
+	pods, containers, err := m.queryRunningPodsAndContainers()
+	if err != nil {
+		fmt.Printf("DEBUG: findFreshConflictingContainers() - pod-container query failed: %v, trying containers only\n", err)
+		// Fallback to container-only query
+		containers, err = m.queryRunningContainers()
+		if err != nil {
+			fmt.Printf("ERROR: findFreshConflictingContainers() failed to query running containers: %v\n", err)
+			return nil, fmt.Errorf("failed to query containers: %w", err)
+		}
+		pods = nil // No pod information available
+	}
+
+	conflictingContainers := make(map[string]*ContainerInfo)
+	requestedCPUSet := make(map[int]struct{})
+	for _, cpu := range requestedCPUs {
+		requestedCPUSet[cpu] = struct{}{}
+	}
+
+	fmt.Printf("DEBUG: findFreshConflictingContainers() - checking %d containers for conflicts with CPUs %v\n", 
+		len(containers), requestedCPUs)
+
+	// Check each container for CPU conflicts
+	for _, container := range containers {
+		if container == nil {
+			continue
+		}
+
+		// Extract CPUs from container resources
+		if container.Linux == nil || container.Linux.Resources == nil ||
+			container.Linux.Resources.Cpu == nil || container.Linux.Resources.Cpu.Cpus == "" {
+			continue
+		}
+
+		cpus, err := numa.ParseCPUList(container.Linux.Resources.Cpu.Cpus)
+		if err != nil {
+			fmt.Printf("DEBUG: findFreshConflictingContainers() - failed to parse CPU list for container %s: %v\n", 
+				safeShortID(container.Id), err)
+			continue
+		}
+
+		// Find the pod for proper classification
+		var pod *api.PodSandbox
+		if pods != nil && container.PodSandboxId != "" {
+			pod = m.findPod(pods, container.PodSandboxId)
+		}
+
+		// Check if this container has exclusive CPU semantics (integer or annotated)
+		if !m.hasExclusiveCPUSemantics(container, pod) {
+			continue
+		}
+
+		// Check for conflicts with requested CPUs
+		var conflictCPUs []int
+		for _, cpu := range cpus {
+			if _, isRequested := requestedCPUSet[cpu]; isRequested {
+				conflictCPUs = append(conflictCPUs, cpu)
+			}
+		}
+
+		if len(conflictCPUs) > 0 {
+			// Create ContainerInfo for the conflicting container
+			mode := "unknown"
+			if pod != nil {
+				mode = m.determineContainerMode(pod, container)
+			}
+
+			// Only count integer containers for reallocation (annotated containers can share)
+			if mode == "integer" || (pod == nil && m.isIntegerContainer(container)) {
+				info := &ContainerInfo{
+					ID:     container.Id,
+					Mode:   ModeInteger,
+					CPUs:   cpus,
+					PodID:  container.PodSandboxId,
+					PodUID: "",
+				}
+				if pod != nil {
+					info.PodUID = pod.Uid
+				}
+
+				conflictingContainers[container.Id] = info
+				fmt.Printf("DEBUG: findFreshConflictingContainers() - found conflicting integer container %s with CPUs %v (conflicts: %v)\n", 
+					safeShortID(container.Id), cpus, conflictCPUs)
+			}
+		}
+	}
+
+	fmt.Printf("DEBUG: findFreshConflictingContainers() - found %d conflicting containers\n", len(conflictingContainers))
+	return conflictingContainers, nil
+}
+
+// calculateReallocationPlan calculates what integer containers need to be moved
+func (m *Manager) calculateReallocationPlan(requestedCPUs []int, alloc Allocator) ([]ReallocationPlan, *api.ContainerAdjustment, error) {
+	// Find conflicting integer containers from in-memory state (already synchronized)
+	m.mu.RLock()
+	conflictingContainers := make(map[string]*ContainerInfo)
+	for _, cpu := range requestedCPUs {
+		if containerID, exists := m.intOwner[cpu]; exists {
+			if container := m.byCID[containerID]; container != nil && container.Mode == ModeInteger {
+				conflictingContainers[containerID] = container
+				fmt.Printf("DEBUG: Found conflicting integer container %s on CPU %d\n", safeShortID(containerID), cpu)
+			}
+		}
+	}
+	m.mu.RUnlock()
+	
+	if len(conflictingContainers) == 0 {
+		// No conflicts found - this means the CPUs are available for direct allocation
+		fmt.Printf("DEBUG: No conflicting containers found for requested CPUs %v - direct allocation possible\n", requestedCPUs)
+		
+		// Create adjustment for direct allocation
+		adjustment := &api.ContainerAdjustment{
+			Linux: &api.LinuxContainerAdjustment{
+				Resources: &api.LinuxResources{
+					Cpu: &api.LinuxCPU{
+						Cpus: numa.FormatCPUList(requestedCPUs),
+					},
+				},
+			},
+		}
+		
+		// Return empty reallocation plan and valid adjustment
+		return []ReallocationPlan{}, adjustment, nil
+	}
+	
+	fmt.Printf("DEBUG: Found %d conflicting containers for reallocation\n", len(conflictingContainers))
+	
+	// Plan reallocation for each conflicting container
+	var plans []ReallocationPlan
+	allReserved := m.getReservedCPUsUnsafe()
+	
+	for containerID, container := range conflictingContainers {
+		newCPUs, canReallocate := alloc.CanReallocateInteger(container.CPUs, requestedCPUs, allReserved)
+		if !canReallocate {
+			return nil, nil, fmt.Errorf("cannot reallocate integer container %s", containerID)
+		}
+		
+		plans = append(plans, ReallocationPlan{
+			ContainerID: containerID,
+			OldCPUs:     container.CPUs,
+			NewCPUs:     newCPUs,
+			MemNodes:    nil, // No NUMA binding for integer containers
+		})
+		
+		// Update allReserved for next iteration
+		allReserved = m.updateReservedSetForPlan(allReserved, container.CPUs, newCPUs)
+	}
+	
+	// Create adjustment for the annotated container
+	adjustment := &api.ContainerAdjustment{
+		Linux: &api.LinuxContainerAdjustment{
+			Resources: &api.LinuxResources{
+				Cpu: &api.LinuxCPU{
+					Cpus: formatCPUListCommaSeparated(requestedCPUs),
+				},
+			},
+		},
+	}
+	
+	return plans, adjustment, nil
+}
+
+// executeReallocationPlanAtomic applies the reallocation plan and records the new annotated container
+func (m *Manager) executeReallocationPlanAtomic(plans []ReallocationPlan, annotatedContainer *api.Container, pod *api.PodSandbox, requestedCPUs []int) ([]*api.ContainerUpdate, error) {
+	// Create container updates for reallocation
+	var updates []*api.ContainerUpdate
+	
+	for _, plan := range plans {
+		update := &api.ContainerUpdate{
+			ContainerId: plan.ContainerID,
+			Linux: &api.LinuxContainerUpdate{
+				Resources: &api.LinuxResources{
+					Cpu: &api.LinuxCPU{
+						Cpus: numa.FormatCPUList(plan.NewCPUs),
+					},
+				},
+			},
+		}
+		updates = append(updates, update)
+	}
+	
+	// Apply state changes atomically
+	m.mu.Lock()
+	
+	// Remove old integer container assignments
+	for _, plan := range plans {
+		for _, cpu := range plan.OldCPUs {
+			if m.intOwner[cpu] == plan.ContainerID {
+				delete(m.intOwner, cpu)
+			}
+		}
+	}
+	
+	// Add new integer container assignments
+	for _, plan := range plans {
+		container := m.byCID[plan.ContainerID]
+		if container != nil {
+			container.CPUs = plan.NewCPUs
+			for _, cpu := range plan.NewCPUs {
+				m.intOwner[cpu] = plan.ContainerID
+			}
+		}
+	}
+	
+	// Record the annotated container
+	m.recordAnnotatedContainerUnsafe(annotatedContainer, pod, requestedCPUs)
+	
+	m.mu.Unlock()
+	
+	return updates, nil
+}
+
+// StatelessUpdateContainer handles UpdateContainer calls with global locking
+// This prevents race conditions with unsolicited UpdateContainer calls
+func (m *Manager) StatelessUpdateContainer(containerID string) *api.ContainerUpdate {
+	// GLOBAL ALLOCATION LOCK - prevents race conditions with ongoing allocations
+	m.allocationMu.Lock()
+	defer m.allocationMu.Unlock()
+
+	// Get fresh container info
+	m.mu.RLock()
+	containerInfo := m.byCID[containerID]
+	m.mu.RUnlock()
+
+	if containerInfo == nil {
+		fmt.Printf("DEBUG: StatelessUpdateContainer called for unknown container %s\n", safeShortID(containerID))
+		return nil
+	}
+
+	// Return current CPU assignment to maintain consistency
+	update := &api.ContainerUpdate{
+		ContainerId: containerID,
+		Linux: &api.LinuxContainerUpdate{
+			Resources: &api.LinuxResources{
+				Cpu: &api.LinuxCPU{
+					Cpus: m.formatCPUListForMode(containerInfo.CPUs, containerInfo.Mode),
+				},
+			},
+		},
+	}
+
+	fmt.Printf("DEBUG: StatelessUpdateContainer returning CPU assignment %s for container %s (mode: %s)\n",
+		update.Linux.Resources.Cpu.Cpus, safeShortID(containerID), containerInfo.Mode)
+
+	return update
+}
+
+// formatCPUListForMode formats CPU list appropriately for the container mode
+func (m *Manager) formatCPUListForMode(cpus []int, mode string) string {
+	if len(cpus) == 0 {
+		return ""
+	}
+
+	// Use comma-separated format for annotated containers for better NRI compatibility
+	if mode == ModeAnnotated {
+		return formatCPUListCommaSeparated(cpus)
+	}
+
+	// Use standard format for other containers
+	return numa.FormatCPUList(cpus)
 }
 
 // getProjectedIntegerReservedCPUs computes integer-reserved CPUs after applying the reallocation plan
@@ -1146,6 +2132,15 @@ func (m *Manager) IsExclusive(cpu int) bool {
 
 // RecordAnnotatedContainer specifically handles recording annotated containers with proper reference counting
 func (m *Manager) RecordAnnotatedContainer(container *api.Container, pod *api.PodSandbox, adjustment *api.ContainerAdjustment) error {
+	// CRITICAL FIX: This function should not be used directly for new allocations due to race conditions
+	// Use AtomicAllocateAndRecordAnnotated instead for new container allocations
+	// This function is kept for backward compatibility and recovery scenarios
+	return m.AtomicRecordAnnotatedContainer(container, pod, adjustment)
+}
+
+// AtomicRecordAnnotatedContainer records an annotated container with proper atomicity
+// This fixes the race condition where periodic cleanup removes annotation references
+func (m *Manager) AtomicRecordAnnotatedContainer(container *api.Container, pod *api.PodSandbox, adjustment *api.ContainerAdjustment) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -1163,21 +2158,40 @@ func (m *Manager) RecordAnnotatedContainer(container *api.Container, pod *api.Po
 		return fmt.Errorf("error parsing CPU list for container %s: %w", container.Id, err)
 	}
 
+	// Remove any temporary container info that might have been created
+	tempContainerID := fmt.Sprintf("pending-annotated-%s", pod.Uid)
+	if tempInfo, exists := m.byCID[tempContainerID]; exists {
+		// Remove the old annotation references that were added for the temporary container
+		for _, cpu := range tempInfo.CPUs {
+			if count := m.annotRef[cpu]; count > 1 {
+				m.annotRef[cpu] = count - 1
+			} else {
+				delete(m.annotRef, cpu)
+			}
+		}
+		delete(m.byCID, tempContainerID)
+		fmt.Printf("DEBUG: Removed temporary annotated container %s\n", tempContainerID)
+	}
+
 	// Create container info
 	info := &ContainerInfo{
-		ID:     container.Id,
-		Mode:   ModeAnnotated,
-		CPUs:   cpus,
-		PodID:  container.PodSandboxId,
-		PodUID: pod.Uid,
+		ID:        container.Id,
+		Mode:      ModeAnnotated,
+		CPUs:      cpus,
+		PodID:     container.PodSandboxId,
+		PodUID:    pod.Uid,
+		CreatedAt: time.Now(),
 	}
 
 	m.byCID[container.Id] = info
 
-	// Update annotation reference counts
+	// Update annotation reference counts atomically
 	for _, cpu := range cpus {
 		m.annotRef[cpu]++
 	}
+
+	fmt.Printf("DEBUG: Atomically recorded annotated container %s with %d CPUs (annotRef now has %d entries)\n", 
+		safeShortID(container.Id), len(cpus), len(m.annotRef))
 
 	return nil
 }
@@ -1200,22 +2214,111 @@ func (m *Manager) RecordIntegerContainer(container *api.Container, pod *api.PodS
 		return fmt.Errorf("error parsing CPU list for container %s: %w", container.Id, err)
 	}
 
+	// CRITICAL FIX: Atomic conflict detection and rejection
+	// Check for CPU conflicts BEFORE recording and REJECT conflicting allocations
+	var conflicts []int
+	var conflictOwners []string
+	
+	for _, cpu := range cpus {
+		if existingOwner := m.intOwner[cpu]; existingOwner != "" {
+			conflicts = append(conflicts, cpu)
+			conflictOwners = append(conflictOwners, safeShortID(existingOwner))
+			fmt.Printf("ERROR: CPU %d ownership conflict - new container %s conflicts with existing %s\n", 
+				cpu, safeShortID(container.Id), safeShortID(existingOwner))
+		}
+	}
+
+	// REJECT allocation if any conflicts detected
+	if len(conflicts) > 0 {
+		return fmt.Errorf("CPU exclusivity violation: container %s attempted to use CPUs %v already owned by containers %v - allocation rejected", 
+			safeShortID(container.Id), conflicts, conflictOwners)
+	}
+
+	// ENHANCED DEBUG LOG FOR RECORDING
+	fmt.Printf("DEBUG: Recording integer container %s with CPUs %v (before: intOwner=%d entries)\n", 
+		safeShortID(container.Id), cpus, len(m.intOwner))
+
 	// Create container info
 	info := &ContainerInfo{
-		ID:     container.Id,
-		Mode:   ModeInteger,
-		CPUs:   cpus,
-		PodID:  container.PodSandboxId,
-		PodUID: pod.Uid,
+		ID:        container.Id,
+		Mode:      ModeInteger,
+		CPUs:      cpus,
+		PodID:     container.PodSandboxId,
+		PodUID:    pod.Uid,
+		CreatedAt: time.Now(),
 	}
 
 	m.byCID[container.Id] = info
 
-	// Update integer ownership map
+	// Update integer ownership map (now safe since conflicts were checked)
 	for _, cpu := range cpus {
 		m.intOwner[cpu] = container.Id
+		fmt.Printf("DEBUG: Assigned CPU %d to integer container %s\n", cpu, safeShortID(container.Id))
 	}
 
-	fmt.Printf("DEBUG: Recorded integer container %s with CPUs %v\n", container.Id, cpus)
+	fmt.Printf("DEBUG: Recorded integer container %s with CPUs %v (after: intOwner=%d entries)\n", 
+		safeShortID(container.Id), cpus, len(m.intOwner))
+	
+	// CRITICAL FIX: Validate state consistency after recording
+	m.validateStateConsistency()
+	
 	return nil
 }
+
+// validateStateConsistency detects and reports state corruption issues
+func (m *Manager) validateStateConsistency() {
+	// Check for orphaned intOwner entries
+	orphanedOwners := 0
+	orphanedCPUs := make([]int, 0)
+	for cpu, containerID := range m.intOwner {
+		if info := m.byCID[containerID]; info == nil {
+			fmt.Printf("WARNING: State corruption - CPU %d owned by missing container %s\n", 
+				cpu, safeShortID(containerID))
+			orphanedOwners++
+			orphanedCPUs = append(orphanedCPUs, cpu)
+		} else if info.Mode != ModeInteger {
+			fmt.Printf("WARNING: State corruption - CPU %d owned by non-integer container %s (mode=%s)\n", 
+				cpu, safeShortID(containerID), info.Mode)
+		}
+	}
+
+	// Check for CPU ownership conflicts within integer containers
+	cpuOwnershipCount := make(map[int]int)
+	for _, info := range m.byCID {
+		if info.Mode == ModeInteger {
+			for _, cpu := range info.CPUs {
+				cpuOwnershipCount[cpu]++
+				if cpuOwnershipCount[cpu] > 1 {
+					fmt.Printf("ERROR: State corruption - CPU %d assigned to multiple integer containers (conflict detected)\n", cpu)
+				}
+			}
+		}
+	}
+
+	// Check for orphaned annotRef entries  
+	orphanedAnnotations := 0
+	for cpu, count := range m.annotRef {
+		hasAnnotatedOwner := false
+		for _, info := range m.byCID {
+			if info.Mode == ModeAnnotated {
+				for _, infoCPU := range info.CPUs {
+					if infoCPU == cpu {
+						hasAnnotatedOwner = true
+						break
+					}
+				}
+			}
+		}
+		if !hasAnnotatedOwner {
+			fmt.Printf("WARNING: State corruption - CPU %d has annotation count %d but no annotated container\n", 
+				cpu, count)
+			orphanedAnnotations++
+		}
+	}
+
+	if orphanedOwners > 0 || orphanedAnnotations > 0 {
+		fmt.Printf("ERROR: State corruption detected - %d orphaned owners, %d orphaned annotations\n", 
+			orphanedOwners, orphanedAnnotations)
+	}
+}
+

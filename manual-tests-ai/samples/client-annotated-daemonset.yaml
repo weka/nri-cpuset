@@ -1,0 +1,29 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: client-annotated
+  namespace: wekaplugin-e2e
+spec:
+  selector:
+    matchLabels:
+      app: client-annotated
+  template:
+    metadata:
+      annotations:
+        weka.io/cores-ids: "12-15,44-47,32"
+      labels:
+        app: client-annotated
+    spec:
+      containers:
+      - name: busybox
+        image: busybox:latest
+        command: ["sleep", "infinity"]
+        resources:
+          limits:
+            cpu: "9"
+            memory: 16165Mi
+          requests:
+            cpu: "9"
+            memory: 16165Mi
+      tolerations:
+      - operator: Exists

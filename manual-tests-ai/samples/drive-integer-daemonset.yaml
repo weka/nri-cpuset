@@ -1,0 +1,27 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: drive-integer
+  namespace: wekaplugin-e2e
+spec:
+  selector:
+    matchLabels:
+      app: drive-integer
+  template:
+    metadata:
+      labels:
+        app: drive-integer
+    spec:
+      containers:
+      - name: busybox
+        image: busybox:latest
+        command: ["sleep", "infinity"]
+        resources:
+          limits:
+            cpu: "13"
+            memory: 30200Mi
+          requests:
+            cpu: "13"
+            memory: 30200Mi
+      tolerations:
+      - operator: Exists

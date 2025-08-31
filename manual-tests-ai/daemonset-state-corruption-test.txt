@@ -1,0 +1,253 @@
+# Annotated DaemonSet State Corruption Manual Test
+
+Tests the bug where NRI plugin loses track of core accounting after annotated pods are removed and replaced with integer pods, using daemonsets for systematic deployment across all nodes.
+
+## Issue Background
+The NRI plugin has a state management bug where annotated containers' allocated cores are not properly deallocated when the containers are removed. This test uses daemonsets to create multiple pods per node simultaneously, increasing stress on state management:
+
+1. Annotated daemonsets get allocated specific CPU cores and are tracked in plugin state on all nodes
+2. When annotated daemonsets are removed, plugin logs removal but fails to deallocate cores from internal state 
+3. New integer daemonsets are created and get different CPUs correctly
+4. Plugin still thinks old annotated pod cores are occupied PLUS new integer pod cores
+5. When new pods try to allocate cores, plugin reports insufficient free CPUs even when there are plenty available
+
+## Test Scenario
+1. **Bulk Deploy**: Create 3 annotated daemonsets simultaneously consuming CPU cores across all nodes
+2. **Bulk Remove**: Delete all annotated daemonsets simultaneously to stress state management 
+3. **Bulk Replace**: Create 3 integer daemonsets simultaneously to replace them
+4. Verify plugin state corruption and demonstrate the resource leak issue
+
+## Prerequisites  
+- KUBECONFIG set to cluster with NRI-enabled containerd/k3s
+- Weka NRI CPUSet plugin deployed as native NRI plugin (not daemonset)
+- Multiple nodes with sufficient CPU cores (adjust core counts for different architectures)
+- SSH access to nodes for plugin log examination
+
+## Test Steps
+
+### 1. Environment Setup
+```bash
+kubectl create namespace wekaplugin-e2e --dry-run=client -o yaml | kubectl apply -f -
+export TEST_NS=wekaplugin-e2e
+echo "Testing annotated daemonset state corruption across cluster"
+kubectl get nodes -o wide
+```
+
+### 2. Deploy Annotated DaemonSets (Initial Load)
+```bash
+echo "=== Deploying 3 Annotated DaemonSets ==="
+
+# Deploy all 3 annotated daemonsets simultaneously
+kubectl apply -f manual-tests-ai/samples/client-annotated-daemonset.yaml
+kubectl apply -f manual-tests-ai/samples/compute-annotated-daemonset.yaml  
+kubectl apply -f manual-tests-ai/samples/drive-annotated-daemonset.yaml
+
+# Wait for all daemonset pods to be ready
+echo "Waiting for annotated daemonsets to be ready..."
+kubectl rollout status daemonset/client-annotated -n $TEST_NS --timeout=120s
+kubectl rollout status daemonset/compute-annotated -n $TEST_NS --timeout=120s
+kubectl rollout status daemonset/drive-annotated -n $TEST_NS --timeout=120s
+
+kubectl get pods -n $TEST_NS -l app=client-annotated -o wide
+kubectl get pods -n $TEST_NS -l app=compute-annotated -o wide
+kubectl get pods -n $TEST_NS -l app=drive-annotated -o wide
+```
+
+**Expected**: All annotated daemonset pods start successfully across all nodes and get their specific CPU allocations.
+
+### 3. Verify Initial State and Plugin Logs
+```bash
+echo "=== Annotated DaemonSet CPU Assignments ==="
+
+# Check CPU assignments for pods on first available node
+TARGET_NODE=$(kubectl get pods -n $TEST_NS -l app=client-annotated -o jsonpath='{.items[0].spec.nodeName}')
+echo "Checking assignments on node: $TARGET_NODE"
+
+CLIENT_POD=$(kubectl get pods -n $TEST_NS -l app=client-annotated --field-selector spec.nodeName=$TARGET_NODE -o jsonpath='{.items[0].metadata.name}')
+COMPUTE_POD=$(kubectl get pods -n $TEST_NS -l app=compute-annotated --field-selector spec.nodeName=$TARGET_NODE -o jsonpath='{.items[0].metadata.name}')
+DRIVE_POD=$(kubectl get pods -n $TEST_NS -l app=drive-annotated --field-selector spec.nodeName=$TARGET_NODE -o jsonpath='{.items[0].metadata.name}')
+
+echo "Client pod (cores 12-15,44-47,32): $CLIENT_POD"
+kubectl exec -n $TEST_NS $CLIENT_POD -- cat /proc/1/status | grep Cpus_allowed_list
+echo "Compute pod (cores 0-11,33-43): $COMPUTE_POD"
+kubectl exec -n $TEST_NS $COMPUTE_POD -- cat /proc/1/status | grep Cpus_allowed_list
+echo "Drive pod (cores 16-21,48-54): $DRIVE_POD"
+kubectl exec -n $TEST_NS $DRIVE_POD -- cat /proc/1/status | grep Cpus_allowed_list
+```
+
+**Expected Output**: Each pod should be pinned to its specific CPU cores as defined in annotations.
+
+### 4. Bulk Remove Annotated DaemonSets (Stress State Management)
+```bash  
+echo "=== Deleting All Annotated DaemonSets Simultaneously ==="
+kubectl delete daemonset client-annotated compute-annotated drive-annotated -n $TEST_NS --grace-period=5
+
+# Wait for bulk removals to complete
+echo "Waiting for all annotated pods to terminate..."
+kubectl wait --for=delete pods -l app=client-annotated -n $TEST_NS --timeout=60s
+kubectl wait --for=delete pods -l app=compute-annotated -n $TEST_NS --timeout=60s
+kubectl wait --for=delete pods -l app=drive-annotated -n $TEST_NS --timeout=60s
+
+echo "Verifying no annotated pods remain:"
+kubectl get pods -n $TEST_NS
+```
+
+**Expected**: All annotated daemonset pods are removed, but plugin may not properly deallocate cores from internal state.
+
+### 5. Deploy Integer DaemonSets (Replacement Workload)
+```bash
+echo "=== Deploying 3 Integer DaemonSets ==="
+
+# Deploy all 3 integer daemonsets simultaneously  
+kubectl apply -f manual-tests-ai/samples/client-integer-daemonset.yaml
+kubectl apply -f manual-tests-ai/samples/compute-integer-daemonset.yaml
+kubectl apply -f manual-tests-ai/samples/drive-integer-daemonset.yaml
+
+# Wait for all daemonset pods to be ready
+echo "Waiting for integer daemonsets to be ready..."
+kubectl rollout status daemonset/client-integer -n $TEST_NS --timeout=120s
+kubectl rollout status daemonset/compute-integer -n $TEST_NS --timeout=120s
+kubectl rollout status daemonset/drive-integer -n $TEST_NS --timeout=120s
+
+kubectl get pods -n $TEST_NS -o wide
+```
+
+**Expected**: Integer daemonset pods start successfully and get automatically allocated CPUs (different from the annotated pods).
+
+### 6. Verify Integer Pod Allocations and Test State
+```bash
+echo "=== Integer DaemonSet CPU Assignments on node $TARGET_NODE ==="
+
+CLIENT_INT_POD=$(kubectl get pods -n $TEST_NS -l app=client-integer --field-selector spec.nodeName=$TARGET_NODE -o jsonpath='{.items[0].metadata.name}')
+COMPUTE_INT_POD=$(kubectl get pods -n $TEST_NS -l app=compute-integer --field-selector spec.nodeName=$TARGET_NODE -o jsonpath='{.items[0].metadata.name}')
+DRIVE_INT_POD=$(kubectl get pods -n $TEST_NS -l app=drive-integer --field-selector spec.nodeName=$TARGET_NODE -o jsonpath='{.items[0].metadata.name}')
+
+echo "Client integer pod (9 cores): $CLIENT_INT_POD"
+kubectl exec -n $TEST_NS $CLIENT_INT_POD -- cat /proc/1/status | grep Cpus_allowed_list
+echo "Compute integer pod (23 cores): $COMPUTE_INT_POD" 
+kubectl exec -n $TEST_NS $COMPUTE_INT_POD -- cat /proc/1/status | grep Cpus_allowed_list
+echo "Drive integer pod (13 cores): $DRIVE_INT_POD"
+kubectl exec -n $TEST_NS $DRIVE_INT_POD -- cat /proc/1/status | grep Cpus_allowed_list
+
+echo "=== Total CPU allocation: 9 + 23 + 13 = 45 cores ==="
+```
+
+**Expected Output**: Integer pods should get CPU allocations that avoid the original annotated pod ranges if state is working correctly.
+
+### 7. Attempt to Create Additional Test Pod (Expose Bug)
+```bash
+echo "=== Creating additional test pod to trigger resource conflicts ==="
+
+# Create a test pod that should fit if state is correct (19 remaining cores on 64-core node)
+cat > /tmp/trigger-test-pod.yaml << 'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: trigger-test-pod
+  namespace: wekaplugin-e2e
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: ${TARGET_NODE}
+  containers:
+  - name: busybox
+    image: busybox:latest
+    command: ["sleep", "infinity"]
+    resources:
+      requests: 
+        cpu: "15"  # Should fit in remaining cores if state is correct
+        memory: "1Gi"
+      limits:
+        cpu: "15" 
+        memory: "1Gi"
+  restartPolicy: Never
+EOF
+
+envsubst < /tmp/trigger-test-pod.yaml | kubectl apply -f -
+
+# Wait and check status
+sleep 15
+kubectl get pod trigger-test-pod -n $TEST_NS
+kubectl describe pod trigger-test-pod -n $TEST_NS | grep -A 10 -B 5 "CreateContainerError\|insufficient\|Events\|FailedScheduling"
+```
+
+**Expected Failure**: If the bug exists, the test pod should fail with insufficient CPU errors even though there should be ~19 cores remaining.
+
+### 8. Analysis and State Inspection
+```bash
+echo "=== Node Resource Analysis ==="
+kubectl describe node $TARGET_NODE | grep -A 10 "Allocated resources"
+
+echo "=== DaemonSet Resource Summary ==="
+echo "Expected total: 45 cores (9+23+13) + 15 test pod = 60/64 cores"
+echo "If failing: Plugin may think it has 45 + 45 (leaked annotated state) = 90+ cores allocated"
+
+echo "=== Current Pod Status ==="
+kubectl get pods -n $TEST_NS -o wide --field-selector spec.nodeName=$TARGET_NODE
+
+echo "=== Pod Events Analysis ==="
+kubectl get events -n $TEST_NS --field-selector involvedObject.name=trigger-test-pod --sort-by='.lastTimestamp'
+```
+
+### 9. Demonstrate Fix (Plugin Restart)
+```bash
+echo "=== Testing Fix via Plugin State Reset ==="
+# Note: In real deployment, this would restart the NRI plugin service
+# For daemonset plugin, restart the plugin pods:
+kubectl rollout restart daemonset/weka-nri-cpuset -n kube-system 2>/dev/null || echo "Plugin not running as daemonset"
+
+# Wait for restart to complete
+sleep 20
+
+# Check if test pod now works
+kubectl get pod trigger-test-pod -n $TEST_NS
+kubectl describe pod trigger-test-pod -n $TEST_NS | tail -10
+```
+
+### 10. Verify Fix Success  
+```bash
+echo "=== Final State Verification ==="
+kubectl get pods -n $TEST_NS -o wide
+
+if kubectl get pod trigger-test-pod -n $TEST_NS | grep -q Running; then
+    echo "SUCCESS: trigger-test-pod is now Running - state corruption resolved"
+    kubectl exec -n $TEST_NS trigger-test-pod -- cat /proc/1/status | grep Cpus_allowed_list
+else
+    echo "PERSISTENT ISSUE: trigger-test-pod still failing after restart"
+    kubectl describe pod trigger-test-pod -n $TEST_NS | tail -15
+fi
+```
+
+## Key Advantages of DaemonSet Approach
+
+1. **Systematic Coverage**: Tests state corruption across all nodes simultaneously
+2. **Increased Stress**: Multiple pod creation/deletion operations per node  
+3. **Realistic Workload**: Mimics real-world daemonset deployments
+4. **Easier Management**: Single commands control multiple pods across cluster
+5. **State Isolation**: Each node's plugin state can be tested independently
+
+## Failure Modes & Debugging
+
+### If DaemonSet Pods Fail to Start
+- Check annotations format: `weka.io/cores-ids: "12-15,44-47,32"`
+- Verify sufficient CPU cores on nodes
+- Check plugin deployment status: `kubectl get pods -n kube-system -l app=weka-nri-cpuset`
+
+### If State Corruption Doesn't Reproduce  
+- Try with nodes that have different CPU topologies
+- Increase resource requests to consume more cores
+- Check plugin logs during transitions
+
+### Plugin Logs Analysis
+```bash
+# For each node with issues:
+TARGET_NODE="worker-node-1"  # Replace with actual node
+kubectl logs -n kube-system -l app=weka-nri-cpuset --field-selector spec.nodeName=$TARGET_NODE
+```
+
+## Cleanup
+```bash
+kubectl delete namespace $TEST_NS
+rm -f /tmp/trigger-test-pod.yaml
+```
+
+This test demonstrates the core accounting state corruption bug using **daemonsets** to create comprehensive, systematic load across the entire cluster. The daemonset approach provides better coverage and more realistic testing conditions compared to individual pod deployments.

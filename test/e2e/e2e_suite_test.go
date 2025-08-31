@@ -183,34 +183,31 @@ var (
 
 var _ = BeforeEach(func() {
 	// Use deterministic node assignment based on Ginkgo worker ID and available nodes
-	// This ensures proper distribution across parallel processes without locking conflicts
+	// This ensures one worker per node with no sharing - worker count must not exceed node count
 	workerID := GinkgoParallelProcess()
 
 	if len(availableNodes) == 0 {
 		Fail("No available nodes for test execution")
 	}
 
-	// Find a node that hasn't had failed tests for this test
-	// This ensures failed test nodes are isolated for debugging
-	var selectedNode string
-	startIndex := (workerID - 1) % len(availableNodes) // Ginkgo workers are 1-based
-
-	for i := 0; i < len(availableNodes); i++ {
-		nodeIndex := (startIndex + i) % len(availableNodes)
-		candidateNode := availableNodes[nodeIndex]
-
-		// Skip nodes that have had failed tests to preserve debugging state
-		if !failedTestNodes[candidateNode] {
-			selectedNode = candidateNode
-			break
-		}
+	// CRITICAL: Ensure worker count does not exceed available nodes
+	// Each worker gets exactly one dedicated node - no sharing, no cycling
+	if workerID > len(availableNodes) {
+		Fail(fmt.Sprintf("Worker count (%d) exceeds available nodes (%d). Reduce parallel workers (-p) or add more nodes.", 
+			workerID, len(availableNodes)))
 	}
 
-	// If all nodes have failed tests, use the original deterministic assignment
-	// This handles the case where we run out of clean nodes
-	if selectedNode == "" {
-		selectedNode = availableNodes[startIndex]
-		fmt.Printf("WARNING: All nodes have failed tests, reusing node %s\n", selectedNode)
+	// Select node deterministically: Worker 1 -> Node 0, Worker 2 -> Node 1, etc.
+	// This guarantees one worker per node with no namespace sharing
+	selectedNodeIndex := workerID - 1 // Ginkgo workers are 1-based
+	selectedNode := availableNodes[selectedNodeIndex]
+
+	// Check if this node has failed tests and should be quarantined
+	if failedTestNodes[selectedNode] {
+		// This worker cannot proceed - its assigned node failed and is quarantined
+		// Skip this test entirely to preserve debugging state
+		Skip(fmt.Sprintf("Worker %d assigned to failed node %s - skipping test to preserve debugging state", 
+			workerID, selectedNode))
 	}
 
 	currentTestNode = selectedNode
@@ -628,12 +625,16 @@ func createDistributedTestPod(name string, annotations map[string]string, resour
 //
 // Each Ginkgo parallel worker gets assigned to a specific node deterministically:
 // - Worker 1 -> Node 0, Worker 2 -> Node 1, etc.
-// - If more workers than nodes, we cycle: Worker N -> Node (N-1) % len(nodes)
-// - This eliminates race conditions and complex locking mechanisms
-// - Namespace names are derived from node names for predictable isolation
+// - CRITICAL: Worker count MUST NOT exceed node count - each worker gets exactly one dedicated node
+// - No cycling, no sharing, no namespace conflicts between workers
+// - Failed nodes are quarantined and skipped for debugging
 //
 // Benefits:
 // 1. No ConfigMap-based locks needed (eliminates race conditions)
 // 2. Predictable resource allocation (no "all nodes busy" scenarios)
 // 3. Simplified debugging (node name -> namespace mapping, easy cleanup)
-// 4. Better test isolation (each worker has dedicated resources)
+// 4. Perfect test isolation (each worker has dedicated node and namespace)
+//
+// Requirements:
+// - Number of parallel workers (-p) must be <= number of available nodes
+// - Test will fail with clear error if worker count exceeds node count
