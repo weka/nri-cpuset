@@ -470,16 +470,17 @@ func (p *plugin) handleAnnotatedContainer(pod *api.PodSandbox, container *api.Co
 	// CRITICAL FIX: Update the cached containers immediately after successful allocation
 	// This ensures that subsequent allocations can see this container's CPU assignment
 	if adjustment != nil {
-		// Update container with the allocated CPU assignment for stateless querying
-		updatedContainer := *container // Copy the container
-		if updatedContainer.Linux == nil {
-			updatedContainer.Linux = &api.LinuxContainer{}
-		}
-		if updatedContainer.Linux.Resources == nil {
-			updatedContainer.Linux.Resources = &api.LinuxResources{}
-		}
-		if updatedContainer.Linux.Resources.Cpu == nil {
-			updatedContainer.Linux.Resources.Cpu = &api.LinuxCPU{}
+		// Create a new container to avoid copying locks
+		updatedContainer := &api.Container{
+			Id:           container.Id,
+			PodSandboxId: container.PodSandboxId,
+			Name:         container.Name,
+			State:        container.State,
+			Linux: &api.LinuxContainer{
+				Resources: &api.LinuxResources{
+					Cpu: &api.LinuxCPU{},
+				},
+			},
 		}
 		
 		// Set the allocated CPU assignment from the adjustment
@@ -489,7 +490,7 @@ func (p *plugin) handleAnnotatedContainer(pod *api.PodSandbox, container *api.Co
 		}
 		
 		// Update the cache with the allocated CPU assignment
-		p.updateCachedContainers(&updatedContainer, true)
+		p.updateCachedContainers(updatedContainer, true)
 		fmt.Printf("DEBUG: Updated cached containers after successful allocation for %s with CPUs: %s\n", 
 			safeShortID(container.Id), updatedContainer.Linux.Resources.Cpu.Cpus)
 	}
@@ -569,16 +570,17 @@ func (p *plugin) handleIntegerContainer(pod *api.PodSandbox, container *api.Cont
 	// CRITICAL FIX: Update the cached containers immediately after successful allocation
 	// This ensures that subsequent allocations can see this container's CPU assignment
 	if adjustment != nil {
-		// Update container with the allocated CPU assignment for stateless querying
-		updatedContainer := *container // Copy the container
-		if updatedContainer.Linux == nil {
-			updatedContainer.Linux = &api.LinuxContainer{}
-		}
-		if updatedContainer.Linux.Resources == nil {
-			updatedContainer.Linux.Resources = &api.LinuxResources{}
-		}
-		if updatedContainer.Linux.Resources.Cpu == nil {
-			updatedContainer.Linux.Resources.Cpu = &api.LinuxCPU{}
+		// Create a new container to avoid copying locks
+		updatedContainer := &api.Container{
+			Id:           container.Id,
+			PodSandboxId: container.PodSandboxId,
+			Name:         container.Name,
+			State:        container.State,
+			Linux: &api.LinuxContainer{
+				Resources: &api.LinuxResources{
+					Cpu: &api.LinuxCPU{},
+				},
+			},
 		}
 		
 		// Set the allocated CPU assignment from the adjustment
@@ -588,7 +590,7 @@ func (p *plugin) handleIntegerContainer(pod *api.PodSandbox, container *api.Cont
 		}
 		
 		// Update the cache with the allocated CPU assignment  
-		p.updateCachedContainers(&updatedContainer, true)
+		p.updateCachedContainers(updatedContainer, true)
 		fmt.Printf("DEBUG: Updated cached containers after successful allocation for %s with CPUs: %s\n", 
 			safeShortID(container.Id), updatedContainer.Linux.Resources.Cpu.Cpus)
 	}
